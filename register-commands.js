@@ -1,7 +1,13 @@
 require('dotenv').config();
-const { REST, Routes, SlashCommandBuilder } = require('discord.js');
+const { REST, Routes, SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
 
 const commands = [
+  new SlashCommandBuilder()
+    .setName('matchmaker-setup')
+    .setDescription('Set up all roles, categories, channels and starter embeds MatchMaker needs (admin-only)')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addStringOption(o => o.setName('yunite-token').setDescription('Your Yunite API token').setRequired(true)),
+
   new SlashCommandBuilder()
     .setName('setup-tournament')
     .setDescription('Create the queue embed for a tournament channel')
@@ -53,15 +59,15 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName('setup-creative-6s')
-    .setDescription('Post the pinned Creative 6s (3v3) queue embed into CREATIVE_6S_CHANNEL_ID'),
+    .setDescription('Post the pinned Creative 6s (3v3) queue embed in this channel (run once)'),
 
   new SlashCommandBuilder()
     .setName('setup-creative-8s')
-    .setDescription('Post the pinned Creative 8s (4v4) queue embed into CREATIVE_8S_CHANNEL_ID'),
+    .setDescription('Post the pinned Creative 8s (4v4) queue embed in this channel (run once)'),
 
   new SlashCommandBuilder()
     .setName('setup-howto')
-    .setDescription('Post the pinned "How to Use MatchMaker" embed into HOWTO_CHANNEL_ID'),
+    .setDescription('Post the pinned "How to Use MatchMaker" embed in this channel'),
 
   new SlashCommandBuilder()
     .setName('votekick')

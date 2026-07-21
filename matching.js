@@ -1,10 +1,11 @@
-// matching.js - Handles pending match proposals and accept/reject logic for 2- or 3-player matches
+// matching.js - Handles pending match proposals and accept/reject logic for 2- or 3-player
+// matches, scoped per guild.
 
 const { requeueUnit } = require('./queue');
 
 // Pending matches structure:
 // pendingMatches[matchId] = {
-//   matchId, unitA, unitB,
+//   matchId, guildId, unitA, unitB,
 //   players: [...unitA.members, ...unitB.members],  // 2 for duo, 3 for trios (party + solo)
 //   tournamentName, region, acceptedBy: Set, createdAt, requeueFn, kind,
 // }
@@ -16,7 +17,9 @@ function generateMatchId() {
 
 // requeueFn lets non-tournament callers (e.g. the creative queue) plug in their own queue's
 // requeue logic on reject/expiry instead of the tournament queue.js default. `kind` tags the
-// match so the confirm-flow (private channel creation etc.) can branch on it later.
+// match so the confirm-flow (private channel creation etc.) can branch on it later. guildId is
+// derived from unitA (every unit carries its own guildId since queue.js/creative-queue.js's
+// rework) rather than taken as a separate parameter.
 function createMatch(unitA, unitB, tournamentName, region, {
   requeueFn = requeueUnit, kind = 'tournament', expiryMs = 5 * 60 * 1000,
 } = {}) {
@@ -24,6 +27,7 @@ function createMatch(unitA, unitB, tournamentName, region, {
 
   pendingMatches[matchId] = {
     matchId,
+    guildId: unitA.guildId,
     unitA,
     unitB,
     players: [...unitA.members, ...unitB.members],
@@ -92,8 +96,9 @@ function getMatch(matchId) {
   return pendingMatches[matchId] ?? null;
 }
 
-function getPendingMatchByDiscordId(discordId) {
+function getPendingMatchByDiscordId(guildId, discordId) {
   for (const match of Object.values(pendingMatches)) {
+    if (match.guildId !== guildId) continue;
     if (match.players.some(p => p.discordId === discordId)) {
       return { matchId: match.matchId, match };
     }

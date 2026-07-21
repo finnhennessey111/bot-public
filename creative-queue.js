@@ -1,9 +1,12 @@
-// creative-queue.js - Matching engine for the Fortnite Creative queue (1v1/2v2 Realistics & Zone Wars)
+// creative-queue.js - Matching engine for the Fortnite Creative queue (1v1/2v2 Realistics & Zone
+// Wars), scoped per guild.
 //
 // Deliberately independent of queue.js's tournament matching: no Elo, no tournament placement
 // data, no party system. A "unit" here is always exactly one solo player — even in 2v2 modes,
 // each queuer represents their own team and is matched against one opponent queuer, never
 // teamed up with another Discord member (see task spec: "no party system... not a teammate").
+// Every unit carries its own `guildId` (stamped at join time) so requeues/events downstream
+// don't need a second guildId threaded through separately.
 //
 // Eligibility is gated purely by elapsed wait time off `joinedAt` (no stored timers, so it
 // survives a restart), on its own schedule — deliberately independent of tournament.js's
@@ -33,41 +36,43 @@ function generateUnitId() {
   return `cunit_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
 }
 
-function getQueue(mode, region) {
-  if (!creativeQueues[mode]) creativeQueues[mode] = {};
-  if (!Array.isArray(creativeQueues[mode][region])) creativeQueues[mode][region] = [];
-  return creativeQueues[mode][region];
+function getQueue(guildId, mode, region) {
+  if (!creativeQueues[guildId]) creativeQueues[guildId] = {};
+  if (!creativeQueues[guildId][mode]) creativeQueues[guildId][mode] = {};
+  if (!Array.isArray(creativeQueues[guildId][mode][region])) creativeQueues[guildId][mode][region] = [];
+  return creativeQueues[guildId][mode][region];
 }
 
-function isInCreativeQueue(discordId) {
-  return !!findCreativeUnitByDiscordId(discordId);
+function isInCreativeQueue(guildId, discordId) {
+  return !!findCreativeUnitByDiscordId(guildId, discordId);
 }
 
-function findCreativeUnitByDiscordId(discordId) {
-  for (const mode of Object.keys(creativeQueues)) {
-    for (const region of Object.keys(creativeQueues[mode])) {
-      const unit = getQueue(mode, region).find(u => u.members.some(p => p.discordId === discordId));
+function findCreativeUnitByDiscordId(guildId, discordId) {
+  if (!creativeQueues[guildId]) return null;
+  for (const mode of Object.keys(creativeQueues[guildId])) {
+    for (const region of Object.keys(creativeQueues[guildId][mode])) {
+      const unit = getQueue(guildId, mode, region).find(u => u.members.some(p => p.discordId === discordId));
       if (unit) return { unit, mode, region };
     }
   }
   return null;
 }
 
-function removeFromCreativeQueueAnywhere(discordId) {
-  const found = findCreativeUnitByDiscordId(discordId);
+function removeFromCreativeQueueAnywhere(guildId, discordId) {
+  const found = findCreativeUnitByDiscordId(guildId, discordId);
   if (!found) return false;
-  const band = getQueue(found.mode, found.region);
+  const band = getQueue(guildId, found.mode, found.region);
   const index = band.findIndex(u => u.unitId === found.unit.unitId);
   if (index !== -1) {
     band.splice(index, 1);
-    save();
+    save(guildId);
     return true;
   }
   return false;
 }
 
-function getCreativeQueueCount(mode, region) {
-  return getQueue(mode, region).length;
+function getCreativeQueueCount(guildId, mode, region) {
+  return getQueue(guildId, mode, region).length;
 }
 
 function toLogPR(totalPR) {
@@ -128,13 +133,13 @@ function describeUnit(unit) {
 
 // Greedy pairing, same approach as queue.js's attemptMatchingForQueue — fine at realistic
 // creative-queue sizes, and runs fully synchronously so overlapping calls can't double-match.
-function attemptMatchingForQueue(mode, region) {
+function attemptMatchingForQueue(guildId, mode, region) {
   const now = Date.now();
-  const pool = getQueue(mode, region);
+  const pool = getQueue(guildId, mode, region);
 
   if (pool.length === 0) return;
 
-  console.log(`[creative-queue] sweep ${mode}/${region}: ${pool.length} in queue`);
+  console.log(`[creative-queue] sweep ${guildId}/${mode}/${region}: ${pool.length} in queue`);
   for (const unit of pool) {
     const wait = (now - new Date(unit.joinedAt).getTime()) / 1000;
     console.log(
@@ -175,8 +180,8 @@ function attemptMatchingForQueue(mode, region) {
         console.log(`[creative-queue] MATCH: ${describeUnit(unitA)} <-> ${describeUnit(unitB)} (logPR diff ${bestDiff.toFixed(1)})`);
         pool.splice(Math.max(i, bestJ), 1);
         pool.splice(Math.min(i, bestJ), 1);
-        save();
-        creativeMatchEvents.emit('matchFound', { unitA, unitB, mode, region });
+        save(guildId);
+        creativeMatchEvents.emit('matchFound', { unitA, unitB, mode, region, guildId });
         matchedSomething = true;
         break; // pool mutated — restart the scan
       }
@@ -185,10 +190,12 @@ function attemptMatchingForQueue(mode, region) {
 }
 
 function sweepAllCreativeQueues() {
-  for (const mode of Object.keys(creativeQueues)) {
-    for (const region of Object.keys(creativeQueues[mode])) {
-      if (getQueue(mode, region).length > 0) {
-        attemptMatchingForQueue(mode, region);
+  for (const guildId of Object.keys(creativeQueues)) {
+    for (const mode of Object.keys(creativeQueues[guildId])) {
+      for (const region of Object.keys(creativeQueues[guildId][mode])) {
+        if (getQueue(guildId, mode, region).length > 0) {
+          attemptMatchingForQueue(guildId, mode, region);
+        }
       }
     }
   }
@@ -214,9 +221,10 @@ async function buildCreativePlayer({ discordId, discordUsername, epicUsername, e
   };
 }
 
-function joinCreativeQueue({ player, mode, region }) {
+function joinCreativeQueue({ guildId, player, mode, region }) {
   const unit = {
     unitId: generateUnitId(),
+    guildId,
     members: [player],
     mode,
     region,
@@ -224,25 +232,25 @@ function joinCreativeQueue({ player, mode, region }) {
     joinedAt: new Date(),
   };
 
-  const pool = getQueue(mode, region);
+  const pool = getQueue(guildId, mode, region);
   pool.push(unit);
-  save();
+  save(guildId);
 
   console.log(
-    `[creative-queue] JOIN ${describeUnit(unit)} mode=${mode} region=${region} `
+    `[creative-queue] JOIN ${describeUnit(unit)} guild=${guildId} mode=${mode} region=${region} `
     + `totalPR=${player.totalPR} logPR=${toLogPR(player.totalPR).toFixed(1)} platform=${player.platform} `
     + `— ${pool.length} now in queue`
   );
 
-  attemptMatchingForQueue(mode, region);
+  attemptMatchingForQueue(guildId, mode, region);
 
   return { unit };
 }
 
 function requeueCreativeUnit(unit) {
-  getQueue(unit.mode, unit.region).push(unit);
-  save();
-  attemptMatchingForQueue(unit.mode, unit.region);
+  getQueue(unit.guildId, unit.mode, unit.region).push(unit);
+  save(unit.guildId);
+  attemptMatchingForQueue(unit.guildId, unit.mode, unit.region);
 }
 
 module.exports = {

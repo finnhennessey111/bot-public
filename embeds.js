@@ -537,6 +537,115 @@ function buildHowtoEmbed() {
     .setFooter({ text: 'MatchMaker' });
 }
 
+// ── ROLES ──────────────────────────────────────────────────────────────────
+// Extracted from index.js's former postRolesEmbed — content unchanged, just split into an
+// embed builder and a components builder so /matchmaker-setup can post them without depending
+// on index.js's interaction-handling module.
+
+function buildRolesEmbed() {
+  return new EmbedBuilder()
+    .setTitle('🎮 Set Up Your Profile')
+    .setDescription('Use the menus below to customise your MatchMaker profile.\n\n**Region is mandatory** — everything else is optional.')
+    .setColor(0x1E3A5F)
+    .setFooter({ text: 'MatchMaker • Complete your profile to queue' });
+}
+
+function buildRolesComponents() {
+  const regionMenu = new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId('select_region')
+      .setPlaceholder('🌍 Select your primary region (mandatory)')
+      .addOptions(
+        new StringSelectMenuOptionBuilder().setLabel('EU — Europe').setValue('EU').setEmoji('🇪🇺'),
+        new StringSelectMenuOptionBuilder().setLabel('NA Central').setValue('NAC').setEmoji('🌎'),
+        new StringSelectMenuOptionBuilder().setLabel('Middle East').setValue('ME').setEmoji('🌍'),
+      )
+  );
+
+  const extraRegionMenu = new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId('select_extra_regions')
+      .setPlaceholder('🌐 Additional regions (optional)')
+      .setMinValues(0)
+      .setMaxValues(2)
+      .addOptions(
+        new StringSelectMenuOptionBuilder().setLabel('EU — Europe').setValue('EU').setEmoji('🇪🇺'),
+        new StringSelectMenuOptionBuilder().setLabel('NA Central').setValue('NAC').setEmoji('🌎'),
+        new StringSelectMenuOptionBuilder().setLabel('Middle East').setValue('ME').setEmoji('🌍'),
+      )
+  );
+
+  const ingameRoleMenu = new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId('select_ingame_role')
+      .setPlaceholder('🎯 In-game role (optional, pick multiple)')
+      .setMinValues(0)
+      .setMaxValues(3)
+      .addOptions(
+        new StringSelectMenuOptionBuilder().setLabel('Fragger').setValue('Fragger').setEmoji('💥'),
+        new StringSelectMenuOptionBuilder().setLabel('IGL (In-Game Leader)').setValue('IGL').setEmoji('🧠'),
+        new StringSelectMenuOptionBuilder().setLabel('Support').setValue('Support').setEmoji('🛡️'),
+      )
+  );
+
+  const languageMenu = new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId('select_language')
+      .setPlaceholder('🗣️ Language (optional)')
+      .addOptions(
+        new StringSelectMenuOptionBuilder().setLabel('English').setValue('English'),
+        new StringSelectMenuOptionBuilder().setLabel('Spanish').setValue('Spanish'),
+        new StringSelectMenuOptionBuilder().setLabel('French').setValue('French'),
+        new StringSelectMenuOptionBuilder().setLabel('German').setValue('German'),
+        new StringSelectMenuOptionBuilder().setLabel('Portuguese').setValue('Portuguese'),
+        new StringSelectMenuOptionBuilder().setLabel('Turkish').setValue('Turkish'),
+        new StringSelectMenuOptionBuilder().setLabel('Arabic').setValue('Arabic'),
+        new StringSelectMenuOptionBuilder().setLabel('Other').setValue('Other'),
+      )
+  );
+
+  const bioButton = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId('set_bio')
+      .setLabel('✏️ Set Bio (optional)')
+      .setStyle(ButtonStyle.Secondary)
+  );
+
+  return [regionMenu, extraRegionMenu, ingameRoleMenu, languageMenu, bioButton];
+}
+
+// ── REGISTER ───────────────────────────────────────────────────────────────
+
+function buildRegisterEmbed(getRolesChannelId) {
+  return new EmbedBuilder()
+    .setTitle('📋 Get Started')
+    .setDescription(
+      '• 🔗 Link your Epic account using **Yunite** in this channel\n' +
+      `• ✅ Once linked, go to ${getRolesChannelId ? `<#${getRolesChannelId}>` : '#get-roles'} to complete your profile\n` +
+      '• 🎮 Then you can queue in tournament and creative channels'
+    )
+    .setColor(0x4A90D9)
+    .setFooter({ text: 'MatchMaker' });
+}
+
+// ── WELCOME DM ─────────────────────────────────────────────────────────────
+
+function buildWelcomeDmEmbed(guildName) {
+  return new EmbedBuilder()
+    .setTitle('👋 Thanks for adding MatchMaker!')
+    .setDescription(
+      `Before your members can use MatchMaker in **${guildName}**, a couple of setup steps:\n\n` +
+      '**1.** Install Yunite (yunite.xyz) in your server, if you haven\'t already.\n' +
+      '**2.** Authorize the MatchMaker app on Yunite for your server — this lets MatchMaker look up ' +
+      'linked Epic accounts.\n' +
+      '**3.** Run `/matchmaker-setup` as a server admin — this creates all the roles, categories, ' +
+      'channels, and starter embeds MatchMaker needs, and asks for your Yunite API token as part of the command.\n\n' +
+      'That\'s it — MatchMaker will be fully live for your server after that.'
+    )
+    .setColor(0x4A90D9)
+    .setFooter({ text: 'MatchMaker' });
+}
+
 module.exports = {
   buildTournamentEmbed,
   buildQueueButtons,
@@ -564,4 +673,8 @@ module.exports = {
   buildVoteKickEmbed,
   buildVoteKickButtons,
   buildHowtoEmbed,
+  buildRolesEmbed,
+  buildRolesComponents,
+  buildRegisterEmbed,
+  buildWelcomeDmEmbed,
 };

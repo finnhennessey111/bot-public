@@ -1,18 +1,17 @@
-// permissions.js - Server-wide permission enforcement, re-applied on every bot startup so
-// manual changes in Discord's UI (or a missed step during setup) don't silently drift from
-// the intended access model. Uses PermissionOverwriteManager#edit (a per-target merge) rather
-// than replacing each channel's overwrite array outright, so it never clobbers overwrites this
-// module doesn't know about (e.g. per-player allows on a private match channel).
+// permissions.js - Server-wide permission enforcement, re-applied on every bot startup (looped
+// over every guild) so manual changes in Discord's UI (or a missed step during setup) don't
+// silently drift from the intended access model. Uses PermissionOverwriteManager#edit (a
+// per-target merge) rather than replacing each channel's overwrite array outright, so it never
+// clobbers overwrites this module doesn't know about (e.g. per-player allows on a private match
+// channel).
 
 const { PermissionFlagsBits } = require('discord.js');
-const { pinnedMessages, creativeChannels } = require('./store');
+const { pinnedMessages } = require('./store');
+const { getChannelId, getRoleId, getCreativeChannelInfo } = require('./guild-config');
 
-// Channels every registered member should be able to see and use.
-const PUBLIC_CHANNEL_ENV_VARS = [
-  'GET_ROLES_CHANNEL_ID',
-  'HOWTO_CHANNEL_ID',
-  'FORM_PARTY_CHANNEL_ID',
-];
+// Channels every registered member should be able to see and use — keys into guild-config's
+// channelIds map (populated by /matchmaker-setup).
+const PUBLIC_CHANNEL_KEYS = ['getRoles', 'howto', 'formParty'];
 
 async function editOverwrite(channel, targetId, permissions, label) {
   try {
@@ -40,16 +39,16 @@ async function lockGuildBasePermissions(guild) {
 }
 
 async function enforcePublicChannels(guild) {
-  for (const envVar of PUBLIC_CHANNEL_ENV_VARS) {
-    const channelId = process.env[envVar];
+  for (const key of PUBLIC_CHANNEL_KEYS) {
+    const channelId = getChannelId(guild.id, key);
     if (!channelId) {
-      console.warn(`  ⚠️ ${envVar} not set — skipping public-visibility enforcement for it`);
+      console.warn(`  ⚠️ No ${key} channel configured for this guild — skipping public-visibility enforcement for it`);
       continue;
     }
 
     const channel = await guild.channels.fetch(channelId).catch(() => null);
     if (!channel) {
-      console.warn(`  ⚠️ ${envVar} (${channelId}) not found — skipping`);
+      console.warn(`  ⚠️ ${key} channel (${channelId}) not found — skipping`);
       continue;
     }
 
@@ -71,23 +70,24 @@ async function lockQueueChannelAttachments(guild, channelId, { everyoneVisible }
   }
   await editOverwrite(channel, guild.roles.everyone, everyonePerms, '@everyone');
 
-  const modRoleId = process.env.MOD_ROLE_ID;
+  const modRoleId = getRoleId(guild.id, 'mod');
   if (modRoleId) {
     await editOverwrite(channel, modRoleId, { ViewChannel: true }, 'mod role');
   }
 }
 
 async function enforceQueueChannels(guild) {
-  for (const channelId of Object.keys(pinnedMessages)) {
+  const guildPinnedChannelIds = Object.entries(pinnedMessages)
+    .filter(([, pinned]) => pinned.guildId === guild.id)
+    .map(([channelId]) => channelId);
+
+  for (const channelId of guildPinnedChannelIds) {
     await lockQueueChannelAttachments(guild, channelId, { everyoneVisible: false });
   }
 
-  const creativeChannelIds = [
-    creativeChannels['1v1']?.channelId,
-    creativeChannels['2v2']?.channelId,
-    process.env.CREATIVE_6S_CHANNEL_ID,
-    process.env.CREATIVE_8S_CHANNEL_ID,
-  ].filter(Boolean);
+  const creativeChannelIds = ['1v1', '2v2', '6s', '8s']
+    .map(category => getCreativeChannelInfo(guild.id, category)?.channelId)
+    .filter(Boolean);
 
   for (const channelId of creativeChannelIds) {
     await lockQueueChannelAttachments(guild, channelId, { everyoneVisible: true });
@@ -95,7 +95,7 @@ async function enforceQueueChannels(guild) {
 }
 
 async function enforcePermissions(guild) {
-  console.log('🔐 Enforcing server permissions...');
+  console.log(`🔐 Enforcing server permissions for guild ${guild.id}...`);
   await lockGuildBasePermissions(guild);
   await enforcePublicChannels(guild);
   await enforceQueueChannels(guild);

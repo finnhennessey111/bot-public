@@ -2,47 +2,35 @@
 // text+voice pairs), shared by 1v1/2v2 creative matches, 6s/8s team matches, and tournament
 // matches.
 //
-// Deletion timestamps are persisted to data.json (store.js's matchChannels) so timers survive a
-// bot restart — restoreScheduledDeletions() re-derives the remaining delay from the stored
-// deleteAt instead of resetting the clock, and deletes immediately anything already overdue.
-// The shared category channel (MATCH_CATEGORY_ID, auto-created if unset/missing) is likewise
-// persisted (store.js's settings.matchCategoryId) so it's only created once.
+// Deletion timestamps are persisted to data.json/MongoDB (store.js's matchChannels) so timers
+// survive a bot restart — restoreScheduledDeletions() re-derives the remaining delay from the
+// stored deleteAt instead of resetting the clock, and deletes immediately anything already
+// overdue. The shared category channel is likewise persisted, per-guild, in guild-config.js's
+// categoryIds.match (guild-config.js's seedLegacyGuildFromEnv folds in the original single-guild
+// deployment's MATCH_CATEGORY_ID once, so there's no env-var fallback needed here anymore).
 
 const { EventEmitter } = require('events');
 const { ChannelType } = require('discord.js');
-const { matchChannels, settings, save } = require('./store');
+const { matchChannels, save } = require('./store');
+const { getCategoryId, setGuildConfig } = require('./guild-config');
 
 const WARNING_MS = 60 * 1000;
 
 const channelLifecycleEvents = new EventEmitter();
 
 async function getOrCreateMatchCategory(guild) {
-  if (settings.matchCategoryId) {
+  const existingId = getCategoryId(guild.id, 'match');
+  if (existingId) {
     try {
-      const existing = await guild.channels.fetch(settings.matchCategoryId);
+      const existing = await guild.channels.fetch(existingId);
       if (existing) return existing;
     } catch (err) {
-      console.warn('Stored matchCategoryId no longer valid, re-resolving:', err.message);
-    }
-  }
-
-  const envId = process.env.MATCH_CATEGORY_ID;
-  if (envId) {
-    try {
-      const envCategory = await guild.channels.fetch(envId);
-      if (envCategory) {
-        settings.matchCategoryId = envId;
-        save();
-        return envCategory;
-      }
-    } catch (err) {
-      console.warn('MATCH_CATEGORY_ID set but channel not found, creating a new category:', err.message);
+      console.warn('Stored match categoryId no longer valid, re-resolving:', err.message);
     }
   }
 
   const created = await guild.channels.create({ name: 'Matches', type: ChannelType.GuildCategory });
-  settings.matchCategoryId = created.id;
-  save();
+  await setGuildConfig(guild.id, { categoryIds: { match: created.id } });
   return created;
 }
 
@@ -58,7 +46,7 @@ function scheduleChannelDeletion({ client, guildId, textChannelId, voiceChannelI
     warned: false,
   };
   matchChannels[textChannelId] = record;
-  save();
+  save(guildId);
 
   armTimers(client, record);
 }
@@ -89,7 +77,7 @@ async function sendWarning(client, textChannelId) {
   if (!record || record.warned) return; // cancelled early, or already warned across a restart
 
   record.warned = true;
-  save();
+  save(record.guildId);
 
   try {
     const channel = await client.channels.fetch(textChannelId);
@@ -104,7 +92,7 @@ async function performDeletion(client, textChannelId) {
   if (!record) return; // cancelled early via the close button
 
   delete matchChannels[textChannelId];
-  save();
+  save(record.guildId);
 
   for (const id of [record.textChannelId, record.voiceChannelId].filter(Boolean)) {
     try {
@@ -129,10 +117,13 @@ function cancelChannelDeletion(textChannelId) {
   const record = matchChannels[textChannelId];
   if (!record) return null;
   delete matchChannels[textChannelId];
-  save();
+  save(record.guildId);
   return record;
 }
 
+// No guild filtering needed — every record already resolves via client.channels.fetch, which
+// works regardless of which guild the channel belongs to, so re-arming every record globally
+// (across every guild) on restart is correct and simpler than filtering.
 function restoreScheduledDeletions(client) {
   for (const record of Object.values(matchChannels)) {
     armTimers(client, record);

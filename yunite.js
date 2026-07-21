@@ -1,15 +1,26 @@
-// yunite.js - Yunite API integration for Discord ID → Epic ID lookup
+// yunite.js - Yunite API integration for Discord ID → Epic ID lookup, per guild.
+//
+// Each server admin supplies their own Yunite API token during /matchmaker-setup (stored in
+// that guild's Mongo config via guild-config.js) — Yunite scopes account links per Discord
+// guild, and each server authorizes the MatchMaker app on Yunite's own dashboard independently.
+// process.env.YUNITE_TOKEN is kept only as a fallback for guilds that haven't set their own
+// (in practice, just this bot's own dev/test server).
 
-const YUNITE_TOKEN = process.env.YUNITE_TOKEN;
-const GUILD_ID = process.env.GUILD_ID;
+const { getYuniteToken } = require('./guild-config');
+
 const BASE_URL = 'https://yunite.xyz/api/v3';
 
-async function getEpicFromDiscord(discordId) {
-  const response = await fetch(`${BASE_URL}/guild/${GUILD_ID}/registration/links`, {
+async function getEpicFromDiscord(discordId, guildId) {
+  const token = getYuniteToken(guildId) ?? process.env.YUNITE_TOKEN;
+  if (!token) {
+    throw new Error('No Yunite API token configured for this server — run /matchmaker-setup.');
+  }
+
+  const response = await fetch(`${BASE_URL}/guild/${guildId}/registration/links`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'Y-Api-Token': YUNITE_TOKEN,
+      'Y-Api-Token': token,
     },
     body: JSON.stringify({
       type: 'DISCORD',

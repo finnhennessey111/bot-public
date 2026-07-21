@@ -12,6 +12,7 @@ const config = require('./config');
 const { toLogPR, getCreativeWideningTier } = require('./creative-queue');
 const creativeTeamQueue = require('./creative-team-queue');
 const channelLifecycle = require('./channel-lifecycle');
+const { getRoleId } = require('./guild-config');
 const {
   buildCreativeMatchConfirmedEmbed, buildCloseChannelButton,
   buildReadyCheckEmbed, buildReadyButton,
@@ -33,8 +34,9 @@ function getMatchByChannelId(channelId) {
   return activeTeamMatches.get(channelId) ?? null;
 }
 
-function isPlayerInActiveTeamMatch(discordId) {
+function isPlayerInActiveTeamMatch(guildId, discordId) {
   for (const matchState of activeTeamMatches.values()) {
+    if (matchState.guildId !== guildId) continue;
     if (matchState.players.some(p => p.discordId === discordId)) return true;
   }
   return false;
@@ -53,7 +55,7 @@ async function startTeamMatch(units, mode, region, guild, client) {
   let channel;
   let voiceChannel;
   try {
-    const modRoleId = process.env.MOD_ROLE_ID;
+    const modRoleId = getRoleId(guild.id, 'mod');
 
     channel = await guild.channels.create({
       name: `team-${category}-${shortId}`,
@@ -97,6 +99,7 @@ async function startTeamMatch(units, mode, region, guild, client) {
 
   const matchState = {
     matchId: generateId('team'),
+    guildId: guild.id,
     channelId: channel.id,
     voiceChannelId: voiceChannel.id,
     mode,
@@ -482,7 +485,7 @@ async function removePlayerAndBackfill(matchState, discordId, guild, client, cha
     console.error('Failed to remove permissions for departed player:', err.message);
   }
 
-  creativeTeamQueue.queueUnit([removedPlayer], matchState.mode, matchState.region);
+  creativeTeamQueue.queueUnit(matchState.guildId, [removedPlayer], matchState.mode, matchState.region);
 
   await backfillVacancies(matchState, guild, client, channel);
 }
@@ -503,7 +506,7 @@ async function backfillVacancies(matchState, guild, client, channel) {
     const groupPlats = new Set(matchState.players.map(p => p.platform));
 
     const pulledUnits = creativeTeamQueue.pullReplacementUnits(
-      matchState.mode, matchState.region, vacantCount, groupAvg, groupPlats, tier, matchState.removedPlayerIds
+      matchState.guildId, matchState.mode, matchState.region, vacantCount, groupAvg, groupPlats, tier, matchState.removedPlayerIds
     );
     const newPlayers = pulledUnits.flatMap(u => u.players);
 

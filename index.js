@@ -13,10 +13,15 @@ const {
   isInQueue, getQueueCount, startMatchSweep, matchEvents, findUnitByDiscordId,
 } = require('./queue');
 const { createMatch, acceptMatch, rejectMatch, getPendingMatchByDiscordId } = require('./matching');
-const { getUser, updateUser, isRegistered } = require('./database');
+// Named playerStore (not `players`) — this file uses `players` extensively as a local variable
+// name for arrays of built player objects, which would otherwise shadow this module import.
+const playerStore = require('./players');
 const { getEpicFromDiscord } = require('./yunite');
 const { startScheduler, checkAndCreateChannels } = require('./channel-manager');
 const { enforcePermissions } = require('./permissions');
+const guildConfig = require('./guild-config');
+const { getRoleId, getChannelId } = guildConfig;
+const { runMatchmakerSetup } = require('./matchmaker-setup');
 const {
   buildTournamentEmbed, buildQueueButtons, buildLeaveQueueButton,
   buildMatchCard, buildMatchButtons, buildMatchConfirmedEmbed,
@@ -25,7 +30,7 @@ const {
   buildCreativeMatchConfirmedEmbed, buildCloseChannelButton, buildCreativeMatchCard,
   buildReadyCheckEmbed, buildTeamMethodVoteEmbed, buildTeamChoiceEmbed,
   buildVoteKickEmbed, buildVoteKickButtons,
-  buildHowtoEmbed,
+  buildHowtoEmbed, buildRolesEmbed, buildRolesComponents,
 } = require('./embeds');
 const store = require('./store');
 const { pinnedMessages, save: saveStore } = store;
@@ -79,17 +84,17 @@ function categoryForAnyMode(mode) {
 // system and any creative queue (1v1/2v2 or 6s/8s) at once. Pending matches are tagged by
 // `kind` (matching.js) so a pending creative accept/reject doesn't count as tournament activity
 // and vice versa.
-function isInTournamentActivity(discordId) {
-  if (findUnitByDiscordId(discordId)) return true;
-  const pending = getPendingMatchByDiscordId(discordId);
+function isInTournamentActivity(guildId, discordId) {
+  if (findUnitByDiscordId(guildId, discordId)) return true;
+  const pending = getPendingMatchByDiscordId(guildId, discordId);
   return !!pending && pending.match.kind !== 'creative';
 }
 
-function isInCreativeActivity(discordId) {
-  if (isInCreativeQueue(discordId)) return true;
-  if (creativeTeamQueue.isInTeamQueue(discordId)) return true;
-  if (teamMatchLifecycle.isPlayerInActiveTeamMatch(discordId)) return true;
-  const pending = getPendingMatchByDiscordId(discordId);
+function isInCreativeActivity(guildId, discordId) {
+  if (isInCreativeQueue(guildId, discordId)) return true;
+  if (creativeTeamQueue.isInTeamQueue(guildId, discordId)) return true;
+  if (teamMatchLifecycle.isPlayerInActiveTeamMatch(guildId, discordId)) return true;
+  const pending = getPendingMatchByDiscordId(guildId, discordId);
   return !!pending && pending.match.kind === 'creative';
 }
 
@@ -101,48 +106,60 @@ const client = new Client({
   ],
 });
 
-client.once('clientReady', () => {
+client.once('clientReady', async () => {
   console.log(`✅ MatchMaker bot is online as ${client.user.tag}`);
-  const guild = client.guilds.cache.first();
-  if (guild) {
+
+  // client.guilds.cache is only reliably populated once the ready sequence completes, so
+  // guild-config's per-guild backfill/hydration has to happen here, not before login.
+  await guildConfig.init(client);
+
+  for (const guild of client.guilds.cache.values()) {
     enforcePermissions(guild).catch(console.error);
-    startScheduler(guild, pinnedMessages);
-    startMatchSweep();
-    matchEvents.on('matchFound', ({ unitA, unitB, tournamentName, region }) => {
-      notifyMatchFound(unitA, unitB, tournamentName, region, guild).catch(console.error);
-    });
-
-    startCreativeMatchSweep();
-    creativeMatchEvents.on('matchFound', ({ unitA, unitB, mode, region }) => {
-      notifyCreativeMatchFound(unitA, unitB, mode, region, guild).catch(console.error);
-    });
-
-    creativeTeamQueue.startCreativeTeamMatchSweep();
-    creativeTeamQueue.creativeTeamMatchEvents.on('matchFormed', ({ units, mode, region }) => {
-      teamMatchLifecycle.startTeamMatch(units, mode, region, guild, client).catch(console.error);
-    });
-
-    channelLifecycle.restoreScheduledDeletions(client);
-    channelLifecycle.channelLifecycleEvents.on('channelDeleted', ({ textChannelId, kind }) => {
-      if (kind === 'creative-team') teamMatchLifecycle.endTeamMatch(textChannelId);
-    });
   }
+
+  startScheduler(client, pinnedMessages);
+  startMatchSweep();
+  matchEvents.on('matchFound', ({ unitA, unitB, tournamentName, region, guildId }) => {
+    const guild = client.guilds.cache.get(guildId);
+    if (guild) notifyMatchFound(unitA, unitB, tournamentName, region, guild).catch(console.error);
+  });
+
+  startCreativeMatchSweep();
+  creativeMatchEvents.on('matchFound', ({ unitA, unitB, mode, region, guildId }) => {
+    const guild = client.guilds.cache.get(guildId);
+    if (guild) notifyCreativeMatchFound(unitA, unitB, mode, region, guild).catch(console.error);
+  });
+
+  creativeTeamQueue.startCreativeTeamMatchSweep();
+  creativeTeamQueue.creativeTeamMatchEvents.on('matchFormed', ({ units, mode, region, guildId }) => {
+    const guild = client.guilds.cache.get(guildId);
+    if (guild) teamMatchLifecycle.startTeamMatch(units, mode, region, guild, client).catch(console.error);
+  });
+
+  channelLifecycle.restoreScheduledDeletions(client);
+  channelLifecycle.channelLifecycleEvents.on('channelDeleted', ({ textChannelId, kind }) => {
+    if (kind === 'creative-team') teamMatchLifecycle.endTeamMatch(textChannelId);
+  });
 });
+
+// Only fires for guilds joined WHILE the bot is running — guildConfig.init() (above) handles
+// backfilling config for guilds already joined at startup, without sending a DM for those.
+client.on('guildCreate', guild => guildConfig.handleNewGuild(guild).catch(console.error));
 
 // ── PLATFORM HELPERS ──────────────────────────────────────────────────────────
 
-function isConsolePlayer(member) {
-  return member.roles.cache.has(process.env.ROLE_CONSOLE);
+function isConsolePlayer(guildId, member) {
+  return member.roles.cache.has(getRoleId(guildId, 'Console'));
 }
 
-function isPCPlayer(member) {
-  return member.roles.cache.has(process.env.ROLE_PC);
+function isPCPlayer(guildId, member) {
+  return member.roles.cache.has(getRoleId(guildId, 'PC'));
 }
 
-function getPlatformFromMember(member) {
-  if (member.roles.cache.has(process.env.ROLE_PC)) return 'PC';
-  if (member.roles.cache.has(process.env.ROLE_CONSOLE)) return 'Console';
-  if (member.roles.cache.has(process.env.ROLE_MOBILE)) return 'Mobile';
+function getPlatformFromMember(guildId, member) {
+  if (member.roles.cache.has(getRoleId(guildId, 'PC'))) return 'PC';
+  if (member.roles.cache.has(getRoleId(guildId, 'Console'))) return 'Console';
+  if (member.roles.cache.has(getRoleId(guildId, 'Mobile'))) return 'Mobile';
   return null;
 }
 
@@ -193,12 +210,13 @@ async function handleInteraction(interaction) {
 
       pinnedMessages[interaction.channelId] = {
         messageId: msg.id,
+        guildId: interaction.guild.id,
         tournamentName,
         region,
         isTrios,
         consoleOnly: false,
       };
-      saveStore();
+      saveStore(interaction.guild.id);
 
       await interaction.editReply({
         content: `✅ Tournament embed created for **${tournamentName}** (${region})`,
@@ -208,7 +226,7 @@ async function handleInteraction(interaction) {
     // /setup-roles
     if (interaction.commandName === 'setup-roles') {
       await interaction.deferReply({ flags: 64 });
-      await postRolesEmbed(interaction.channel);
+      await interaction.channel.send({ embeds: [buildRolesEmbed()], components: buildRolesComponents() });
       await interaction.editReply({ content: '✅ Roles embed posted.' });
     }
 
@@ -220,54 +238,27 @@ async function handleInteraction(interaction) {
       await interaction.editReply({ content: '✅ Party instructions posted and pinned.' });
     }
 
-    // /setup-creative-1v1, /setup-creative-2v2
-    if (interaction.commandName === 'setup-creative-1v1' || interaction.commandName === 'setup-creative-2v2') {
+    // /setup-creative-1v1, /setup-creative-2v2, /setup-creative-6s, /setup-creative-8s — all
+    // post wherever the command is run (6s/8s used to target a fixed env-var channel; there's
+    // no per-guild equivalent of that now that config lives in Mongo, so they match 1v1/2v2's
+    // existing "post wherever run" behavior instead).
+    if ([
+      'setup-creative-1v1', 'setup-creative-2v2', 'setup-creative-6s', 'setup-creative-8s',
+    ].includes(interaction.commandName)) {
       await interaction.deferReply({ flags: 64 });
-      const category = interaction.commandName === 'setup-creative-1v1' ? '1v1' : '2v2';
-      await postCreativeQueueChannel(interaction.channel, category, QUEUE_CHANNEL_CONFIGS[category]);
+      const category = interaction.commandName.replace('setup-creative-', '');
+      await postCreativeQueueChannel(interaction.guild.id, interaction.channel, category, QUEUE_CHANNEL_CONFIGS[category]);
       await interaction.editReply({ content: `✅ Creative ${category} queue embed posted and pinned.` });
     }
 
-    // /setup-creative-6s, /setup-creative-8s — always post into the fixed env-var channel,
-    // regardless of where the command is run (unlike 1v1/2v2's "post wherever run").
-    if (interaction.commandName === 'setup-creative-6s' || interaction.commandName === 'setup-creative-8s') {
-      await interaction.deferReply({ flags: 64 });
-      const category = interaction.commandName === 'setup-creative-6s' ? '6s' : '8s';
-      const envVar = category === '6s' ? 'CREATIVE_6S_CHANNEL_ID' : 'CREATIVE_8S_CHANNEL_ID';
-      const channelId = process.env[envVar];
-
-      if (!channelId) {
-        return interaction.editReply({ content: `❌ ${envVar} is not set in .env.` });
-      }
-
-      try {
-        const targetChannel = await client.channels.fetch(channelId);
-        await postCreativeQueueChannel(targetChannel, category, QUEUE_CHANNEL_CONFIGS[category]);
-        await interaction.editReply({ content: `✅ Creative ${category} queue embed posted and pinned in ${targetChannel}.` });
-      } catch (err) {
-        console.error(`Failed to post creative ${category} queue channel:`, err.message);
-        await interaction.editReply({ content: `❌ Failed to post to <#${channelId}> — check ${envVar} is a valid channel ID the bot can see.` });
-      }
-    }
-
-    // /setup-howto — always posts into the fixed HOWTO_CHANNEL_ID env-var channel
+    // /setup-howto — posts wherever the command is run (previously a fixed env-var channel;
+    // /matchmaker-setup posts the same embed automatically into #how-to-use on first setup —
+    // this command is for manually re-posting/refreshing it elsewhere).
     if (interaction.commandName === 'setup-howto') {
       await interaction.deferReply({ flags: 64 });
-      const channelId = process.env.HOWTO_CHANNEL_ID;
-
-      if (!channelId) {
-        return interaction.editReply({ content: '❌ HOWTO_CHANNEL_ID is not set in .env.' });
-      }
-
-      try {
-        const targetChannel = await client.channels.fetch(channelId);
-        const msg = await targetChannel.send({ embeds: [buildHowtoEmbed()] });
-        await msg.pin();
-        await interaction.editReply({ content: `✅ How-to embed posted and pinned in ${targetChannel}.` });
-      } catch (err) {
-        console.error('Failed to post how-to embed:', err.message);
-        await interaction.editReply({ content: '❌ Failed to post to <#' + channelId + '> — check HOWTO_CHANNEL_ID is a valid channel ID the bot can see.' });
-      }
+      const msg = await interaction.channel.send({ embeds: [buildHowtoEmbed()] });
+      await msg.pin();
+      await interaction.editReply({ content: '✅ How-to embed posted and pinned.' });
     }
 
     // /votekick — only usable inside an active 6s/8s team match channel
@@ -322,7 +313,7 @@ async function handleInteraction(interaction) {
       }
 
       const { tournamentName, region } = pinned;
-      const count = getQueueCount(tournamentName, region);
+      const count = getQueueCount(interaction.guild.id, tournamentName, region);
       if (count > 0) {
         await interaction.channel.send(
           `⚠️ **${tournamentName}** has been cancelled. All queued players have been removed.`
@@ -331,7 +322,7 @@ async function handleInteraction(interaction) {
 
       await interaction.editReply({ content: `✅ Tournament cancelled. Channel will be deleted in 10 seconds.` });
       delete pinnedMessages[interaction.channelId];
-      saveStore();
+      saveStore(interaction.guild.id);
       setTimeout(() => interaction.channel.delete().catch(console.error), 10000);
     }
 
@@ -341,13 +332,30 @@ async function handleInteraction(interaction) {
       checkAndCreateChannels(interaction.guild, pinnedMessages).catch(console.error);
     }
 
+    // /matchmaker-setup — admin-only (see register-commands.js's setDefaultMemberPermissions).
+    // Creates every role/category/channel MatchMaker needs and posts the starter embeds,
+    // idempotently (safe to re-run — reuses anything already created and still present).
+    if (interaction.commandName === 'matchmaker-setup') {
+      await interaction.deferReply({ flags: 64 });
+
+      const yuniteToken = interaction.options.getString('yunite-token');
+
+      try {
+        const result = await runMatchmakerSetup(interaction.guild, yuniteToken);
+        await interaction.editReply({ content: result.summary });
+      } catch (err) {
+        console.error('matchmaker-setup failed:', err.message);
+        await interaction.editReply({ content: `❌ Setup failed: ${err.message}` });
+      }
+    }
+
     // /party-invite
     if (interaction.commandName === 'party-invite') {
       await interaction.deferReply({ flags: 64 });
 
-      if (interaction.channelId !== process.env.FORM_PARTY_CHANNEL_ID) {
+      if (interaction.channelId !== getChannelId(interaction.guild.id, 'formParty')) {
         return interaction.editReply({
-          content: `❌ Use this command in <#${process.env.FORM_PARTY_CHANNEL_ID}>.`,
+          content: `❌ Use this command in <#${getChannelId(interaction.guild.id, 'formParty')}>.`,
         });
       }
 
@@ -360,17 +368,17 @@ async function handleInteraction(interaction) {
       if (invited.bot) {
         return interaction.editReply({ content: '❌ You cannot invite a bot.' });
       }
-      if (party.hasPendingInvite(leader.id)) {
+      if (party.hasPendingInvite(interaction.guild.id, leader.id)) {
         return interaction.editReply({ content: '❌ You already have a pending invite out. Wait for it to resolve first.' });
       }
-      if (!party.canAddMember(leader.id)) {
+      if (!party.canAddMember(interaction.guild.id, leader.id)) {
         return interaction.editReply({ content: `❌ Your party is already at the ${party.MAX_PARTY_SIZE}-member cap.` });
       }
-      if (party.isInParty(invited.id) || party.hasPendingInvite(invited.id)) {
+      if (party.isInParty(interaction.guild.id, invited.id) || party.hasPendingInvite(interaction.guild.id, invited.id)) {
         return interaction.editReply({ content: `❌ **${invited.username}** is already in a party or has a pending invite.` });
       }
 
-      const existingParty = party.getPartyByDiscordId(leader.id);
+      const existingParty = party.getPartyByDiscordId(interaction.guild.id, leader.id);
       const formPartyChannel = interaction.channel;
 
       let privateChannel;
@@ -442,7 +450,7 @@ async function handleInteraction(interaction) {
     if (interaction.commandName === 'party-leave') {
       await interaction.deferReply({ flags: 64 });
 
-      const record = party.getPartyByDiscordId(interaction.user.id);
+      const record = party.getPartyByDiscordId(interaction.guild.id, interaction.user.id);
       if (!record) {
         return interaction.editReply({ content: '❌ You are not in a party.' });
       }
@@ -451,12 +459,12 @@ async function handleInteraction(interaction) {
 
       // Reject any pending match first (requeues both units in that match)...
       for (const discordId of memberIds) {
-        const pending = getPendingMatchByDiscordId(discordId);
+        const pending = getPendingMatchByDiscordId(interaction.guild.id, discordId);
         if (pending) rejectMatch(pending.matchId, discordId);
       }
       // ...then pull the disbanding unit back out again, wherever it ended up.
       for (const discordId of memberIds) {
-        removeFromQueueAnywhere(discordId);
+        removeFromQueueAnywhere(interaction.guild.id, discordId);
       }
 
       try {
@@ -475,7 +483,7 @@ async function handleInteraction(interaction) {
     if (interaction.commandName === 'party-status') {
       await interaction.deferReply({ flags: 64 });
 
-      const record = party.getPartyByDiscordId(interaction.user.id);
+      const record = party.getPartyByDiscordId(interaction.guild.id, interaction.user.id);
       if (!record) {
         return interaction.editReply({ content: '❌ You are not in a party. Use /party-invite to form one.' });
       }
@@ -488,7 +496,7 @@ async function handleInteraction(interaction) {
   if (interaction.isModalSubmit()) {
     if (interaction.customId === 'bio_modal') {
       const bio = interaction.fields.getTextInputValue('bio_input');
-      updateUser(interaction.user.id, { bio });
+      await playerStore.upsertPlayer(interaction.guild.id, interaction.user.id, { bio });
       await interaction.reply({ content: `✅ Bio saved: "${bio}"`, flags: 64 });
     }
 
@@ -497,45 +505,48 @@ async function handleInteraction(interaction) {
   // ── SELECT MENUS ─────────────────────────────────────────────────────────────
   if (interaction.isStringSelectMenu()) {
     await interaction.deferReply({ flags: 64 });
-    const { user, customId, values } = interaction;
+    const { user, customId, values, guildId } = interaction;
 
     if (customId === 'select_region') {
-      updateUser(user.id, { region: values[0] });
-      await assignRole(interaction.guild, user.id, regionRoleId(values[0]));
+      await playerStore.upsertPlayer(guildId, user.id, { region: values[0] });
+      await assignRole(interaction.guild, user.id, regionRoleId(guildId, values[0]));
+      // Region is the mandatory minimum for "profile complete" — grant Registered here so
+      // queue-join gates unlock as soon as this step is done, not waiting on the optional ones.
+      await assignRole(interaction.guild, user.id, getRoleId(guildId, 'Registered'));
       await interaction.editReply({ content: `✅ Primary region set to **${values[0]}**.` });
     }
 
     if (customId === 'select_extra_regions') {
-      updateUser(user.id, { extraRegions: values });
+      await playerStore.upsertPlayer(guildId, user.id, { extraRegions: values });
       for (const region of values) {
-        await assignRole(interaction.guild, user.id, regionRoleId(region));
+        await assignRole(interaction.guild, user.id, regionRoleId(guildId, region));
       }
       await interaction.editReply({ content: `✅ Extra regions unlocked: **${values.join(', ')}**.` });
     }
 
     if (customId === 'select_ingame_role') {
-      updateUser(user.id, { roles: values });
+      await playerStore.upsertPlayer(guildId, user.id, { ingameRoles: values });
       for (const role of values) {
-        await assignRole(interaction.guild, user.id, ingameRoleId(role));
+        await assignRole(interaction.guild, user.id, ingameRoleId(guildId, role));
       }
       await interaction.editReply({ content: `✅ In-game role(s) set to: **${values.join(', ')}**.` });
     }
 
     if (customId === 'select_language') {
-      updateUser(user.id, { language: values[0] });
+      await playerStore.upsertPlayer(guildId, user.id, { language: values[0] });
       await interaction.editReply({ content: `✅ Language set to **${values[0]}**.` });
     }
 
     if (customId.startsWith('creative_mode_')) {
       const category = customId.replace('creative_mode_', '');
-      const key = `${user.id}:${category}`;
+      const key = `${guildId}:${user.id}:${category}`;
       creativeSelections.set(key, { ...creativeSelections.get(key), mode: values[0] });
       await interaction.editReply({ content: `✅ Mode set to **${values[0]}**. Now select a region, then click Queue.` });
     }
 
     if (customId.startsWith('creative_region_')) {
       const category = customId.replace('creative_region_', '');
-      const key = `${user.id}:${category}`;
+      const key = `${guildId}:${user.id}:${category}`;
       creativeSelections.set(key, { ...creativeSelections.get(key), region: values[0] });
       await interaction.editReply({ content: `✅ Region set to **${values[0]}**. Now select a mode (if you haven't), then click Queue.` });
     }
@@ -622,33 +633,40 @@ async function handleInteraction(interaction) {
       const queueType = customId.replace('queue_', '');
 
       const member = await guild.members.fetch(user.id);
-      const platform = getPlatformFromMember(member);
 
-      if (consoleOnly && isPCPlayer(member)) {
+      if (!member.roles.cache.has(getRoleId(guild.id, 'Registered'))) {
+        return interaction.editReply({
+          content: `❌ Complete your profile in <#${getChannelId(guild.id, 'getRoles')}> first (set your region).`,
+        });
+      }
+
+      const platform = getPlatformFromMember(guild.id, member);
+
+      if (consoleOnly && isPCPlayer(guild.id, member)) {
         return interaction.editReply({
           content: '❌ This is a console-only tournament. PC players cannot queue here.',
         });
       }
-      if (consoleOnly && !isConsolePlayer(member)) {
+      if (consoleOnly && !isConsolePlayer(guild.id, member)) {
         return interaction.editReply({
           content: '❌ This is a console-only tournament. You must have the Console role to queue.',
         });
       }
 
-      if (queueType === 'lf2' && party.isInParty(user.id)) {
+      if (queueType === 'lf2' && party.isInParty(guild.id, user.id)) {
         return interaction.editReply({
           content: '❌ You are in a party — ask your party leader to click "Looking for 1", or run /party-leave to queue solo.',
         });
       }
 
-      if (isInQueue(user.id, tournamentName, region)) {
+      if (isInQueue(guild.id, user.id, tournamentName, region)) {
         return interaction.editReply({
           content: '🔍 You are currently in queue. Click to leave.',
           components: [buildLeaveQueueButton()],
         });
       }
 
-      if (isInCreativeActivity(user.id)) {
+      if (isInCreativeActivity(guild.id, user.id)) {
         return interaction.editReply({ content: '❌ You are already in a creative queue or match. Leave it before queueing for a tournament.' });
       }
 
@@ -657,7 +675,7 @@ async function handleInteraction(interaction) {
       try {
         const { epicUsername, epicId } = await resolveEpicIdentity(guild, member);
 
-        const userData = getUser(user.id);
+        const userData = await playerStore.getPlayer(guild.id, user.id);
         const homeRegion = userData?.region ?? region;
 
         const player = await buildPlayer({
@@ -671,14 +689,14 @@ async function handleInteraction(interaction) {
           queueType,
           platform,
           consoleOnly,
-          ingameRoles: userData?.roles ?? [],
+          ingameRoles: userData?.ingameRoles ?? [],
           language: userData?.language ?? null,
           bio: userData?.bio ?? null,
         });
 
-        await joinQueue({ players: [player], tournamentName, region, queueType });
+        await joinQueue({ guildId: guild.id, players: [player], tournamentName, region, queueType });
 
-        await updateQueueEmbed(channelId, tournamentName, region, isTrios);
+        await updateQueueEmbed(guild.id, channelId, tournamentName, region, isTrios);
 
         await interaction.editReply({
           content: `✅ You are now in queue for **${tournamentName}**! We'll DM you the moment a match is found.`,
@@ -701,7 +719,7 @@ async function handleInteraction(interaction) {
 
       const { tournamentName, region, isTrios, consoleOnly } = pinned;
 
-      const partyRecord = party.getPartyByDiscordId(user.id);
+      const partyRecord = party.getPartyByDiscordId(guild.id, user.id);
       if (!partyRecord) {
         return interaction.editReply({
           content: '❌ You need an active party to queue here. Use /party-invite in #form-party, or click "Looking for 2" to queue solo.',
@@ -720,8 +738,15 @@ async function handleInteraction(interaction) {
 
       const partyMembers = await Promise.all(partyRecord.members.map(m => guild.members.fetch(m.discordId)));
 
+      const unregistered = partyMembers.find(m => !m.roles.cache.has(getRoleId(guild.id, 'Registered')));
+      if (unregistered) {
+        return interaction.editReply({
+          content: `❌ **${unregistered.user.username}** needs to complete their profile in <#${getChannelId(guild.id, 'getRoles')}> first (set their region).`,
+        });
+      }
+
       for (const member of partyMembers) {
-        const platform = getPlatformFromMember(member);
+        const platform = getPlatformFromMember(guild.id, member);
         if (consoleOnly && platform === 'PC') {
           return interaction.editReply({
             content: `❌ This is a console-only tournament. **${member.user.username}** is registered as PC and cannot queue here.`,
@@ -735,13 +760,13 @@ async function handleInteraction(interaction) {
       }
 
       for (const member of partyMembers) {
-        if (isInQueue(member.id, tournamentName, region)) {
+        if (isInQueue(guild.id, member.id, tournamentName, region)) {
           return interaction.editReply({ content: `❌ **${member.user.username}** is already in queue for this tournament.` });
         }
-        if (getPendingMatchByDiscordId(member.id)) {
+        if (getPendingMatchByDiscordId(guild.id, member.id)) {
           return interaction.editReply({ content: `❌ **${member.user.username}** already has a pending match to resolve first.` });
         }
-        if (isInCreativeActivity(member.id)) {
+        if (isInCreativeActivity(guild.id, member.id)) {
           return interaction.editReply({ content: `❌ **${member.user.username}** is already in a creative queue or match — leave it before queueing for a tournament.` });
         }
       }
@@ -750,7 +775,7 @@ async function handleInteraction(interaction) {
 
       try {
         const players = await Promise.all(partyMembers.map(async member => {
-          const userData = getUser(member.id);
+          const userData = await playerStore.getPlayer(guild.id, member.id);
           const identity = await resolveEpicIdentity(guild, member);
           return buildPlayer({
             discordId: member.id,
@@ -761,15 +786,16 @@ async function handleInteraction(interaction) {
             homeRegion: userData?.region ?? region,
             queueRegion: region,
             queueType: 'lf1',
-            platform: getPlatformFromMember(member),
+            platform: getPlatformFromMember(guild.id, member),
             consoleOnly,
-            ingameRoles: userData?.roles ?? [],
+            ingameRoles: userData?.ingameRoles ?? [],
             language: userData?.language ?? null,
             bio: userData?.bio ?? null,
           });
         }));
 
         await joinQueue({
+          guildId: guild.id,
           players,
           tournamentName,
           region,
@@ -777,7 +803,7 @@ async function handleInteraction(interaction) {
           partyId: partyRecord.partyId,
         });
 
-        await updateQueueEmbed(channelId, tournamentName, region, isTrios);
+        await updateQueueEmbed(guild.id, channelId, tournamentName, region, isTrios);
 
         await interaction.editReply({
           content: `✅ Your party is now in queue for **${tournamentName}**! We'll DM you both the moment a third player is found.`,
@@ -797,11 +823,11 @@ async function handleInteraction(interaction) {
       if (!pinned) return interaction.editReply({ content: '❌ Could not find tournament info.' });
 
       const { tournamentName, region, isTrios } = pinned;
-      const removed = removeFromQueue(user.id, tournamentName, region);
+      const removed = removeFromQueue(guild.id, user.id, tournamentName, region);
 
       if (removed) {
-        await updateQueueEmbed(channelId, tournamentName, region, isTrios);
-        const inParty = party.isInParty(user.id);
+        await updateQueueEmbed(guild.id, channelId, tournamentName, region, isTrios);
+        const inParty = party.isInParty(guild.id, user.id);
         await interaction.editReply({
           content: inParty
             ? '✅ You have left the queue. Your party is still active — queue again anytime.'
@@ -835,8 +861,9 @@ async function handleInteraction(interaction) {
         const isCreative = match.kind === 'creative';
 
         // Accept is clicked from the DM'd match card, where interaction.guild is null (DMs
-        // aren't part of a guild) — resolve the actual guild the same way clientReady does.
-        const matchGuild = interaction.guild ?? client.guilds.cache.first();
+        // aren't part of a guild) — resolve the actual guild the match belongs to instead
+        // (every match carries its guildId since queue.js/creative-queue.js stamp it on units).
+        const matchGuild = interaction.guild ?? client.guilds.cache.get(match.guildId);
         const category = await channelLifecycle.getOrCreateMatchCategory(matchGuild);
 
         const channelName = `${isCreative ? 'creative' : 'match'}-${players.map(p => p.epicUsername).join('-')}`
@@ -844,7 +871,7 @@ async function handleInteraction(interaction) {
           .replace(/\s+/g, '-')
           .slice(0, 100);
 
-        const modRoleId = process.env.MOD_ROLE_ID;
+        const modRoleId = getRoleId(matchGuild.id, 'mod');
 
         const privateChannel = await matchGuild.channels.create({
           name: channelName,
@@ -910,28 +937,37 @@ async function handleInteraction(interaction) {
       await interaction.deferReply({ flags: 64 });
 
       const category = customId.replace('creative_queue_', '');
-      const selection = creativeSelections.get(`${user.id}:${category}`);
+      const selection = creativeSelections.get(`${guild.id}:${user.id}:${category}`);
 
       if (!selection?.mode || !selection?.region) {
         return interaction.editReply({ content: '❌ Select a mode and region from the menus above first.' });
       }
 
-      if (isInCreativeQueue(user.id) || creativeJoinInProgress.has(user.id)) {
+      const joinKey = `${guild.id}:${user.id}`;
+
+      if (isInCreativeQueue(guild.id, user.id) || creativeJoinInProgress.has(joinKey)) {
         return interaction.editReply({
           content: '🔍 You are already in the creative queue. Click "Leave Queue" first if you want to change your selection.',
         });
       }
 
-      if (isInTournamentActivity(user.id)) {
+      if (isInTournamentActivity(guild.id, user.id)) {
         return interaction.editReply({ content: '❌ You are already in a tournament queue or match. Leave it before queueing for creative.' });
       }
 
-      creativeJoinInProgress.add(user.id);
+      creativeJoinInProgress.add(joinKey);
       await interaction.editReply({ content: '⏳ Fetching your stats...' });
 
       try {
         const member = await guild.members.fetch(user.id);
-        const platform = getPlatformFromMember(member);
+
+        if (!member.roles.cache.has(getRoleId(guild.id, 'Registered'))) {
+          return interaction.editReply({
+            content: `❌ Complete your profile in <#${getChannelId(guild.id, 'getRoles')}> first (set your region).`,
+          });
+        }
+
+        const platform = getPlatformFromMember(guild.id, member);
         const { epicUsername, epicId } = await resolveEpicIdentity(guild, member);
 
         const player = await buildCreativePlayer({
@@ -944,9 +980,9 @@ async function handleInteraction(interaction) {
           platform,
         });
 
-        joinCreativeQueue({ player, mode: selection.mode, region: selection.region });
+        joinCreativeQueue({ guildId: guild.id, player, mode: selection.mode, region: selection.region });
 
-        await updateCreativeQueueEmbed(client, category, QUEUE_CHANNEL_CONFIGS[category]);
+        await updateCreativeQueueEmbed(guild.id, client, category, QUEUE_CHANNEL_CONFIGS[category]);
 
         await interaction.editReply({
           content: `✅ You are now in the creative queue for **${selection.mode}** (${selection.region})! We'll ping you here the moment an opponent is found.`,
@@ -955,7 +991,7 @@ async function handleInteraction(interaction) {
         console.error('Creative queue error:', err);
         await interaction.editReply({ content: `❌ Error joining queue: ${err.message}` });
       } finally {
-        creativeJoinInProgress.delete(user.id);
+        creativeJoinInProgress.delete(joinKey);
       }
     }
 
@@ -963,15 +999,15 @@ async function handleInteraction(interaction) {
     if (customId === 'creative_leave_queue') {
       await interaction.deferReply({ flags: 64 });
 
-      const found = findCreativeUnitByDiscordId(user.id);
+      const found = findCreativeUnitByDiscordId(guild.id, user.id);
       if (!found) {
         return interaction.editReply({ content: '❌ You are not in the creative queue.' });
       }
 
-      removeFromCreativeQueueAnywhere(user.id);
+      removeFromCreativeQueueAnywhere(guild.id, user.id);
 
       const category = categoryForAnyMode(found.mode);
-      if (category) await updateCreativeQueueEmbed(client, category, QUEUE_CHANNEL_CONFIGS[category]);
+      if (category) await updateCreativeQueueEmbed(guild.id, client, category, QUEUE_CHANNEL_CONFIGS[category]);
 
       await interaction.editReply({ content: '✅ You have left the creative queue.' });
     }
@@ -981,13 +1017,13 @@ async function handleInteraction(interaction) {
       await interaction.deferReply({ flags: 64 });
 
       const category = customId.replace('team_queue_', '');
-      const selection = creativeSelections.get(`${user.id}:${category}`);
+      const selection = creativeSelections.get(`${guild.id}:${user.id}:${category}`);
 
       if (!selection?.mode || !selection?.region) {
         return interaction.editReply({ content: '❌ Select a mode and region from the menus above first.' });
       }
 
-      const existingParty = party.getPartyByDiscordId(user.id);
+      const existingParty = party.getPartyByDiscordId(guild.id, user.id);
       if (existingParty && existingParty.leaderId !== user.id) {
         return interaction.editReply({ content: '❌ Only your party leader can queue the party.' });
       }
@@ -995,30 +1031,37 @@ async function handleInteraction(interaction) {
       const partyMembersRaw = existingParty ? existingParty.members : [{ discordId: user.id, username: user.username }];
 
       const alreadyBusy = partyMembersRaw.some(m =>
-        isInCreativeQueue(m.discordId)
-        || creativeTeamQueue.isInTeamQueue(m.discordId)
-        || teamJoinInProgress.has(m.discordId)
-        || teamMatchLifecycle.isPlayerInActiveTeamMatch(m.discordId)
+        isInCreativeQueue(guild.id, m.discordId)
+        || creativeTeamQueue.isInTeamQueue(guild.id, m.discordId)
+        || teamJoinInProgress.has(`${guild.id}:${m.discordId}`)
+        || teamMatchLifecycle.isPlayerInActiveTeamMatch(guild.id, m.discordId)
       );
       if (alreadyBusy) {
         return interaction.editReply({ content: '❌ One or more of your party members is already queued or in an active match.' });
       }
 
-      const busyWithTournament = partyMembersRaw.find(m => isInTournamentActivity(m.discordId));
+      const busyWithTournament = partyMembersRaw.find(m => isInTournamentActivity(guild.id, m.discordId));
       if (busyWithTournament) {
         return interaction.editReply({
           content: `❌ **${busyWithTournament.username}** is already in a tournament queue or match — leave it before queueing for creative.`,
         });
       }
 
-      for (const m of partyMembersRaw) teamJoinInProgress.add(m.discordId);
+      for (const m of partyMembersRaw) teamJoinInProgress.add(`${guild.id}:${m.discordId}`);
       await interaction.editReply({ content: `⏳ Fetching stats for ${partyMembersRaw.length} player(s)...` });
 
       try {
         const members = await Promise.all(partyMembersRaw.map(m => guild.members.fetch(m.discordId)));
 
+        const unregistered = members.find(m => !m.roles.cache.has(getRoleId(guild.id, 'Registered')));
+        if (unregistered) {
+          return interaction.editReply({
+            content: `❌ **${unregistered.user.username}** needs to complete their profile in <#${getChannelId(guild.id, 'getRoles')}> first (set their region).`,
+          });
+        }
+
         const players = await Promise.all(members.map(async member => {
-          const platform = getPlatformFromMember(member);
+          const platform = getPlatformFromMember(guild.id, member);
           const { epicUsername, epicId } = await resolveEpicIdentity(guild, member);
           return buildCreativePlayer({
             discordId: member.id,
@@ -1031,9 +1074,9 @@ async function handleInteraction(interaction) {
           });
         }));
 
-        creativeTeamQueue.queueUnit(players, selection.mode, selection.region);
+        creativeTeamQueue.queueUnit(guild.id, players, selection.mode, selection.region);
 
-        await updateCreativeQueueEmbed(client, category, QUEUE_CHANNEL_CONFIGS[category]);
+        await updateCreativeQueueEmbed(guild.id, client, category, QUEUE_CHANNEL_CONFIGS[category]);
 
         const targetSize = creativeTeamQueue.targetSizeForMode(selection.mode);
         const needed = targetSize - players.length;
@@ -1046,7 +1089,7 @@ async function handleInteraction(interaction) {
         console.error('Team queue error:', err);
         await interaction.editReply({ content: `❌ Error joining queue: ${err.message}` });
       } finally {
-        for (const m of partyMembersRaw) teamJoinInProgress.delete(m.discordId);
+        for (const m of partyMembersRaw) teamJoinInProgress.delete(`${guild.id}:${m.discordId}`);
       }
     }
 
@@ -1054,15 +1097,15 @@ async function handleInteraction(interaction) {
     if (customId === 'team_leave_queue') {
       await interaction.deferReply({ flags: 64 });
 
-      const found = creativeTeamQueue.findUnitByDiscordId(user.id);
+      const found = creativeTeamQueue.findUnitByDiscordId(guild.id, user.id);
       if (!found) {
         return interaction.editReply({ content: '❌ You are not in the 6s/8s queue.' });
       }
 
-      creativeTeamQueue.removeFromTeamQueueAnywhere(user.id);
+      creativeTeamQueue.removeFromTeamQueueAnywhere(guild.id, user.id);
 
       const category = categoryForAnyMode(found.mode);
-      if (category) await updateCreativeQueueEmbed(client, category, QUEUE_CHANNEL_CONFIGS[category]);
+      if (category) await updateCreativeQueueEmbed(guild.id, client, category, QUEUE_CHANNEL_CONFIGS[category]);
 
       await interaction.editReply({ content: '✅ You (and your party) have left the 6s/8s queue.' });
     }
@@ -1172,105 +1215,24 @@ async function handleInteraction(interaction) {
   }
 }
 
-// ── POST ROLES EMBED ──────────────────────────────────────────────────────────
-async function postRolesEmbed(channel) {
-  const embed = new EmbedBuilder()
-    .setTitle('🎮 Set Up Your Profile')
-    .setDescription('Use the menus below to customise your MatchMaker profile.\n\n**Region is mandatory** — everything else is optional.')
-    .setColor(0x1E3A5F)
-    .setFooter({ text: 'MatchMaker • Complete your profile to queue' });
-
-  const regionMenu = new ActionRowBuilder().addComponents(
-    new StringSelectMenuBuilder()
-      .setCustomId('select_region')
-      .setPlaceholder('🌍 Select your primary region (mandatory)')
-      .addOptions(
-        new StringSelectMenuOptionBuilder().setLabel('EU — Europe').setValue('EU').setEmoji('🇪🇺'),
-        new StringSelectMenuOptionBuilder().setLabel('NA Central').setValue('NAC').setEmoji('🌎'),
-        new StringSelectMenuOptionBuilder().setLabel('Middle East').setValue('ME').setEmoji('🌍'),
-      )
-  );
-
-  const extraRegionMenu = new ActionRowBuilder().addComponents(
-    new StringSelectMenuBuilder()
-      .setCustomId('select_extra_regions')
-      .setPlaceholder('🌐 Additional regions (optional)')
-      .setMinValues(0)
-      .setMaxValues(2)
-      .addOptions(
-        new StringSelectMenuOptionBuilder().setLabel('EU — Europe').setValue('EU').setEmoji('🇪🇺'),
-        new StringSelectMenuOptionBuilder().setLabel('NA Central').setValue('NAC').setEmoji('🌎'),
-        new StringSelectMenuOptionBuilder().setLabel('Middle East').setValue('ME').setEmoji('🌍'),
-      )
-  );
-
-  const ingameRoleMenu = new ActionRowBuilder().addComponents(
-    new StringSelectMenuBuilder()
-      .setCustomId('select_ingame_role')
-      .setPlaceholder('🎯 In-game role (optional, pick multiple)')
-      .setMinValues(0)
-      .setMaxValues(3)
-      .addOptions(
-        new StringSelectMenuOptionBuilder().setLabel('Fragger').setValue('Fragger').setEmoji('💥'),
-        new StringSelectMenuOptionBuilder().setLabel('IGL (In-Game Leader)').setValue('IGL').setEmoji('🧠'),
-        new StringSelectMenuOptionBuilder().setLabel('Support').setValue('Support').setEmoji('🛡️'),
-      )
-  );
-
-  const languageMenu = new ActionRowBuilder().addComponents(
-    new StringSelectMenuBuilder()
-      .setCustomId('select_language')
-      .setPlaceholder('🗣️ Language (optional)')
-      .addOptions(
-        new StringSelectMenuOptionBuilder().setLabel('English').setValue('English'),
-        new StringSelectMenuOptionBuilder().setLabel('Spanish').setValue('Spanish'),
-        new StringSelectMenuOptionBuilder().setLabel('French').setValue('French'),
-        new StringSelectMenuOptionBuilder().setLabel('German').setValue('German'),
-        new StringSelectMenuOptionBuilder().setLabel('Portuguese').setValue('Portuguese'),
-        new StringSelectMenuOptionBuilder().setLabel('Turkish').setValue('Turkish'),
-        new StringSelectMenuOptionBuilder().setLabel('Arabic').setValue('Arabic'),
-        new StringSelectMenuOptionBuilder().setLabel('Other').setValue('Other'),
-      )
-  );
-
-  const bioButton = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId('set_bio')
-      .setLabel('✏️ Set Bio (optional)')
-      .setStyle(ButtonStyle.Secondary)
-  );
-
-  await channel.send({
-    embeds: [embed],
-    components: [regionMenu, extraRegionMenu, ingameRoleMenu, languageMenu, bioButton],
-  });
-}
-
 // ── ROLE ID HELPERS ───────────────────────────────────────────────────────────
-function regionRoleId(region) {
-  const map = {
-    EU: process.env.ROLE_EU,
-    NAC: process.env.ROLE_NAC,
-    ME: process.env.ROLE_ME,
-  };
-  return map[region] ?? null;
+function regionRoleId(guildId, region) {
+  return getRoleId(guildId, region);
 }
 
-function ingameRoleId(role) {
-  const map = {
-    Fragger: process.env.ROLE_FRAGGER,
-    IGL: process.env.ROLE_IGL,
-  };
-  return map[role] ?? null;
+function ingameRoleId(guildId, role) {
+  // 'Support' is offered as a select option but wasn't previously mapped to a role at all —
+  // now that /matchmaker-setup actually creates a Support role, wire it up.
+  return getRoleId(guildId, role);
 }
 
-function platformRoleId(platform) {
+function platformRoleId(guildId, platform) {
   const map = {
-    PC: process.env.ROLE_PC,
-    PS4: process.env.ROLE_CONSOLE,
-    XB1: process.env.ROLE_CONSOLE,
-    SWITCH: process.env.ROLE_CONSOLE,
-    MOBILE: process.env.ROLE_MOBILE,
+    PC: getRoleId(guildId, 'PC'),
+    PS4: getRoleId(guildId, 'Console'),
+    XB1: getRoleId(guildId, 'Console'),
+    SWITCH: getRoleId(guildId, 'Console'),
+    MOBILE: getRoleId(guildId, 'Mobile'),
   };
   return map[platform] ?? null;
 }
@@ -1289,9 +1251,9 @@ async function assignRole(guild, discordId, roleId) {
 // ── HELPER: RESOLVE EPIC IDENTITY (Yunite lookup, falls back to Discord name) ──
 async function resolveEpicIdentity(guild, member) {
   try {
-    const yuniteData = await getEpicFromDiscord(member.id);
+    const yuniteData = await getEpicFromDiscord(member.id, guild.id);
     if (yuniteData.platform) {
-      await assignRole(guild, member.id, platformRoleId(yuniteData.platform));
+      await assignRole(guild, member.id, platformRoleId(guild.id, yuniteData.platform));
     }
     return { epicUsername: yuniteData.epicName, epicId: yuniteData.epicId };
   } catch (yuniteErr) {
@@ -1314,14 +1276,14 @@ async function dmPlayer(guild, discordId, payload) {
 }
 
 // ── HELPER: UPDATE QUEUE EMBED ────────────────────────────────────────────────
-async function updateQueueEmbed(channelId, tournamentName, region, isTrios) {
+async function updateQueueEmbed(guildId, channelId, tournamentName, region, isTrios) {
   try {
     const channel = await client.channels.fetch(channelId);
     const pinned = pinnedMessages[channelId];
     if (!pinned) return;
 
     const msg = await channel.messages.fetch(pinned.messageId);
-    const count = getQueueCount(tournamentName, region);
+    const count = getQueueCount(guildId, tournamentName, region);
     const newEmbed = buildTournamentEmbed(tournamentName, region, count, isTrios, pinned.beginTime, pinned.deleteAt);
     await msg.edit({ embeds: [newEmbed], components: msg.components });
   } catch (err) {
@@ -1383,7 +1345,7 @@ async function notifyCreativeMatchFound(unitA, unitB, mode, region, guild) {
   });
 
   const category = categoryForAnyMode(mode);
-  if (category) await updateCreativeQueueEmbed(client, category, QUEUE_CHANNEL_CONFIGS[category]);
+  if (category) await updateCreativeQueueEmbed(guild.id, client, category, QUEUE_CHANNEL_CONFIGS[category]);
 }
 
 store.init()

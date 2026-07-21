@@ -5,6 +5,7 @@ const { scrapeUpcomingTournaments } = require('./tournament-scraper');
 const { save: saveStore } = require('./store');
 const { buildTournamentEmbed } = require('./embeds');
 const { getQueueCount } = require('./queue');
+const { getRoleId, getCategoryId } = require('./guild-config');
 
 const EMBED_REFRESH_INTERVAL_MS = 60 * 1000;
 
@@ -66,7 +67,7 @@ function armDeletionTimer(guild, channelId, pinned, pinnedMessages) {
     } finally {
       delete managedChannels[channelId];
       delete pinnedMessages[channelId];
-      saveStore();
+      saveStore(guild.id);
     }
   });
 
@@ -74,18 +75,6 @@ function armDeletionTimer(guild, channelId, pinned, pinnedMessages) {
   const hrsUntil = (Math.max(msUntilDelete, 0) / 3600000).toFixed(1);
   console.log(`  ⏲️ Armed deletion timer for ${channelId} (${label}) — fires in ${hrsUntil}hrs${msUntilDelete <= 0 ? ' (overdue, deleting now)' : ''}`);
 }
-
-const REGION_CATEGORIES = {
-  EU: process.env.CATEGORY_EU,
-  NAC: process.env.CATEGORY_NAC,
-  ME: process.env.CATEGORY_ME,
-};
-
-const REGION_ROLE_IDS = {
-  EU: process.env.ROLE_EU,
-  NAC: process.env.ROLE_NAC,
-  ME: process.env.ROLE_ME,
-};
 
 function buildChannelName(tournamentName, dateStr = null) {
   const cleanName = tournamentName
@@ -127,7 +116,7 @@ async function createTournamentChannel(guild, tournament, pinnedMessages) {
   // so the same tournament in a different region produces an identical name — scope the
   // dedup check to this region's category or same-name channels across regions would
   // incorrectly appear as duplicates of each other.
-  const categoryId = REGION_CATEGORIES[region];
+  const categoryId = getCategoryId(guild.id, region);
   const existing = guild.channels.cache.find(c => c.name === channelName && c.parentId === (categoryId ?? null));
   if (existing) {
     console.log(`  ⏭️ Skipped — channel already exists in this region's category: ${channelName}`);
@@ -147,14 +136,14 @@ async function createTournamentChannel(guild, tournament, pinnedMessages) {
   }
   console.log(`  ✅ Matched KNOWN_TOURNAMENTS keyword: "${matchedKeyword}"`);
 
-  const regionRoleId = REGION_ROLE_IDS[region];
-  const consoleRoleId = process.env.ROLE_CONSOLE;
+  const regionRoleId = getRoleId(guild.id, region);
+  const consoleRoleId = getRoleId(guild.id, 'Console');
 
   if (!categoryId) {
-    console.log(`  ⚠️ No CATEGORY_${region} env var set — channel will be created with no parent category`);
+    console.log(`  ⚠️ No ${region} category configured for this guild — channel will be created with no parent category`);
   }
   if (!(consoleOnly && consoleRoleId) && !regionRoleId) {
-    console.log(`  ⚠️ No ROLE_${region} env var set — channel will have no region role granted view access`);
+    console.log(`  ⚠️ No ${region} role configured for this guild — channel will have no region role granted view access`);
   }
 
   const permissionOverwrites = [
@@ -169,7 +158,7 @@ async function createTournamentChannel(guild, tournament, pinnedMessages) {
     permissionOverwrites.push({ id: regionRoleId, allow: [PermissionFlagsBits.ViewChannel], deny: noFiles });
   }
 
-  const modRoleId = process.env.MOD_ROLE_ID;
+  const modRoleId = getRoleId(guild.id, 'mod');
   if (modRoleId) {
     permissionOverwrites.push({ id: modRoleId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages] });
   }
@@ -195,13 +184,14 @@ async function createTournamentChannel(guild, tournament, pinnedMessages) {
 
     pinnedMessages[channel.id] = {
       messageId: msg.id,
+      guildId: guild.id,
       tournamentName: name,
       region,
       isTrios,
       beginTime,
       deleteAt: deleteAfter,
     };
-    saveStore();
+    saveStore(guild.id);
 
     armDeletionTimer(guild, channel.id, { tournamentName: name, region, beginTime, deleteAt: deleteAfter }, pinnedMessages);
 
@@ -257,7 +247,7 @@ async function checkAndCreateChannels(guild, pinnedMessages) {
 // Refreshes the pinned embed for every tournament channel that has a known beginTime, so the
 // countdown/elapsed/ending-soon status and left-border color stay live between player actions.
 async function updateActiveTournamentEmbeds(guild, pinnedMessages) {
-  const entries = Object.entries(pinnedMessages);
+  const entries = Object.entries(pinnedMessages).filter(([, pinned]) => pinned.guildId === guild.id);
   console.log(`🔄 Refreshing tournament embeds — ${entries.length} pinned channel(s) tracked`);
 
   // Legacy/manually-created entries can be missing beginTime (e.g. pinned before this field
@@ -283,7 +273,7 @@ async function updateActiveTournamentEmbeds(guild, pinnedMessages) {
           console.log(`  ⚠️ No match in current scrape for ${channelId} (${pinned.tournamentName}, ${pinned.region}) — leaving timer-less`);
         }
       }
-      saveStore();
+      saveStore(guild.id);
     } catch (err) {
       console.error('  ❌ Backfill scrape failed:', err.message);
     }
@@ -312,7 +302,7 @@ async function updateActiveTournamentEmbeds(guild, pinnedMessages) {
       }
 
       const msg = await channel.messages.fetch(pinned.messageId);
-      const count = getQueueCount(pinned.tournamentName, pinned.region);
+      const count = getQueueCount(guild.id, pinned.tournamentName, pinned.region);
       const newEmbed = buildTournamentEmbed(
         pinned.tournamentName, pinned.region, count, pinned.isTrios, pinned.beginTime, pinned.deleteAt
       );
@@ -324,26 +314,35 @@ async function updateActiveTournamentEmbeds(guild, pinnedMessages) {
   }
 }
 
-function startScheduler(guild, pinnedMessages) {
-  checkAndCreateChannels(guild, pinnedMessages);
+// Runs a per-guild scheduler action against every guild the bot is currently in — a fresh
+// snapshot of client.guilds.cache on each call, so a guild joined/left between ticks is picked
+// up automatically without restarting the scheduler.
+async function forEachGuild(client, action) {
+  for (const guild of client.guilds.cache.values()) {
+    await action(guild).catch(err => console.error(`Scheduler action failed for guild ${guild.id}:`, err.message));
+  }
+}
+
+function startScheduler(client, pinnedMessages) {
+  forEachGuild(client, guild => checkAndCreateChannels(guild, pinnedMessages));
   // Also run immediately (not just on the 60s interval below) so deletion timers lost to a
   // restart — managedChannels is in-memory only — get re-armed right away instead of after
   // up to a minute's delay.
-  updateActiveTournamentEmbeds(guild, pinnedMessages).catch(console.error);
+  forEachGuild(client, guild => updateActiveTournamentEmbeds(guild, pinnedMessages));
 
   setInterval(async () => {
     const now = new Date();
     console.log(`⏰ Scheduler tick — UTC hour ${now.getUTCHours()} (${now.toISOString()})`);
     if (now.getUTCHours() === 12) {
       console.log('  → 12:00 UTC — running tournament check');
-      await checkAndCreateChannels(guild, pinnedMessages);
+      await forEachGuild(client, guild => checkAndCreateChannels(guild, pinnedMessages));
     } else {
       console.log('  → not 12:00 UTC — skipping until next tick');
     }
   }, 60 * 60 * 1000);
 
   setInterval(() => {
-    updateActiveTournamentEmbeds(guild, pinnedMessages).catch(console.error);
+    forEachGuild(client, guild => updateActiveTournamentEmbeds(guild, pinnedMessages)).catch(console.error);
   }, EMBED_REFRESH_INTERVAL_MS);
 
   console.log('📅 Tournament scheduler started');
