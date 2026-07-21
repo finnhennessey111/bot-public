@@ -10,6 +10,8 @@
 const { ChannelType } = require('discord.js');
 const { getGuildConfig, setGuildConfig } = require('./guild-config');
 const { enforcePermissions } = require('./permissions');
+const { postCreativeQueueChannel } = require('./creative-channel');
+const { QUEUE_CHANNEL_CONFIGS } = require('./creative-channel-configs');
 const {
   buildRolesEmbed, buildRolesComponents, buildRegisterEmbed,
   buildHowtoEmbed, buildFormPartyInstructionsEmbed,
@@ -39,6 +41,16 @@ const CHANNEL_SPECS = [
   { key: 'getRoles', name: 'get-roles' },
   { key: 'howto', name: 'how-to-use' },
   { key: 'formParty', name: 'form-party' },
+];
+
+// Creative queue channels — separate from CHANNEL_SPECS above because they're tracked in
+// guild-config's `creativeChannels` map (channelId + pinned messageId together), not
+// `channelIds`, matching creative-channel.js's existing storage shape.
+const CREATIVE_CHANNEL_SPECS = [
+  { key: '1v1', name: 'creative-1v1' },
+  { key: '2v2', name: 'creative-2v2' },
+  { key: '6s', name: 'creative-6s' },
+  { key: '8s', name: 'creative-8s' },
 ];
 
 const runningGuilds = new Set();
@@ -71,6 +83,32 @@ async function ensureChannel(guild, existingChannelIds, spec) {
   }
   const created = await guild.channels.create({ name: spec.name, type: ChannelType.GuildText });
   return created.id;
+}
+
+// Creates (or reuses) the channel for one creative category, then posts (or reuses) its queue
+// embed via creative-channel.js's postCreativeQueueChannel — which persists {channelId,
+// messageId} into guild-config's creativeChannels map itself, so no separate save is needed
+// here. Only re-posts the embed if the channel and/or its pinned message are actually missing.
+async function ensureCreativeChannel(guild, category, spec, existingCreativeChannels) {
+  const existing = existingCreativeChannels[category];
+
+  if (existing?.channelId && existing?.messageId) {
+    try {
+      const channel = await guild.channels.fetch(existing.channelId);
+      const msg = await channel.messages.fetch(existing.messageId);
+      if (channel && msg) return existing.channelId;
+    } catch {
+      // fall through — channel or pinned message is gone, (re)create/(re)post below
+    }
+  }
+
+  let channel = existing?.channelId ? await guild.channels.fetch(existing.channelId).catch(() => null) : null;
+  if (!channel) {
+    channel = await guild.channels.create({ name: spec.name, type: ChannelType.GuildText });
+  }
+
+  await postCreativeQueueChannel(guild.id, channel, category, QUEUE_CHANNEL_CONFIGS[category]);
+  return channel.id;
 }
 
 // Posts (or reuses, if already posted and still present) the starter embed for one channel,
@@ -113,6 +151,11 @@ async function runMatchmakerSetup(guild, yuniteToken) {
     const channelIds = {};
     for (const spec of CHANNEL_SPECS) channelIds[spec.key] = await ensureChannel(guild, config.channelIds, spec);
 
+    const creativeChannelIds = {};
+    for (const spec of CREATIVE_CHANNEL_SPECS) {
+      creativeChannelIds[spec.key] = await ensureCreativeChannel(guild, spec.key, spec, config.creativeChannels);
+    }
+
     // Persist roles/categories/channels before posting embeds — ensurePosted needs channelIds
     // (already have them locally) but buildRegisterEmbed needs the *final* getRoles channel ID,
     // which is already known at this point regardless.
@@ -146,7 +189,8 @@ async function runMatchmakerSetup(guild, yuniteToken) {
         '✅ MatchMaker setup complete!\n' +
         `Roles: ${ROLE_SPECS.map(s => s.name).join(', ')}\n` +
         `Categories: ${CATEGORY_SPECS.map(s => s.name).join(', ')}\n` +
-        `Channels: ${CHANNEL_SPECS.map(s => `<#${channelIds[s.key]}>`).join(', ')}`,
+        `Channels: ${CHANNEL_SPECS.map(s => `<#${channelIds[s.key]}>`).join(', ')}\n` +
+        `Creative channels: ${CREATIVE_CHANNEL_SPECS.map(s => `<#${creativeChannelIds[s.key]}>`).join(', ')}`,
     };
   } finally {
     runningGuilds.delete(guild.id);

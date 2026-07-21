@@ -36,14 +36,15 @@ const store = require('./store');
 const { pinnedMessages, save: saveStore } = store;
 const party = require('./party');
 const {
-  MODES: CREATIVE_MODES, buildCreativePlayer, joinCreativeQueue, requeueCreativeUnit,
+  buildCreativePlayer, joinCreativeQueue, requeueCreativeUnit,
   removeFromCreativeQueueAnywhere, findCreativeUnitByDiscordId, isInCreativeQueue,
-  startCreativeMatchSweep, creativeMatchEvents, getCreativeQueueCount,
+  startCreativeMatchSweep, creativeMatchEvents,
 } = require('./creative-queue');
 const { postCreativeQueueChannel, updateCreativeQueueEmbed } = require('./creative-channel');
 const creativeTeamQueue = require('./creative-team-queue');
 const teamMatchLifecycle = require('./team-match-lifecycle');
 const channelLifecycle = require('./channel-lifecycle');
+const { QUEUE_CHANNEL_CONFIGS, categoryForAnyMode } = require('./creative-channel-configs');
 
 // discordId:category -> { mode, region } — pending selections from the creative queue's
 // select menus, held here since Queue is a separate interaction from picking mode/region.
@@ -54,31 +55,6 @@ const creativeSelections = new Map();
 // ending up with two units for the same player and, in the worst case, a self-match.
 const creativeJoinInProgress = new Set();
 const teamJoinInProgress = new Set();
-
-// Per-category config for the shared creative-channel.js lifecycle — 1v1/2v2 are backed by
-// creative-queue.js's pairwise engine, 6s/8s by creative-team-queue.js's partial-fill engine.
-const QUEUE_CHANNEL_CONFIGS = {
-  '1v1': {
-    modes: CREATIVE_MODES['1v1'], countFn: getCreativeQueueCount,
-    queueButtonPrefix: 'creative_queue_', leaveButtonId: 'creative_leave_queue',
-  },
-  '2v2': {
-    modes: CREATIVE_MODES['2v2'], countFn: getCreativeQueueCount,
-    queueButtonPrefix: 'creative_queue_', leaveButtonId: 'creative_leave_queue',
-  },
-  '6s': {
-    modes: creativeTeamQueue.MODES['6s'], countFn: creativeTeamQueue.getTeamQueueWaitingCount,
-    queueButtonPrefix: 'team_queue_', leaveButtonId: 'team_leave_queue',
-  },
-  '8s': {
-    modes: creativeTeamQueue.MODES['8s'], countFn: creativeTeamQueue.getTeamQueueWaitingCount,
-    queueButtonPrefix: 'team_queue_', leaveButtonId: 'team_leave_queue',
-  },
-};
-
-function categoryForAnyMode(mode) {
-  return Object.keys(QUEUE_CHANNEL_CONFIGS).find(category => QUEUE_CHANNEL_CONFIGS[category].modes.includes(mode));
-}
 
 // Cross-queue exclusivity: a player can't be queued (or mid-match) in both the tournament
 // system and any creative queue (1v1/2v2 or 6s/8s) at once. Pending matches are tagged by
