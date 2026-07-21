@@ -106,4 +106,10 @@ function getPendingMatchByDiscordId(guildId, discordId) {
   return null;
 }
 
-module.exports = { createMatch, acceptMatch, rejectMatch, getMatch, getPendingMatchByDiscordId };
+// Count of matches still awaiting accept/reject from at least one player, scoped to this guild —
+// used by /bot-status.
+function getPendingMatchCount(guildId) {
+  return Object.values(pendingMatches).filter(match => match.guildId === guildId).length;
+}
+
+module.exports = { createMatch, acceptMatch, rejectMatch, getMatch, getPendingMatchByDiscordId, getPendingMatchCount };

@@ -44,6 +44,7 @@ async function scrapePlayer(epicUsername, region = 'EU', epicId = null) {
 
 function parseProfileData(data) {
   const totalPR = extractPowerRank(data.powerRank);
+  const prBand = extractPRBand(data.powerRank);
 
   // Match the player's segment for the site's authoritative current season — not just
   // whichever season segment they happen to have the highest number for. A player who
@@ -80,7 +81,7 @@ function parseProfileData(data) {
 
   recentEvents.sort((a, b) => new Date(b.date) - new Date(a.date));
 
-  return { totalPR, thisSeasonPR, recentEvents };
+  return { totalPR, thisSeasonPR, prBand, recentEvents };
 }
 
 function extractPowerRank(powerRank) {
@@ -88,6 +89,14 @@ function extractPowerRank(powerRank) {
   if (typeof powerRank === 'number') return powerRank;
   if (typeof powerRank === 'object') return powerRank.points ?? powerRank.pr ?? powerRank.rank ?? 0;
   return 0;
+}
+
+// FT Tracker's Power Ranking groups players into named bands (e.g. "Unreal", "Elite",
+// "Contender") — field name isn't fixed across profile payload shapes, so try the known
+// candidates and fall back to null rather than guessing.
+function extractPRBand(powerRank) {
+  if (!powerRank || typeof powerRank !== 'object') return null;
+  return powerRank.band ?? powerRank.bandName ?? powerRank.rankName ?? powerRank.tier ?? null;
 }
 
 function getPlacementScore(placement) {

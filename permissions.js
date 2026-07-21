@@ -13,6 +13,10 @@ const { getChannelId, getRoleId, getCreativeChannelInfo } = require('./guild-con
 // channelIds map (populated by /matchmaker-setup).
 const PUBLIC_CHANNEL_KEYS = ['getRoles', 'howto', 'formParty'];
 
+// Channels everyone can see but nobody but the bot can post in — the #access channel's embed is
+// entirely button-driven, so member messages would just be clutter.
+const READ_ONLY_CHANNEL_KEYS = ['access'];
+
 async function editOverwrite(channel, targetId, permissions, label) {
   try {
     await channel.permissionOverwrites.edit(targetId, permissions);
@@ -53,6 +57,24 @@ async function enforcePublicChannels(guild) {
     }
 
     await editOverwrite(channel, guild.roles.everyone, { ViewChannel: true, SendMessages: true }, '@everyone');
+  }
+}
+
+async function enforceReadOnlyChannels(guild) {
+  for (const key of READ_ONLY_CHANNEL_KEYS) {
+    const channelId = getChannelId(guild.id, key);
+    if (!channelId) {
+      console.warn(`  ⚠️ No ${key} channel configured for this guild — skipping read-only enforcement for it`);
+      continue;
+    }
+
+    const channel = await guild.channels.fetch(channelId).catch(() => null);
+    if (!channel) {
+      console.warn(`  ⚠️ ${key} channel (${channelId}) not found — skipping`);
+      continue;
+    }
+
+    await editOverwrite(channel, guild.roles.everyone, { ViewChannel: true, SendMessages: false }, '@everyone');
   }
 }
 
@@ -98,6 +120,7 @@ async function enforcePermissions(guild) {
   console.log(`🔐 Enforcing server permissions for guild ${guild.id}...`);
   await lockGuildBasePermissions(guild);
   await enforcePublicChannels(guild);
+  await enforceReadOnlyChannels(guild);
   await enforceQueueChannels(guild);
   console.log('🔐 Permission enforcement complete');
 }

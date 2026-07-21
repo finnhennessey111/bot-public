@@ -74,6 +74,34 @@ const commands = [
     .setDescription('Start a vote to kick a player from this 6s/8s match channel')
     .addUserOption(o => o.setName('player').setDescription('Player to vote-kick').setRequired(true)),
 
+  new SlashCommandBuilder()
+    .setName('refresh-stats')
+    .setDescription('Force a rescrape of your Fortnite Tracker stats (once per hour)'),
+
+  // ── MOD DEBUG COMMANDS (MatchMaker Mod role only) ──────────────────────────
+  new SlashCommandBuilder()
+    .setName('bot-status')
+    .setDescription('[Mod] Show bot uptime, MongoDB/Yunite connectivity, and active queue/match/party counts'),
+
+  new SlashCommandBuilder()
+    .setName('queue-status')
+    .setDescription('[Mod] List all active queues across every tournament and creative mode'),
+
+  new SlashCommandBuilder()
+    .setName('player-lookup')
+    .setDescription('[Mod] Look up a player\'s stored stats')
+    .addUserOption(o => o.setName('user').setDescription('Player to look up').setRequired(true)),
+
+  new SlashCommandBuilder()
+    .setName('clear-queue')
+    .setDescription('[Mod] Empty a specific tournament queue')
+    .addStringOption(o => o.setName('tournament').setDescription('Tournament name').setRequired(true)),
+
+  new SlashCommandBuilder()
+    .setName('force-refresh')
+    .setDescription('[Mod] Force a fresh Fortnite Tracker scrape for a player, ignoring the 24h cache')
+    .addUserOption(o => o.setName('user').setDescription('Player to refresh').setRequired(true)),
+
 ].map(c => c.toJSON());
 
 const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);

@@ -16,9 +16,10 @@
 // and survives a bot restart with no extra state to reconstruct.
 
 const { EventEmitter } = require('events');
-const { scrapePlayer, calculateMatchScore } = require('./scraper');
+const { calculateMatchScore } = require('./scraper');
 const { queues, save } = require('./store');
 const config = require('./config');
+const playerStore = require('./players');
 
 const matchEvents = new EventEmitter();
 
@@ -204,6 +205,7 @@ function startMatchSweep() {
 }
 
 async function buildPlayer({
+  guildId,
   discordId,
   discordUsername,
   epicUsername,
@@ -218,7 +220,7 @@ async function buildPlayer({
   language,
   bio,
 }) {
-  const playerData = await scrapePlayer(epicUsername, homeRegion, epicId);
+  const playerData = await playerStore.getPlayerStats(guildId, discordId, epicUsername, epicId, homeRegion);
   const matchScore = calculateMatchScore(playerData, tournamentName, homeRegion, queueRegion);
 
   return {

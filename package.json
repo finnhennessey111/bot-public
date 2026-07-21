@@ -13,7 +13,9 @@
   "dependencies": {
     "discord.js": "^14.26.3",
     "dotenv": "^17.4.2",
+    "express": "^5.2.1",
     "mongoose": "^9.8.0",
-    "puppeteer": "^24.42.0"
+    "puppeteer": "^24.42.0",
+    "stripe": "^22.3.2"
   }
 }

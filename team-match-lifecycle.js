@@ -12,6 +12,7 @@ const config = require('./config');
 const { toLogPR, getCreativeWideningTier } = require('./creative-queue');
 const creativeTeamQueue = require('./creative-team-queue');
 const channelLifecycle = require('./channel-lifecycle');
+const credits = require('./credits');
 const { getRoleId } = require('./guild-config');
 const {
   buildCreativeMatchConfirmedEmbed, buildCloseChannelButton,
@@ -44,6 +45,16 @@ function isPlayerInActiveTeamMatch(guildId, discordId) {
 
 function endTeamMatch(channelId) {
   activeTeamMatches.delete(channelId);
+}
+
+// Count of confirmed 6s/8s matches currently in their post-formation lifecycle (team pick/lock/
+// ready-check/live), scoped to this guild — used by /bot-status.
+function getActiveTeamMatchCount(guildId) {
+  let count = 0;
+  for (const matchState of activeTeamMatches.values()) {
+    if (matchState.guildId === guildId) count++;
+  }
+  return count;
 }
 
 async function startTeamMatch(units, mode, region, guild, client) {
@@ -135,6 +146,11 @@ async function startTeamMatch(units, mode, region, guild, client) {
     client, guildId: guild.id, textChannelId: channel.id, voiceChannelId: voiceChannel.id,
     deleteAtMs: Date.now() + 2 * 60 * 60 * 1000, kind: 'creative-team',
   });
+
+  // Reads matchState.players at fire time (5 min out), not the roster captured here — a
+  // vote-kick or ready-check no-show + backfill can change who's actually in the match before
+  // then, and credits should follow who's really there.
+  credits.scheduleCreditTimer(channel.id, () => getMatchByChannelId(channel.id)?.players ?? []);
 
   // Teams have to be settled before the lock/ready-check timer starts — startTeamMethodVote's
   // chain (vote -> [team choice] -> announceTeams) posts the leader-lock message and arms that
@@ -638,6 +654,7 @@ module.exports = {
   getMatchByChannelId,
   isPlayerInActiveTeamMatch,
   endTeamMatch,
+  getActiveTeamMatchCount,
   handleReadyButton,
   handleTeamMethodVoteButton,
   handleTeamPickButton,

@@ -10,6 +10,7 @@ const BLOCKED_KEYWORDS = [
   'play ins',
   'heats',
   'finals',
+  'solo',
 ];
 
 // These are multi-session — keep one channel alive until last session ends
@@ -80,7 +81,10 @@ async function scrapeUpcomingTournaments() {
 
     // Skip blocked tournament types
     const blockedMatch = BLOCKED_KEYWORDS.find(k => titleLower.includes(k));
-    if (blockedMatch) {
+    // FNCS Majors are a compound match — "fncs" and "major" don't work as standalone
+    // BLOCKED_KEYWORDS entries without also blocking regular FNCS divisions.
+    const isFncsMajor = titleLower.includes('fncs') && titleLower.includes('major');
+    if (blockedMatch || isFncsMajor) {
       blockedCount++;
       continue;
     }

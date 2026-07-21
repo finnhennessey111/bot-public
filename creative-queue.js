@@ -19,7 +19,7 @@
 // Ranking among eligible candidates is just closest logPR — no match-score weighting.
 
 const { EventEmitter } = require('events');
-const { scrapePlayer } = require('./scraper');
+const playerStore = require('./players');
 const { creativeQueues, save } = require('./store');
 const config = require('./config');
 
@@ -205,8 +205,8 @@ function startCreativeMatchSweep() {
   setInterval(sweepAllCreativeQueues, config.matchSweepIntervalSeconds * 1000);
 }
 
-async function buildCreativePlayer({ discordId, discordUsername, epicUsername, epicId, mode, region, platform }) {
-  const { totalPR } = await scrapePlayer(epicUsername, region, epicId);
+async function buildCreativePlayer({ guildId, discordId, discordUsername, epicUsername, epicId, mode, region, platform }) {
+  const { totalPR } = await playerStore.getPlayerStats(guildId, discordId, epicUsername, epicId, region);
 
   return {
     discordId,

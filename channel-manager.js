@@ -6,6 +6,7 @@ const { save: saveStore } = require('./store');
 const { buildTournamentEmbed } = require('./embeds');
 const { getQueueCount } = require('./queue');
 const { getRoleId, getCategoryId } = require('./guild-config');
+const playerStore = require('./players');
 
 const EMBED_REFRESH_INTERVAL_MS = 60 * 1000;
 
@@ -123,8 +124,20 @@ async function createTournamentChannel(guild, tournament, pinnedMessages) {
     return;
   }
 
-  if (name.toLowerCase().includes('mobile')) {
+  const nameLower = name.toLowerCase();
+
+  if (nameLower.includes('mobile')) {
     console.log(`  ⏭️ Skipped — mobile tournaments are excluded: "${name}"`);
+    return;
+  }
+
+  if (nameLower.includes('solo')) {
+    console.log(`  ⏭️ Skipped — solo tournaments are excluded: "${name}"`);
+    return;
+  }
+
+  if (nameLower.includes('fncs') && nameLower.includes('major')) {
+    console.log(`  ⏭️ Skipped — FNCS Major tournaments are excluded: "${name}"`);
     return;
   }
 
@@ -292,6 +305,19 @@ async function updateActiveTournamentEmbeds(guild, pinnedMessages) {
     if (!pinned.beginTime) {
       console.log(`  ⏭️ ${channelId} (${pinned.tournamentName ?? 'unknown'}) — no beginTime stored, countdown can't be rendered`);
       continue;
+    }
+
+    // Tournament just moved from upcoming to past (beginTime has elapsed) — batch-rescrape
+    // every registered player in this region so their cached stats pick up the event that just
+    // happened, rather than each of them individually waiting out the 24h queue-join cache.
+    // statsRescraped is set synchronously (before the rescrape resolves) so an overlapping tick
+    // within the same ~60s window can't fire it twice.
+    if (!pinned.statsRescraped && new Date(pinned.beginTime).getTime() <= Date.now()) {
+      pinned.statsRescraped = true;
+      saveStore(guild.id);
+      console.log(`  🔄 ${channelId} (${pinned.tournamentName}, ${pinned.region}) — tournament has begun, triggering batch stats rescrape`);
+      playerStore.rescrapeRegisteredPlayers(guild.id, pinned.region)
+        .catch(err => console.error(`  ❌ Batch rescrape failed for ${pinned.tournamentName} (${pinned.region}):`, err.message));
     }
 
     try {

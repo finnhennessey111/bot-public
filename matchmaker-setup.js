@@ -15,6 +15,7 @@ const { QUEUE_CHANNEL_CONFIGS } = require('./creative-channel-configs');
 const {
   buildRolesEmbed, buildRolesComponents, buildRegisterEmbed,
   buildHowtoEmbed, buildFormPartyInstructionsEmbed,
+  buildAccessChannelEmbed, buildAccessChannelButtons,
 } = require('./embeds');
 
 const ROLE_SPECS = [
@@ -41,6 +42,7 @@ const CHANNEL_SPECS = [
   { key: 'getRoles', name: 'get-roles' },
   { key: 'howto', name: 'how-to-use' },
   { key: 'formParty', name: 'form-party' },
+  { key: 'access', name: 'access' },
 ];
 
 // Creative queue channels — separate from CHANNEL_SPECS above because they're tracked in
@@ -175,6 +177,10 @@ async function runMatchmakerSetup(guild, yuniteToken) {
     setupMessageIds.register = await ensurePosted(
       guild.client, config.setupMessageIds, channelIds, 'register',
       () => ({ embeds: [buildRegisterEmbed(channelIds.getRoles)] })
+    );
+    setupMessageIds.access = await ensurePosted(
+      guild.client, config.setupMessageIds, channelIds, 'access',
+      () => ({ embeds: [buildAccessChannelEmbed()], components: [buildAccessChannelButtons()] })
     );
 
     await setGuildConfig(guild.id, {

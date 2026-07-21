@@ -43,10 +43,11 @@ function buildTournamentEmbed(tournamentName, region, queueCount, isTrios = fals
     const now = Date.now();
     const startMs = new Date(beginTime).getTime();
     const msUntilStart = startMs - now;
+    const startTimestamp = Math.floor(startMs / 1000);
 
     if (msUntilStart > 0) {
       color = COLOR_UPCOMING;
-      statusText = `⏰ Starts in ${formatDuration(msUntilStart)}`;
+      statusText = `⏰ Starts <t:${startTimestamp}:R>`;
     } else {
       const msUntilEnd = endTime ? new Date(endTime).getTime() - now : null;
       if (msUntilEnd !== null && msUntilEnd <= ENDING_SOON_THRESHOLD_MS) {
@@ -54,7 +55,7 @@ function buildTournamentEmbed(tournamentName, region, queueCount, isTrios = fals
         statusText = `🔴 Ending soon — ${formatDuration(msUntilEnd)} remaining`;
       } else {
         color = COLOR_LIVE;
-        statusText = `🟠 Tournament in progress — started ${formatDuration(now - startMs)} ago`;
+        statusText = `🟠 Tournament in progress — started <t:${startTimestamp}:R>`;
       }
     }
   }
@@ -646,6 +647,307 @@ function buildWelcomeDmEmbed(guildName) {
     .setFooter({ text: 'MatchMaker' });
 }
 
+// ── ACCESS / SUBSCRIPTIONS ────────────────────────────────────────────────
+// Discord-ID-based access system (access.js/billing.js/notifications.js) — a 7-day free trial,
+// then an escalating-cost credit-day ladder funded only by creative-queue play, then a paid
+// Stripe subscription. Global per Discord ID, independent of any single server.
+
+const ACCESS_COLOR = 0x4A90D9;
+const ACCESS_DENIED_COLOR = 0xE74C3C;
+const ACCESS_ACTIVE_COLOR = 0x2E7D32;
+
+function buildAccessChannelEmbed() {
+  return new EmbedBuilder()
+    .setTitle('🔐 MatchMaker Access')
+    .setDescription(
+      '7 day free trial on signup. Complete creative matches to earn extra days. Subscribe for unlimited access.'
+    )
+    .setColor(ACCESS_COLOR)
+    .setFooter({ text: 'MatchMaker' });
+}
+
+function buildAccessChannelButtons() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId('access_check')
+      .setLabel('Check My Access')
+      .setStyle(ButtonStyle.Primary)
+      .setEmoji('🔍'),
+  );
+}
+
+// Attached to both the ephemeral "Check My Access" status message and the "no access" blocking
+// embed shown at every gating point — one handler in index.js serves both, since clicking either
+// button does the same thing (generate a checkout session for the clicking user).
+function buildAccessSubscribeButtons() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId('access_subscribe_monthly')
+      .setLabel('Subscribe Monthly — £2.99')
+      .setStyle(ButtonStyle.Success),
+    new ButtonBuilder()
+      .setCustomId('access_subscribe_yearly')
+      .setLabel('Subscribe Yearly — £29.99')
+      .setStyle(ButtonStyle.Success),
+  );
+}
+
+// status comes from access.js's getAccessStatus() — shape varies by status.kind.
+function buildAccessStatusEmbed(status) {
+  const embed = new EmbedBuilder().setFooter({ text: 'MatchMaker' }).setTimestamp();
+
+  if (status.kind === 'subscription') {
+    const expiryTs = Math.floor(new Date(status.subscriptionExpiry).getTime() / 1000);
+    const planLabel = status.plan === 'yearly' ? 'Yearly' : 'Monthly';
+    return embed
+      .setTitle('✅ Subscribed')
+      .setColor(ACCESS_ACTIVE_COLOR)
+      .setDescription(
+        `**Plan:** ${planLabel}\n` +
+        `**Status:** ${status.subscriptionStatus === 'cancelled' ? 'Cancelled — access continues until it expires' : 'Active'}\n` +
+        `**Access until:** <t:${expiryTs}:D>`
+      );
+  }
+
+  if (status.kind === 'trial') {
+    return embed
+      .setTitle('✅ Free Trial Active')
+      .setColor(ACCESS_ACTIVE_COLOR)
+      .setDescription(
+        `**Days remaining:** ${status.trialDaysRemaining}\n` +
+        `**Credits banked:** ${status.creditsEarned} — play creative matches now to fund extra days once your trial ends!`
+      );
+  }
+
+  if (status.kind === 'new') {
+    return embed
+      .setTitle('👋 No Access Yet')
+      .setColor(ACCESS_COLOR)
+      .setDescription('Click Queue on any tournament or creative channel to start your 7-day free trial.');
+  }
+
+  if (status.kind === 'credits_active') {
+    const nextDayLine = status.matchesNeededForNextDay > 0
+      ? `**To earn tomorrow's access:** ${status.matchesNeededForNextDay} more creative match(es) (costs ${status.nextRungCost} credits)`
+      : `✅ You already have enough credits banked for tomorrow's access (${status.nextRungCost} credits).`;
+    return embed
+      .setTitle('✅ Credits Active')
+      .setColor(ACCESS_ACTIVE_COLOR)
+      .setDescription(
+        `**Extra days used:** ${status.creditDaysUsed}/7\n` +
+        `**Credits:** ${status.creditsEarned}\n` +
+        nextDayLine
+      );
+  }
+
+  // 'no_access' — trial and all 7 extra credit-days spent, no subscription
+  return embed
+    .setTitle('❌ No Access')
+    .setColor(ACCESS_DENIED_COLOR)
+    .setDescription(
+      'Your free trial and all 7 extra credit-earned days have been used.\n\nSubscribe below for unlimited access.'
+    );
+}
+
+// accessResult comes from access.js's checkAccess() when allowed is false — shown at every
+// gating point (queue_duo/lf2/lf1, creative_queue_*, team_queue_*).
+function buildNoAccessEmbed(accessResult) {
+  const embed = new EmbedBuilder()
+    .setTitle('❌ Access Required')
+    .setColor(ACCESS_DENIED_COLOR)
+    .setFooter({ text: 'MatchMaker • Check #access for your full status' });
+
+  if (accessResult.reason === 'insufficient_credits') {
+    embed.setDescription(
+      `You need **${accessResult.needed}** credits for today's access (you have **${accessResult.have}**). ` +
+      'Complete a creative match to earn more, or subscribe below for unlimited access.'
+    );
+  } else if (accessResult.reason === 'credits_exhausted') {
+    embed.setDescription(
+      'Your free trial and all 7 extra credit-earned days have been used. Subscribe below for unlimited access.'
+    );
+  } else {
+    embed.setDescription('You need an active trial, credits, or subscription to queue. Subscribe below for unlimited access.');
+  }
+
+  return embed;
+}
+
+function buildTrialExpiredDmEmbed(estimatedDaysFromCredits) {
+  return new EmbedBuilder()
+    .setTitle('⌛ Your Free Trial Has Ended')
+    .setDescription(
+      `Your free trial has ended. You have credits banked for approximately **${estimatedDaysFromCredits}** more day(s). ` +
+      'Click below to subscribe for unlimited access, or check #access in your server for full details.'
+    )
+    .setColor(ACCESS_DENIED_COLOR)
+    .setFooter({ text: 'MatchMaker' })
+    .setTimestamp();
+}
+
+function buildCreditsExhaustedDmEmbed() {
+  return new EmbedBuilder()
+    .setTitle('⌛ You\'ve Run Out of Free Access')
+    .setDescription(
+      'You have run out of free access. Subscribe at £2.99/month to continue, or check #access in your server for full details.'
+    )
+    .setColor(ACCESS_DENIED_COLOR)
+    .setFooter({ text: 'MatchMaker' })
+    .setTimestamp();
+}
+
+function buildSubscriptionExpiredDmEmbed() {
+  return new EmbedBuilder()
+    .setTitle('⌛ Your Subscription Has Expired')
+    .setDescription(
+      'Your subscription has expired. Resubscribe below to continue, or check #access in your server for full details.'
+    )
+    .setColor(ACCESS_DENIED_COLOR)
+    .setFooter({ text: 'MatchMaker' })
+    .setTimestamp();
+}
+
+function buildTrialExpiringSoonDmEmbed(hoursRemaining) {
+  return new EmbedBuilder()
+    .setTitle('⏳ Your Free Trial Is Ending Soon')
+    .setDescription(
+      `Your free trial ends in about **${hoursRemaining} hour(s)**. Play a creative match or two now to bank credits ` +
+      'for after it ends, or subscribe below for unlimited access.'
+    )
+    .setColor(ACCESS_COLOR)
+    .setFooter({ text: 'MatchMaker' })
+    .setTimestamp();
+}
+
+function buildCreditsLowDmEmbed(daysRemaining) {
+  return new EmbedBuilder()
+    .setTitle('⚠️ Your Credits Are Running Low')
+    .setDescription(
+      `You have roughly **${daysRemaining} day(s)** of access left on your banked credits. Play more creative matches ` +
+      'to keep earning, or subscribe below before you run out.'
+    )
+    .setColor(ACCESS_DENIED_COLOR)
+    .setFooter({ text: 'MatchMaker' })
+    .setTimestamp();
+}
+
+function buildPaymentFailedDmEmbed() {
+  return new EmbedBuilder()
+    .setTitle('⚠️ Your Payment Failed')
+    .setDescription(
+      'Your last subscription payment didn\'t go through. Please update your payment details with Stripe, or your ' +
+      'subscription will expire at the end of the current billing period.'
+    )
+    .setColor(ACCESS_DENIED_COLOR)
+    .setFooter({ text: 'MatchMaker' })
+    .setTimestamp();
+}
+
+// monthlyUrl/yearlyUrl may individually be null if that plan's Stripe checkout-session generation
+// failed at DM-send time — whichever button(s) have a real URL still show, and this returns null
+// only if BOTH failed, so the DM still sends either way (see notifications.js/webhook-server.js),
+// just with fewer (or zero) working link buttons.
+function buildDmSubscribeButtons(monthlyUrl, yearlyUrl) {
+  const buttons = [];
+  if (monthlyUrl) {
+    buttons.push(new ButtonBuilder().setStyle(ButtonStyle.Link).setURL(monthlyUrl).setLabel('Subscribe Monthly — £2.99'));
+  }
+  if (yearlyUrl) {
+    buttons.push(new ButtonBuilder().setStyle(ButtonStyle.Link).setURL(yearlyUrl).setLabel('Subscribe Yearly — £29.99'));
+  }
+  if (buttons.length === 0) return null;
+  return new ActionRowBuilder().addComponents(...buttons);
+}
+
+// ── MOD DEBUG COMMANDS ──────────────────────────────────────────────────────
+
+function buildBotStatusEmbed({ uptimeMs, mongoConnected, yuniteReachable, activeQueues, activeMatches, activeParties }) {
+  return new EmbedBuilder()
+    .setTitle('🛠️ Bot Status')
+    .setColor(mongoConnected && yuniteReachable ? 0x2ECC71 : 0xE67E22)
+    .addFields(
+      { name: '⏱️ Uptime', value: formatDuration(uptimeMs), inline: true },
+      { name: '🗄️ MongoDB', value: mongoConnected ? '✅ Connected' : '❌ Not connected', inline: true },
+      { name: '🔗 Yunite API', value: yuniteReachable ? '✅ Reachable' : '❌ Unreachable', inline: true },
+      { name: '🎮 Active Queues', value: `**${activeQueues}**`, inline: true },
+      { name: '⚔️ Active Matches', value: `**${activeMatches}**`, inline: true },
+      { name: '🤝 Active Parties', value: `**${activeParties}**`, inline: true },
+    )
+    .setFooter({ text: 'MatchMaker' })
+    .setTimestamp();
+}
+
+// tournamentEntries/creativeEntries/teamEntries: [{ label, count }] — already-formatted
+// "Tournament / Region" or "Mode / Region" strings, grouped into sections by the caller
+// (index.js) since it's the one that knows which queue system each entry came from.
+function buildQueueStatusEmbed({ tournamentEntries, creativeEntries, teamEntries }) {
+  const embed = new EmbedBuilder()
+    .setTitle('📋 Queue Status')
+    .setColor(0x4A90D9)
+    .setFooter({ text: 'MatchMaker' })
+    .setTimestamp();
+
+  const formatSection = entries => entries.length > 0
+    ? entries.map(e => `**${e.label}** — ${e.count} player(s)`).join('\n')
+    : '*No active queues*';
+
+  embed.addFields(
+    { name: '🏆 Tournament Queues', value: formatSection(tournamentEntries) },
+    { name: '🎯 Creative 1v1/2v2', value: formatSection(creativeEntries) },
+    { name: '👥 Creative 6s/8s', value: formatSection(teamEntries) },
+  );
+
+  return embed;
+}
+
+// accessStatus comes straight from access.js's getAccessStatus(discordId) — access is global
+// per Discord ID, not guild-scoped, same as everywhere else it's read.
+function formatAccessSummary(status) {
+  const trialStatus = status.kind === 'trial'
+    ? `Active — ${status.trialDaysRemaining} day(s) left`
+    : status.kind === 'new'
+      ? 'Not started'
+      : 'Ended';
+
+  const credits = status.creditsEarned != null ? `${status.creditsEarned} earned` : '0';
+
+  const subscriptionStatus = status.kind === 'subscription'
+    ? `${status.subscriptionStatus === 'cancelled' ? 'Cancelled (access continues)' : 'Active'} — ${status.plan ?? 'unknown plan'}`
+    : 'None';
+
+  return { trialStatus, credits, subscriptionStatus };
+}
+
+function buildPlayerLookupEmbed(discordUser, playerDoc, accessStatus) {
+  const embed = new EmbedBuilder()
+    .setTitle(`🔍 Player Lookup — ${discordUser.username}`)
+    .setColor(0x4A90D9)
+    .setFooter({ text: 'MatchMaker' })
+    .setTimestamp();
+
+  if (playerDoc) {
+    embed.addFields(
+      { name: '🎮 Epic Username', value: playerDoc.epicUsername ?? 'Unknown', inline: true },
+      { name: '📍 Region', value: playerDoc.region ?? 'Unknown', inline: true },
+      { name: '🖥️ Platform', value: playerDoc.platform ?? 'Unknown', inline: true },
+      { name: '⚡ Total PR', value: `${playerDoc.totalPR ?? 'N/A'}`, inline: true },
+      { name: '📅 This Season PR', value: `${playerDoc.thisSeasonPR ?? 'N/A'}`, inline: true },
+      { name: '🕐 Stats Age', value: playerDoc.lastUpdated ? `<t:${Math.floor(new Date(playerDoc.lastUpdated).getTime() / 1000)}:R>` : 'Never scraped', inline: true },
+    );
+  } else {
+    embed.setDescription('No stored stats for this player in this server — they haven\'t queued yet.');
+  }
+
+  const { trialStatus, credits, subscriptionStatus } = formatAccessSummary(accessStatus);
+  embed.addFields(
+    { name: '🎟️ Trial Status', value: trialStatus, inline: true },
+    { name: '💳 Credits', value: credits, inline: true },
+    { name: '💎 Subscription', value: subscriptionStatus, inline: true },
+  );
+
+  return embed;
+}
+
 module.exports = {
   buildTournamentEmbed,
   buildQueueButtons,
@@ -677,4 +979,19 @@ module.exports = {
   buildRolesComponents,
   buildRegisterEmbed,
   buildWelcomeDmEmbed,
+  buildAccessChannelEmbed,
+  buildAccessChannelButtons,
+  buildAccessSubscribeButtons,
+  buildAccessStatusEmbed,
+  buildNoAccessEmbed,
+  buildTrialExpiringSoonDmEmbed,
+  buildTrialExpiredDmEmbed,
+  buildCreditsLowDmEmbed,
+  buildCreditsExhaustedDmEmbed,
+  buildPaymentFailedDmEmbed,
+  buildSubscriptionExpiredDmEmbed,
+  buildDmSubscribeButtons,
+  buildBotStatusEmbed,
+  buildQueueStatusEmbed,
+  buildPlayerLookupEmbed,
 };

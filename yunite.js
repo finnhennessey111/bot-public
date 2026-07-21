@@ -55,4 +55,27 @@ async function getEpicFromDiscord(discordId, guildId) {
   };
 }
 
-module.exports = { getEpicFromDiscord };
+// Lightweight reachability check for /bot-status — an empty userIds array still hits the real
+// endpoint with this guild's real auth, so a non-ok response (bad/missing token, Yunite down,
+// etc.) or a network exception both correctly report "not reachable" without needing a real
+// linked Discord ID.
+async function checkYuniteReachable(guildId) {
+  const token = getYuniteToken(guildId) ?? process.env.YUNITE_TOKEN;
+  if (!token) return false;
+
+  try {
+    const response = await fetch(`${BASE_URL}/guild/${guildId}/registration/links`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Y-Api-Token': token,
+      },
+      body: JSON.stringify({ type: 'DISCORD', userIds: [] }),
+    });
+    return response.ok;
+  } catch (err) {
+    return false;
+  }
+}
+
+module.exports = { getEpicFromDiscord, checkYuniteReachable };

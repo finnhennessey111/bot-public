@@ -12,11 +12,13 @@ const {
   buildPlayer, joinQueue, removeFromQueue, removeFromQueueAnywhere,
   isInQueue, getQueueCount, startMatchSweep, matchEvents, findUnitByDiscordId,
 } = require('./queue');
-const { createMatch, acceptMatch, rejectMatch, getPendingMatchByDiscordId } = require('./matching');
+const {
+  createMatch, acceptMatch, rejectMatch, getPendingMatchByDiscordId, getPendingMatchCount,
+} = require('./matching');
 // Named playerStore (not `players`) — this file uses `players` extensively as a local variable
 // name for arrays of built player objects, which would otherwise shadow this module import.
 const playerStore = require('./players');
-const { getEpicFromDiscord } = require('./yunite');
+const { getEpicFromDiscord, checkYuniteReachable } = require('./yunite');
 const { startScheduler, checkAndCreateChannels } = require('./channel-manager');
 const { enforcePermissions } = require('./permissions');
 const guildConfig = require('./guild-config');
@@ -31,20 +33,81 @@ const {
   buildReadyCheckEmbed, buildTeamMethodVoteEmbed, buildTeamChoiceEmbed,
   buildVoteKickEmbed, buildVoteKickButtons,
   buildHowtoEmbed, buildRolesEmbed, buildRolesComponents,
+  buildAccessStatusEmbed, buildAccessSubscribeButtons, buildNoAccessEmbed,
+  buildBotStatusEmbed, buildQueueStatusEmbed, buildPlayerLookupEmbed,
 } = require('./embeds');
 const store = require('./store');
 const { pinnedMessages, save: saveStore } = store;
 const party = require('./party');
 const {
-  buildCreativePlayer, joinCreativeQueue, requeueCreativeUnit,
+  REGIONS: CREATIVE_REGIONS, buildCreativePlayer, joinCreativeQueue, requeueCreativeUnit,
   removeFromCreativeQueueAnywhere, findCreativeUnitByDiscordId, isInCreativeQueue,
-  startCreativeMatchSweep, creativeMatchEvents,
+  startCreativeMatchSweep, creativeMatchEvents, getCreativeQueueCount,
 } = require('./creative-queue');
 const { postCreativeQueueChannel, updateCreativeQueueEmbed } = require('./creative-channel');
 const creativeTeamQueue = require('./creative-team-queue');
 const teamMatchLifecycle = require('./team-match-lifecycle');
 const channelLifecycle = require('./channel-lifecycle');
+const credits = require('./credits');
+const access = require('./access');
+const billing = require('./billing');
+const { startWebhookServer } = require('./webhook-server');
+const { startAccessScheduler } = require('./notifications');
 const { QUEUE_CHANNEL_CONFIGS, categoryForAnyMode } = require('./creative-channel-configs');
+const db = require('./db');
+
+const botStartTime = Date.now();
+
+// Runtime gate for the mod debug commands and the setup/admin commands restricted to mods —
+// a custom per-guild role (guild-config.js's roleIds.mod), not a Discord permission bit, so it
+// can't be expressed via SlashCommandBuilder#setDefaultMemberPermissions.
+function isModMember(guildId, interaction) {
+  const modRoleId = getRoleId(guildId, 'mod');
+  return !!modRoleId && !!interaction.member?.roles.cache.has(modRoleId);
+}
+
+async function replyModOnly(interaction) {
+  await interaction.editReply({ content: '❌ This command is restricted to the MatchMaker Mod role.' });
+}
+
+// Non-empty queue buckets, one entry per tournament/mode+region combo currently holding at
+// least one player — shared by /bot-status (just the count) and /queue-status (the full list).
+function getTournamentQueueEntries(guildId) {
+  const entries = [];
+  const guildQueues = store.queues[guildId] ?? {};
+  for (const tournamentName of Object.keys(guildQueues)) {
+    for (const region of Object.keys(guildQueues[tournamentName])) {
+      const count = getQueueCount(guildId, tournamentName, region);
+      if (count > 0) entries.push({ label: `${tournamentName} / ${region}`, count });
+    }
+  }
+  return entries;
+}
+
+function getCreativeQueueEntries(guildId) {
+  const entries = [];
+  const guildQueues = store.creativeQueues[guildId] ?? {};
+  for (const mode of Object.keys(guildQueues)) {
+    for (const region of Object.keys(guildQueues[mode])) {
+      const count = getCreativeQueueCount(guildId, mode, region);
+      if (count > 0) entries.push({ label: `${mode} / ${region}`, count });
+    }
+  }
+  return entries;
+}
+
+function getTeamQueueEntries(guildId) {
+  const entries = [];
+  for (const category of ['6s', '8s']) {
+    for (const mode of creativeTeamQueue.MODES[category]) {
+      for (const region of CREATIVE_REGIONS) {
+        const count = creativeTeamQueue.getTeamQueueWaitingCount(guildId, mode, region);
+        if (count > 0) entries.push({ label: `${mode} / ${region}`, count });
+      }
+    }
+  }
+  return entries;
+}
 
 // discordId:category -> { mode, region } — pending selections from the creative queue's
 // select menus, held here since Queue is a separate interaction from picking mode/region.
@@ -116,6 +179,8 @@ client.once('clientReady', async () => {
   channelLifecycle.channelLifecycleEvents.on('channelDeleted', ({ textChannelId, kind }) => {
     if (kind === 'creative-team') teamMatchLifecycle.endTeamMatch(textChannelId);
   });
+
+  startAccessScheduler(client);
 });
 
 // Only fires for guilds joined WHILE the bot is running — guildConfig.init() (above) handles
@@ -173,6 +238,7 @@ async function handleInteraction(interaction) {
     // /setup-tournament
     if (interaction.commandName === 'setup-tournament') {
       await interaction.deferReply({ flags: 64 });
+      if (!isModMember(interaction.guild.id, interaction)) return replyModOnly(interaction);
 
       const tournamentName = interaction.options.getString('tournament');
       const region = interaction.options.getString('region');
@@ -202,6 +268,7 @@ async function handleInteraction(interaction) {
     // /setup-roles
     if (interaction.commandName === 'setup-roles') {
       await interaction.deferReply({ flags: 64 });
+      if (!isModMember(interaction.guild.id, interaction)) return replyModOnly(interaction);
       await interaction.channel.send({ embeds: [buildRolesEmbed()], components: buildRolesComponents() });
       await interaction.editReply({ content: '✅ Roles embed posted.' });
     }
@@ -209,6 +276,7 @@ async function handleInteraction(interaction) {
     // /setup-party-channel
     if (interaction.commandName === 'setup-party-channel') {
       await interaction.deferReply({ flags: 64 });
+      if (!isModMember(interaction.guild.id, interaction)) return replyModOnly(interaction);
       const msg = await interaction.channel.send({ embeds: [buildFormPartyInstructionsEmbed()] });
       await msg.pin();
       await interaction.editReply({ content: '✅ Party instructions posted and pinned.' });
@@ -222,6 +290,7 @@ async function handleInteraction(interaction) {
       'setup-creative-1v1', 'setup-creative-2v2', 'setup-creative-6s', 'setup-creative-8s',
     ].includes(interaction.commandName)) {
       await interaction.deferReply({ flags: 64 });
+      if (!isModMember(interaction.guild.id, interaction)) return replyModOnly(interaction);
       const category = interaction.commandName.replace('setup-creative-', '');
       await postCreativeQueueChannel(interaction.guild.id, interaction.channel, category, QUEUE_CHANNEL_CONFIGS[category]);
       await interaction.editReply({ content: `✅ Creative ${category} queue embed posted and pinned.` });
@@ -232,14 +301,24 @@ async function handleInteraction(interaction) {
     // this command is for manually re-posting/refreshing it elsewhere).
     if (interaction.commandName === 'setup-howto') {
       await interaction.deferReply({ flags: 64 });
+      if (!isModMember(interaction.guild.id, interaction)) return replyModOnly(interaction);
       const msg = await interaction.channel.send({ embeds: [buildHowtoEmbed()] });
       await msg.pin();
       await interaction.editReply({ content: '✅ How-to embed posted and pinned.' });
     }
 
-    // /votekick — only usable inside an active 6s/8s team match channel
+    // /votekick — only usable inside a private match channel (tournament "match-...", or a
+    // 6s/8s team match "team-6s-.../team-8s-..." — see team-match-lifecycle.js's channel
+    // naming). handleVoteKickCommand below is the authoritative check (an active team match
+    // must actually exist for this channel); this is just a fast, clear rejection for anyone
+    // running it somewhere obviously wrong.
     if (interaction.commandName === 'votekick') {
       await interaction.deferReply({ flags: 64 });
+
+      const name = interaction.channel.name;
+      if (!(name.startsWith('match-') || name.includes('6s-') || name.includes('8s-'))) {
+        return interaction.editReply({ content: '❌ This command only works inside a private match channel.' });
+      }
 
       const target = interaction.options.getUser('player');
       const result = teamMatchLifecycle.handleVoteKickCommand(interaction.channelId, interaction.user.id, target.id);
@@ -279,9 +358,51 @@ async function handleInteraction(interaction) {
       teamMatchLifecycle.startVoteResolutionTimer(interaction.channelId, result.voteId, interaction.guild, client, interaction.channel);
     }
 
+    // /refresh-stats — force a rescrape of the caller's own stats, rate-limited to once/hour
+    // (players.js's refreshPlayerStats) so this can't be used to hammer FT Tracker.
+    if (interaction.commandName === 'refresh-stats') {
+      await interaction.deferReply({ flags: 64 });
+
+      const member = await interaction.guild.members.fetch(interaction.user.id);
+      if (!member.roles.cache.has(getRoleId(interaction.guild.id, 'Registered'))) {
+        return interaction.editReply({
+          content: `❌ Complete your profile in <#${getChannelId(interaction.guild.id, 'getRoles')}> first (set your region).`,
+        });
+      }
+
+      const userData = await playerStore.getPlayer(interaction.guild.id, interaction.user.id);
+      if (!userData?.region) {
+        return interaction.editReply({
+          content: `❌ Set your region in <#${getChannelId(interaction.guild.id, 'getRoles')}> first.`,
+        });
+      }
+
+      try {
+        const { epicUsername, epicId } = await resolveEpicIdentity(interaction.guild, member);
+        const result = await playerStore.refreshPlayerStats(
+          interaction.guild.id, interaction.user.id, epicUsername, epicId, userData.region
+        );
+
+        if (result.limited) {
+          const retryTimestamp = Math.floor(result.retryAt.getTime() / 1000);
+          return interaction.editReply({
+            content: `❌ You can only refresh your stats once per hour. Try again <t:${retryTimestamp}:R>.`,
+          });
+        }
+
+        await interaction.editReply({
+          content: `✅ Stats refreshed! Total PR: **${result.stats.totalPR}**, This Season PR: **${result.stats.thisSeasonPR}**.`,
+        });
+      } catch (err) {
+        console.error('refresh-stats error:', err);
+        await interaction.editReply({ content: `❌ Failed to refresh stats: ${err.message}` });
+      }
+    }
+
     // /cancel-tournament
     if (interaction.commandName === 'cancel-tournament') {
       await interaction.deferReply({ flags: 64 });
+      if (!isModMember(interaction.guild.id, interaction)) return replyModOnly(interaction);
 
       const pinned = pinnedMessages[interaction.channelId];
       if (!pinned) {
@@ -304,6 +425,9 @@ async function handleInteraction(interaction) {
 
     // /check-tournaments
     if (interaction.commandName === 'check-tournaments') {
+      if (!isModMember(interaction.guild.id, interaction)) {
+        return interaction.reply({ content: '❌ This command is restricted to the MatchMaker Mod role.', flags: 64 });
+      }
       await interaction.reply({ content: '🔍 Checking tournaments in background... check #master-tournaments shortly.', flags: 64 });
       checkAndCreateChannels(interaction.guild, pinnedMessages).catch(console.error);
     }
@@ -426,6 +550,12 @@ async function handleInteraction(interaction) {
     if (interaction.commandName === 'party-leave') {
       await interaction.deferReply({ flags: 64 });
 
+      if (interaction.channelId !== getChannelId(interaction.guild.id, 'formParty')) {
+        return interaction.editReply({
+          content: `❌ Use this command in <#${getChannelId(interaction.guild.id, 'formParty')}>.`,
+        });
+      }
+
       const record = party.getPartyByDiscordId(interaction.guild.id, interaction.user.id);
       if (!record) {
         return interaction.editReply({ content: '❌ You are not in a party.' });
@@ -459,12 +589,126 @@ async function handleInteraction(interaction) {
     if (interaction.commandName === 'party-status') {
       await interaction.deferReply({ flags: 64 });
 
+      if (interaction.channelId !== getChannelId(interaction.guild.id, 'formParty')) {
+        return interaction.editReply({
+          content: `❌ Use this command in <#${getChannelId(interaction.guild.id, 'formParty')}>.`,
+        });
+      }
+
       const record = party.getPartyByDiscordId(interaction.guild.id, interaction.user.id);
       if (!record) {
         return interaction.editReply({ content: '❌ You are not in a party. Use /party-invite to form one.' });
       }
 
       await interaction.editReply({ embeds: [buildPartyStatusEmbed(record)] });
+    }
+
+    // ── MOD DEBUG COMMANDS ────────────────────────────────────────────────────
+
+    // /bot-status
+    if (interaction.commandName === 'bot-status') {
+      await interaction.deferReply({ flags: 64 });
+      if (!isModMember(interaction.guild.id, interaction)) return replyModOnly(interaction);
+
+      const [mongoConnected, yuniteReachable] = await Promise.all([
+        Promise.resolve(db.isConnected()),
+        checkYuniteReachable(interaction.guild.id),
+      ]);
+
+      const guildId = interaction.guild.id;
+      const activeQueues = getTournamentQueueEntries(guildId).length
+        + getCreativeQueueEntries(guildId).length
+        + getTeamQueueEntries(guildId).length;
+      const activeMatches = getPendingMatchCount(guildId) + teamMatchLifecycle.getActiveTeamMatchCount(guildId);
+      const activeParties = Object.values(store.parties).filter(p => p.guildId === guildId).length;
+
+      await interaction.editReply({
+        embeds: [buildBotStatusEmbed({
+          uptimeMs: Date.now() - botStartTime,
+          mongoConnected,
+          yuniteReachable,
+          activeQueues,
+          activeMatches,
+          activeParties,
+        })],
+      });
+    }
+
+    // /queue-status
+    if (interaction.commandName === 'queue-status') {
+      await interaction.deferReply({ flags: 64 });
+      if (!isModMember(interaction.guild.id, interaction)) return replyModOnly(interaction);
+
+      const guildId = interaction.guild.id;
+      await interaction.editReply({
+        embeds: [buildQueueStatusEmbed({
+          tournamentEntries: getTournamentQueueEntries(guildId),
+          creativeEntries: getCreativeQueueEntries(guildId),
+          teamEntries: getTeamQueueEntries(guildId),
+        })],
+      });
+    }
+
+    // /player-lookup
+    if (interaction.commandName === 'player-lookup') {
+      await interaction.deferReply({ flags: 64 });
+      if (!isModMember(interaction.guild.id, interaction)) return replyModOnly(interaction);
+
+      const target = interaction.options.getUser('user');
+      const [playerDoc, accessStatus] = await Promise.all([
+        playerStore.getPlayer(interaction.guild.id, target.id),
+        access.getAccessStatus(target.id),
+      ]);
+
+      await interaction.editReply({ embeds: [buildPlayerLookupEmbed(target, playerDoc, accessStatus)] });
+    }
+
+    // /clear-queue
+    if (interaction.commandName === 'clear-queue') {
+      await interaction.deferReply({ flags: 64 });
+      if (!isModMember(interaction.guild.id, interaction)) return replyModOnly(interaction);
+
+      const guildId = interaction.guild.id;
+      const tournamentName = interaction.options.getString('tournament');
+      const guildQueues = store.queues[guildId] ?? {};
+      const matchedKey = Object.keys(guildQueues).find(k => k.toLowerCase() === tournamentName.toLowerCase());
+
+      if (!matchedKey) {
+        return interaction.editReply({ content: `❌ No active queue found for "${tournamentName}".` });
+      }
+
+      let cleared = 0;
+      for (const region of Object.keys(guildQueues[matchedKey])) {
+        cleared += getQueueCount(guildId, matchedKey, region);
+        guildQueues[matchedKey][region] = [];
+      }
+      saveStore(guildId);
+
+      await interaction.editReply({ content: `✅ Cleared **${matchedKey}** — removed ${cleared} player(s) across all regions.` });
+    }
+
+    // /force-refresh
+    if (interaction.commandName === 'force-refresh') {
+      await interaction.deferReply({ flags: 64 });
+      if (!isModMember(interaction.guild.id, interaction)) return replyModOnly(interaction);
+
+      const target = interaction.options.getUser('user');
+
+      try {
+        const member = await interaction.guild.members.fetch(target.id);
+        const existing = await playerStore.getPlayer(interaction.guild.id, target.id);
+        const { epicUsername, epicId } = await resolveEpicIdentity(interaction.guild, member);
+        const region = existing?.region ?? 'EU';
+
+        const fresh = await playerStore.forceRefreshStats(interaction.guild.id, target.id, epicUsername, epicId, region);
+
+        await interaction.editReply({
+          content: `✅ Force-refreshed **${target.username}** — Total PR: **${fresh.totalPR}**, This Season PR: **${fresh.thisSeasonPR}**.`,
+        });
+      } catch (err) {
+        console.error('force-refresh error:', err);
+        await interaction.editReply({ content: `❌ Failed to refresh stats: ${err.message}` });
+      }
     }
   }
 
@@ -646,6 +890,14 @@ async function handleInteraction(interaction) {
         return interaction.editReply({ content: '❌ You are already in a creative queue or match. Leave it before queueing for a tournament.' });
       }
 
+      const tournamentAccess = await access.checkAccess(user.id);
+      if (!tournamentAccess.allowed) {
+        return interaction.editReply({
+          embeds: [buildNoAccessEmbed(tournamentAccess)],
+          components: [buildAccessSubscribeButtons()],
+        });
+      }
+
       await interaction.editReply({ content: '⏳ Fetching your stats...' });
 
       try {
@@ -655,6 +907,7 @@ async function handleInteraction(interaction) {
         const homeRegion = userData?.region ?? region;
 
         const player = await buildPlayer({
+          guildId: guild.id,
           discordId: user.id,
           discordUsername: user.username,
           epicUsername,
@@ -747,6 +1000,16 @@ async function handleInteraction(interaction) {
         }
       }
 
+      for (const member of partyMembers) {
+        const memberAccess = await access.checkAccess(member.id);
+        if (!memberAccess.allowed) {
+          return interaction.editReply({
+            embeds: [buildNoAccessEmbed(memberAccess)],
+            components: [buildAccessSubscribeButtons()],
+          });
+        }
+      }
+
       await interaction.editReply({ content: '⏳ Fetching stats for both party members...' });
 
       try {
@@ -754,6 +1017,7 @@ async function handleInteraction(interaction) {
           const userData = await playerStore.getPlayer(guild.id, member.id);
           const identity = await resolveEpicIdentity(guild, member);
           return buildPlayer({
+            guildId: guild.id,
             discordId: member.id,
             discordUsername: member.user.username,
             epicUsername: identity.epicUsername,
@@ -877,6 +1141,10 @@ async function handleInteraction(interaction) {
             client, guildId: matchGuild.id, textChannelId: privateChannel.id,
             deleteAtMs: Date.now() + 5 * 60 * 1000, kind: 'creative-pairwise',
           });
+
+          // Fixed 2-player roster for the lifetime of this channel — unlike 6s/8s, there's no
+          // backfill/vote-kick here, so a plain closure over `players` is enough.
+          credits.scheduleCreditTimer(privateChannel.id, () => players);
         } else {
           const voiceChannel = await matchGuild.channels.create({
             name: `vc-${channelName}`.slice(0, 100),
@@ -943,10 +1211,19 @@ async function handleInteraction(interaction) {
           });
         }
 
+        const creativeAccess = await access.checkAccess(user.id);
+        if (!creativeAccess.allowed) {
+          return interaction.editReply({
+            embeds: [buildNoAccessEmbed(creativeAccess)],
+            components: [buildAccessSubscribeButtons()],
+          });
+        }
+
         const platform = getPlatformFromMember(guild.id, member);
         const { epicUsername, epicId } = await resolveEpicIdentity(guild, member);
 
         const player = await buildCreativePlayer({
+          guildId: guild.id,
           discordId: user.id,
           discordUsername: user.username,
           epicUsername,
@@ -1036,10 +1313,21 @@ async function handleInteraction(interaction) {
           });
         }
 
+        for (const member of members) {
+          const memberAccess = await access.checkAccess(member.id);
+          if (!memberAccess.allowed) {
+            return interaction.editReply({
+              embeds: [buildNoAccessEmbed(memberAccess)],
+              components: [buildAccessSubscribeButtons()],
+            });
+          }
+        }
+
         const players = await Promise.all(members.map(async member => {
           const platform = getPlatformFromMember(guild.id, member);
           const { epicUsername, epicId } = await resolveEpicIdentity(guild, member);
           return buildCreativePlayer({
+            guildId: guild.id,
             discordId: member.id,
             discordUsername: member.user.username,
             epicUsername,
@@ -1160,6 +1448,7 @@ async function handleInteraction(interaction) {
     // ── CLOSE CREATIVE MATCH CHANNEL ─────────────────────────────────────────
     if (customId === 'close_creative_channel') {
       teamMatchLifecycle.endTeamMatch(channelId);
+      credits.cancelCreditTimer(channelId);
       const cancelled = channelLifecycle.cancelChannelDeletion(channelId);
 
       await interaction.reply({ content: '🔒 Closing this channel in 10 seconds...' });
@@ -1186,6 +1475,42 @@ async function handleInteraction(interaction) {
 
       if (result.status === 'rejected') {
         return interaction.editReply({ content: '❌ Match declined. You have been re-queued automatically.' });
+      }
+    }
+
+    // ── CHECK MY ACCESS ──────────────────────────────────────────────────────
+    if (customId === 'access_check') {
+      await interaction.deferReply({ flags: 64 });
+      const status = await access.getAccessStatus(user.id);
+      await interaction.editReply({
+        embeds: [buildAccessStatusEmbed(status)],
+        components: [buildAccessSubscribeButtons()],
+      });
+    }
+
+    // ── SUBSCRIBE BUTTONS ─────────────────────────────────────────────────────
+    // Same two IDs are used both on the persistent #access embed and on the "no access" blocking
+    // embed shown at every gating point — the action is identical regardless of entry point:
+    // generate a fresh Checkout Session for whoever clicked and hand back a Link button, since a
+    // Checkout URL is single-use and can't be baked into a static persistent embed.
+    if (customId === 'access_subscribe_monthly' || customId === 'access_subscribe_yearly') {
+      await interaction.deferReply({ flags: 64 });
+      const plan = customId === 'access_subscribe_monthly' ? 'monthly' : 'yearly';
+
+      try {
+        const checkoutUrl = await billing.createCheckoutSession(user.id, plan);
+        const linkButton = new ActionRowBuilder().addComponents(
+          new ButtonBuilder()
+            .setStyle(ButtonStyle.Link)
+            .setURL(checkoutUrl)
+            .setLabel(`Complete ${plan === 'monthly' ? 'Monthly' : 'Yearly'} Checkout ↗`),
+        );
+        await interaction.editReply({
+          content: 'Click below to complete checkout (opens Stripe):',
+          components: [linkButton],
+        });
+      } catch (err) {
+        await interaction.editReply({ content: `❌ ${err.message}` });
       }
     }
   }
@@ -1323,6 +1648,8 @@ async function notifyCreativeMatchFound(unitA, unitB, mode, region, guild) {
   const category = categoryForAnyMode(mode);
   if (category) await updateCreativeQueueEmbed(guild.id, client, category, QUEUE_CHANNEL_CONFIGS[category]);
 }
+
+startWebhookServer(client);
 
 store.init()
   .catch(err => console.error('[Store] init() failed unexpectedly:', err.message))
