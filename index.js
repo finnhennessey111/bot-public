@@ -1782,10 +1782,23 @@ async function handleInteraction(interaction) {
     // generate a fresh Checkout Session for whoever clicked and hand back a Link button, since a
     // Checkout URL is single-use and can't be baked into a static persistent embed.
     if (customId === 'access_subscribe_monthly' || customId === 'access_subscribe_yearly') {
-      await interaction.deferReply({ flags: 64 });
+      // Guard against double-processing the same interaction — calling deferReply/reply on an
+      // interaction that's already been acknowledged throws "Interaction has already been
+      // acknowledged", which previously happened outside any try/catch here and made the whole
+      // checkout flow fail silently (caught only by the generic interactionCreate handler).
+      if (interaction.deferred || interaction.replied) {
+        console.warn(`[billing] access_subscribe button already acknowledged — skipping duplicate handling (user ${user.id})`);
+        return;
+      }
+
       const plan = customId === 'access_subscribe_monthly' ? 'monthly' : 'yearly';
 
       try {
+        // deferReply is the first thing in this block and the only place it's called — if it
+        // throws, interaction.deferred stays false, so the catch below falls back to reply()
+        // instead of editReply() rather than risking a second acknowledgement attempt.
+        await interaction.deferReply({ flags: 64 });
+
         const checkoutUrl = await billing.createCheckoutSession(user.id, plan);
         const linkButton = new ActionRowBuilder().addComponents(
           new ButtonBuilder()
@@ -1798,7 +1811,15 @@ async function handleInteraction(interaction) {
           components: [linkButton],
         });
       } catch (err) {
-        await interaction.editReply({ content: `❌ ${err.message}` });
+        // Full error (not just .message) so a Stripe API failure — bad price ID, account issue,
+        // network error — is actually visible in the logs instead of just a generic ❌ in Discord.
+        console.error(`[billing] Failed to create Stripe checkout session for user ${user.id} (${plan}):`, err);
+
+        const errorPayload = { content: `❌ ${err.message}` };
+        const sendError = interaction.deferred || interaction.replied
+          ? interaction.editReply(errorPayload)
+          : interaction.reply({ ...errorPayload, flags: 64 });
+        await sendError.catch(sendErr => console.error('[billing] Failed to send checkout error reply:', sendErr));
       }
     }
   }
