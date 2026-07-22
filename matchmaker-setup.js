@@ -9,7 +9,7 @@
 
 const { ChannelType } = require('discord.js');
 const { getGuildConfig, setGuildConfig } = require('./guild-config');
-const { enforcePermissions } = require('./permissions');
+const { enforcePermissions, botAccessOverwrite } = require('./permissions');
 const { postCreativeQueueChannel } = require('./creative-channel');
 const { QUEUE_CHANNEL_CONFIGS } = require('./creative-channel-configs');
 const {
@@ -107,7 +107,11 @@ async function ensureCreativeChannel(guild, category, spec, existingCreativeChan
 
   let channel = existing?.channelId ? await guild.channels.fetch(existing.channelId).catch(() => null) : null;
   if (!channel) {
-    channel = await guild.channels.create({ name: spec.name, type: ChannelType.GuildText });
+    channel = await guild.channels.create({
+      name: spec.name,
+      type: ChannelType.GuildText,
+      permissionOverwrites: [botAccessOverwrite(guild)],
+    });
   }
 
   await postCreativeQueueChannel(guild.id, channel, category, QUEUE_CHANNEL_CONFIGS[category]);

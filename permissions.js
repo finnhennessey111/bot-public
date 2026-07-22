@@ -64,6 +64,16 @@ async function grantBotAccess(guild, channel) {
   await editOverwrite(channel, botMember, { ViewChannel: true, SendMessages: true }, 'bot');
 }
 
+// Permission-overwrite object for guild.channels.create's permissionOverwrites array — grants the
+// bot explicit ViewChannel/SendMessages at creation time itself, rather than relying on a later
+// enforcePermissions() pass (or grantBotAccess above) to add it. Needed for channels like the
+// creative queue ones that matchmaker-setup.js creates with a restrictive default (e.g. no parent
+// category to inherit from, or a guild where @everyone's base permissions deny ViewChannel) — the
+// bot could otherwise be unable to see/post in a channel it just created.
+function botAccessOverwrite(guild) {
+  return { id: guild.members.me.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages] };
+}
+
 async function lockGuildBasePermissions(guild) {
   const everyone = guild.roles.everyone;
   const next = everyone.permissions.remove([
@@ -257,4 +267,4 @@ async function enforcePermissions(guild) {
   console.log('🔐 Permission enforcement complete');
 }
 
-module.exports = { enforcePermissions };
+module.exports = { enforcePermissions, botAccessOverwrite };
