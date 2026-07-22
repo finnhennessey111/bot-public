@@ -110,6 +110,16 @@ const commands = [
     .setDescription('[Owner only] Grant the MatchMaker Mod role to a user')
     .addUserOption(o => o.setName('user').setDescription('User to grant MatchMaker Mod').setRequired(true)),
 
+  new SlashCommandBuilder()
+    .setName('test-webhook')
+    .setDescription('[Mod] Simulate a Stripe checkout.session.completed event to test subscription activation, no real payment needed')
+    .addUserOption(o => o.setName('user').setDescription('User to simulate the subscription for (defaults to you)').setRequired(false))
+    .addStringOption(o => o.setName('plan').setDescription('Plan to simulate (defaults to monthly)').setRequired(false)
+      .addChoices(
+        { name: 'Monthly', value: 'monthly' },
+        { name: 'Yearly', value: 'yearly' },
+      )),
+
 ].map(c => c.toJSON());
 
 const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);

@@ -36,6 +36,32 @@ function getCurrentPeriodEnd(subscription) {
   return new Date(periodEnd * 1000);
 }
 
+// Shared DB-write step for "this Discord user now has an active subscription" — used by the real
+// checkout.session.completed handler below (subscriptionExpiry computed from Stripe's own
+// current_period_end) and by simulateCheckoutCompleted (a fabricated expiry, for /test-webhook),
+// so a mod-run test exercises the exact same activation path a real payment would.
+async function activateSubscription(discordId, plan, subscriptionExpiry, { stripeCustomerId = null, stripeSubscriptionId = null } = {}) {
+  await SubscriptionModel.findOneAndUpdate(
+    { discordId },
+    {
+      $set: {
+        plan,
+        status: 'active',
+        subscriptionStart: new Date(),
+        subscriptionExpiry,
+        stripeCustomerId,
+        stripeSubscriptionId,
+        // Reset so a resubscribe -> lapse -> resubscribe -> lapse cycle still gets an expiry DM
+        // on every lapse, not just the first.
+        subscriptionExpiredDmSent: false,
+      },
+    },
+    { upsert: true }
+  );
+
+  access.invalidateCache(discordId);
+}
+
 async function handleCheckoutCompleted(stripe, session) {
   const discordId = session.metadata?.discordId;
   const plan = session.metadata?.plan;
@@ -48,26 +74,29 @@ async function handleCheckoutCompleted(stripe, session) {
   const subscription = await stripe.subscriptions.retrieve(session.subscription);
   const subscriptionExpiry = getCurrentPeriodEnd(subscription);
 
-  await SubscriptionModel.findOneAndUpdate(
-    { discordId },
-    {
-      $set: {
-        plan,
-        status: 'active',
-        subscriptionStart: new Date(),
-        subscriptionExpiry,
-        stripeCustomerId: session.customer,
-        stripeSubscriptionId: session.subscription,
-        // Reset so a resubscribe -> lapse -> resubscribe -> lapse cycle still gets an expiry DM
-        // on every lapse, not just the first.
-        subscriptionExpiredDmSent: false,
-      },
-    },
-    { upsert: true }
-  );
+  await activateSubscription(discordId, plan, subscriptionExpiry, {
+    stripeCustomerId: session.customer,
+    stripeSubscriptionId: session.subscription,
+  });
 
-  access.invalidateCache(discordId);
   console.log(`[webhook] checkout.session.completed — ${discordId} subscribed (${plan}), access until ${subscriptionExpiry.toISOString()}`);
+}
+
+// Test-only entry point for /test-webhook (mod command, index.js). Bypasses Stripe entirely —
+// no API call, no real session/subscription needed — so mods can verify the activation path
+// (Subscription doc written, access cache invalidated, #access reflects it) without a real
+// payment or a live Stripe test-mode checkout.
+async function simulateCheckoutCompleted(discordId, plan) {
+  const days = plan === 'yearly' ? 365 : 30;
+  const subscriptionExpiry = new Date(Date.now() + days * 24 * 60 * 60 * 1000);
+
+  await activateSubscription(discordId, plan, subscriptionExpiry, {
+    stripeCustomerId: 'test_customer',
+    stripeSubscriptionId: `test_sub_${Date.now()}`,
+  });
+
+  console.log(`[webhook] [TEST] simulated checkout.session.completed — ${discordId} subscribed (${plan}), access until ${subscriptionExpiry.toISOString()}`);
+  return subscriptionExpiry;
 }
 
 async function handleSubscriptionDeleted(subscription) {
@@ -305,4 +334,4 @@ function startWebhookServer(client) {
   return server;
 }
 
-module.exports = { startWebhookServer };
+module.exports = { startWebhookServer, simulateCheckoutCompleted };

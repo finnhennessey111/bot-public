@@ -50,6 +50,8 @@ async function createCheckoutSession(discordId, plan) {
     cancel_url: process.env.STRIPE_CANCEL_URL || 'https://discord.com',
   });
 
+  console.log(`[billing] Created checkout session ${session.id} for Discord ${discordId} (${plan}) — ${session.url}`);
+
   return session.url;
 }
 

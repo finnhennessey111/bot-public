@@ -56,7 +56,7 @@ const credits = require('./credits');
 const access = require('./access');
 const billing = require('./billing');
 const { dmUser } = require('./discord-dm');
-const { startWebhookServer } = require('./webhook-server');
+const { startWebhookServer, simulateCheckoutCompleted } = require('./webhook-server');
 const { startAccessScheduler } = require('./notifications');
 const { QUEUE_CHANNEL_CONFIGS, categoryForAnyMode } = require('./creative-channel-configs');
 const db = require('./db');
@@ -853,6 +853,28 @@ async function handleInteraction(interaction) {
       } catch (err) {
         console.error('grant-mod error:', err);
         await interaction.editReply({ content: `❌ Failed to grant MatchMaker Mod: ${err.message}` });
+      }
+    }
+
+    // /test-webhook — manually runs the same DB-write + cache-invalidation path a real Stripe
+    // checkout.session.completed webhook would, with a fabricated expiry instead of a real
+    // Stripe subscription (see webhook-server.js's simulateCheckoutCompleted). Lets mods verify
+    // #access/the credit-gate reflects an active subscription without a real payment.
+    if (interaction.commandName === 'test-webhook') {
+      await interaction.deferReply({ flags: 64 });
+      if (!isModMember(interaction.guild.id, interaction)) return replyModOnly(interaction);
+
+      const target = interaction.options.getUser('user') ?? interaction.user;
+      const plan = interaction.options.getString('plan') ?? 'monthly';
+
+      try {
+        const subscriptionExpiry = await simulateCheckoutCompleted(target.id, plan);
+        await interaction.editReply({
+          content: `✅ Simulated a **${plan}** checkout.session.completed for **${target.username}** — access active until **${subscriptionExpiry.toISOString()}**. Check #access or the Subscription collection to verify.`,
+        });
+      } catch (err) {
+        console.error('test-webhook error:', err);
+        await interaction.editReply({ content: `❌ Failed to simulate webhook event: ${err.message}` });
       }
     }
   }
