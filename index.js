@@ -770,6 +770,33 @@ async function handleInteraction(interaction) {
         await interaction.editReply({ content: `❌ Failed to refresh stats: ${err.message}` });
       }
     }
+
+    // /grant-mod — server-owner-only, not gated by isModMember like the other mod commands above.
+    // This is the only path in the bot that assigns the MatchMaker Mod role — anyone who already
+    // holds it could otherwise grant it to others (or themselves again) indefinitely, so the
+    // check is against the actual Discord guild owner rather than the mod role itself.
+    if (interaction.commandName === 'grant-mod') {
+      await interaction.deferReply({ flags: 64 });
+
+      if (interaction.guild.ownerId !== interaction.user.id) {
+        return interaction.editReply({ content: '❌ Only the server owner can grant the MatchMaker Mod role.' });
+      }
+
+      const modRoleId = getRoleId(interaction.guild.id, 'mod');
+      if (!modRoleId) {
+        return interaction.editReply({ content: '❌ No MatchMaker Mod role configured for this server — run /matchmaker-setup first.' });
+      }
+
+      const target = interaction.options.getUser('user');
+      try {
+        const member = await interaction.guild.members.fetch(target.id);
+        await member.roles.add(modRoleId);
+        await interaction.editReply({ content: `✅ Granted MatchMaker Mod to **${target.username}**.` });
+      } catch (err) {
+        console.error('grant-mod error:', err);
+        await interaction.editReply({ content: `❌ Failed to grant MatchMaker Mod: ${err.message}` });
+      }
+    }
   }
 
   // ── MODAL SUBMISSIONS ────────────────────────────────────────────────────────

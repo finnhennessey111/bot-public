@@ -105,6 +105,11 @@ const commands = [
     .setDescription('[Mod] Force a fresh Fortnite Tracker scrape for a player, ignoring the 24h cache')
     .addUserOption(o => o.setName('user').setDescription('Player to refresh').setRequired(true)),
 
+  new SlashCommandBuilder()
+    .setName('grant-mod')
+    .setDescription('[Owner only] Grant the MatchMaker Mod role to a user')
+    .addUserOption(o => o.setName('user').setDescription('User to grant MatchMaker Mod').setRequired(true)),
+
 ].map(c => c.toJSON());
 
 const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);

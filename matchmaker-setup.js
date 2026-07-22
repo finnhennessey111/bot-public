@@ -35,6 +35,11 @@ const CATEGORY_SPECS = [
   { key: 'EU', name: 'EU Tournaments' },
   { key: 'NAC', name: 'NAC Tournaments' },
   { key: 'ME', name: 'ME Tournaments' },
+  // Parent for the four creative queue channels below — gets the bot's ViewChannel/SendMessages
+  // set explicitly at creation (unlike the tournament categories above, which rely on each
+  // channel's own per-creation overwrite instead), so any channel placed under it inherits bot
+  // access automatically instead of needing enforcePermissions to patch it in after the fact.
+  { key: 'creative', name: 'Creative' },
 ];
 
 const CHANNEL_SPECS = [
@@ -68,13 +73,17 @@ async function ensureRole(guild, existingRoleIds, spec) {
   return created.id;
 }
 
-async function ensureCategory(guild, existingCategoryIds, spec) {
+async function ensureCategory(guild, existingCategoryIds, spec, { permissionOverwrites } = {}) {
   const existingId = existingCategoryIds[spec.key];
   if (existingId) {
     const existing = await guild.channels.fetch(existingId).catch(() => null);
     if (existing) return existing.id;
   }
-  const created = await guild.channels.create({ name: spec.name, type: ChannelType.GuildCategory });
+  const created = await guild.channels.create({
+    name: spec.name,
+    type: ChannelType.GuildCategory,
+    ...(permissionOverwrites ? { permissionOverwrites } : {}),
+  });
   return created.id;
 }
 
@@ -88,18 +97,37 @@ async function ensureChannel(guild, existingChannelIds, spec) {
   return created.id;
 }
 
+// One-time migration for servers that ran /matchmaker-setup before the Creative category existed
+// (or before a given channel had one) — reparents an already-existing creative channel that's
+// missing its parent or sitting under the wrong one. lockPermissions: false is essential here:
+// Discord's default (true) would sync the channel's overwrites to the new parent, wiping the
+// channel-specific overwrites enforcePermissions() already applied (Registered-role gate, mod
+// role, bot access, attachment lock).
+async function ensureCreativeChannelParent(channel, parentCategoryId) {
+  if (!parentCategoryId || channel.parentId === parentCategoryId) return;
+  try {
+    await channel.setParent(parentCategoryId, { lockPermissions: false });
+    console.log(`  📁 Moved #${channel.name} into the Creative category`);
+  } catch (err) {
+    console.error(`  ⚠️ Failed to move #${channel.name} into the Creative category:`, err.message);
+  }
+}
+
 // Creates (or reuses) the channel for one creative category, then posts (or reuses) its queue
 // embed via creative-channel.js's postCreativeQueueChannel — which persists {channelId,
 // messageId} into guild-config's creativeChannels map itself, so no separate save is needed
 // here. Only re-posts the embed if the channel and/or its pinned message are actually missing.
-async function ensureCreativeChannel(guild, category, spec, existingCreativeChannels) {
+async function ensureCreativeChannel(guild, category, spec, existingCreativeChannels, parentCategoryId) {
   const existing = existingCreativeChannels[category];
 
   if (existing?.channelId && existing?.messageId) {
     try {
       const channel = await guild.channels.fetch(existing.channelId);
       const msg = await channel.messages.fetch(existing.messageId);
-      if (channel && msg) return existing.channelId;
+      if (channel && msg) {
+        await ensureCreativeChannelParent(channel, parentCategoryId);
+        return existing.channelId;
+      }
     } catch {
       // fall through — channel or pinned message is gone, (re)create/(re)post below
     }
@@ -110,8 +138,11 @@ async function ensureCreativeChannel(guild, category, spec, existingCreativeChan
     channel = await guild.channels.create({
       name: spec.name,
       type: ChannelType.GuildText,
+      parent: parentCategoryId ?? null,
       permissionOverwrites: [botAccessOverwrite(guild)],
     });
+  } else {
+    await ensureCreativeChannelParent(channel, parentCategoryId);
   }
 
   await postCreativeQueueChannel(guild.id, channel, category, QUEUE_CHANNEL_CONFIGS[category]);
@@ -165,14 +196,17 @@ async function runMatchmakerSetup(guild, yuniteToken, yuniteVerifiedRoleId = nul
     else if (config.roleIds.yuniteVerified) roleIds.yuniteVerified = config.roleIds.yuniteVerified;
 
     const categoryIds = { ...config.categoryIds };
-    for (const spec of CATEGORY_SPECS) categoryIds[spec.key] = await ensureCategory(guild, config.categoryIds, spec);
+    for (const spec of CATEGORY_SPECS) {
+      const permissionOverwrites = spec.key === 'creative' ? [botAccessOverwrite(guild)] : undefined;
+      categoryIds[spec.key] = await ensureCategory(guild, config.categoryIds, spec, { permissionOverwrites });
+    }
 
     const channelIds = {};
     for (const spec of CHANNEL_SPECS) channelIds[spec.key] = await ensureChannel(guild, config.channelIds, spec);
 
     const creativeChannelIds = {};
     for (const spec of CREATIVE_CHANNEL_SPECS) {
-      creativeChannelIds[spec.key] = await ensureCreativeChannel(guild, spec.key, spec, config.creativeChannels);
+      creativeChannelIds[spec.key] = await ensureCreativeChannel(guild, spec.key, spec, config.creativeChannels, categoryIds.creative);
     }
 
     // Persist roles/categories/channels before posting embeds — ensurePosted needs channelIds
