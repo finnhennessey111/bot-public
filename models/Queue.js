@@ -1,9 +1,10 @@
-// models/Queue.js - One document per guild holding the full tournament matchmaking queue
-// blob (tournamentName -> region -> array of waiting units), mirroring store.js's `queues`
-// shape. Kept as a single Mixed blob rather than normalized documents since the shape is
-// still evolving alongside queue.js. `creativeData` mirrors store.js's `creativeQueues[guildId]`
-// (mode -> region -> array of waiting units) — kept on the same per-guild doc rather than a
-// separate collection since both are small, guild-scoped queue blobs.
+// models/Queue.js - Single global document holding the full tournament matchmaking queue blob
+// (tournamentName -> region -> array of waiting units), mirroring store.js's `queues` shape. The
+// queue pool is shared across every installed guild (cross-server matchmaking), so this is keyed
+// by a constant guildId ('__global__', see store.js), not a real guild. Kept as a single Mixed
+// blob rather than normalized documents since the shape is still evolving alongside queue.js.
+// `creativeData` mirrors store.js's `creativeQueues` (mode -> region -> array of waiting units) —
+// kept on the same doc rather than a separate collection since both are small queue blobs.
 
 const mongoose = require('mongoose');
 

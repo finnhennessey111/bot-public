@@ -12,9 +12,11 @@ const {
   buildPlayer, joinQueue, removeFromQueue, removeFromQueueAnywhere,
   isInQueue, getQueueCount, startMatchSweep, matchEvents, findUnitByDiscordId,
 } = require('./queue');
+const matching = require('./matching');
 const {
   createMatch, acceptMatch, rejectMatch, getPendingMatchByDiscordId, getPendingMatchCount,
-} = require('./matching');
+} = matching;
+const { createMatchChannelsForMatch } = require('./match-channels');
 // Named playerStore (not `players`) — this file uses `players` extensively as a local variable
 // name for arrays of built player objects, which would otherwise shadow this module import.
 const playerStore = require('./players');
@@ -26,12 +28,10 @@ const { getRoleId, getChannelId } = guildConfig;
 const { runMatchmakerSetup } = require('./matchmaker-setup');
 const {
   buildTournamentEmbed, buildQueueButtons, buildLeaveQueueButton,
-  buildMatchCard, buildMatchButtons, buildMatchConfirmedEmbed,
+  buildMatchConfirmedEmbed,
   buildPartyInviteEmbed, buildPartyInviteButtons, buildPartyStatusEmbed,
   buildFormPartyInstructionsEmbed, buildPartyChannelInstructionsEmbed,
-  buildCreativeMatchConfirmedEmbed, buildCloseChannelButton, buildCreativeMatchCard,
-  buildReadyCheckEmbed, buildTeamMethodVoteEmbed, buildTeamChoiceEmbed,
-  buildVoteKickEmbed, buildVoteKickButtons,
+  buildCreativeMatchConfirmedEmbed, buildCloseChannelButton,
   buildHowtoEmbed, buildRolesEmbed, buildRolesComponents,
   buildAccessStatusEmbed, buildAccessSubscribeButtons, buildNoAccessEmbed,
   buildBotStatusEmbed, buildQueueStatusEmbed, buildPlayerLookupEmbed,
@@ -72,11 +72,12 @@ async function replyModOnly(interaction) {
 
 // Non-empty queue buckets, one entry per tournament/mode+region combo currently holding at
 // least one player — shared by /bot-status (just the count) and /queue-status (the full list).
+// The queue pool is global (cross-server matchmaking), so these are global counts, not scoped to
+// the calling guild — guildId is kept as a parameter for call-site compatibility but unused.
 function getTournamentQueueEntries(guildId) {
   const entries = [];
-  const guildQueues = store.queues[guildId] ?? {};
-  for (const tournamentName of Object.keys(guildQueues)) {
-    for (const region of Object.keys(guildQueues[tournamentName])) {
+  for (const tournamentName of Object.keys(store.queues)) {
+    for (const region of Object.keys(store.queues[tournamentName])) {
       const count = getQueueCount(guildId, tournamentName, region);
       if (count > 0) entries.push({ label: `${tournamentName} / ${region}`, count });
     }
@@ -86,9 +87,8 @@ function getTournamentQueueEntries(guildId) {
 
 function getCreativeQueueEntries(guildId) {
   const entries = [];
-  const guildQueues = store.creativeQueues[guildId] ?? {};
-  for (const mode of Object.keys(guildQueues)) {
-    for (const region of Object.keys(guildQueues[mode])) {
+  for (const mode of Object.keys(store.creativeQueues)) {
+    for (const region of Object.keys(store.creativeQueues[mode])) {
       const count = getCreativeQueueCount(guildId, mode, region);
       if (count > 0) entries.push({ label: `${mode} / ${region}`, count });
     }
@@ -158,26 +158,33 @@ client.once('clientReady', async () => {
 
   startScheduler(client, pinnedMessages);
   startMatchSweep();
-  matchEvents.on('matchFound', ({ unitA, unitB, tournamentName, region, guildId }) => {
-    const guild = client.guilds.cache.get(guildId);
-    if (guild) notifyMatchFound(unitA, unitB, tournamentName, region, guild).catch(console.error);
+  // The queue pool is global (cross-server matchmaking) — a match's involved guild(s) come from
+  // the matched players themselves, not one event-level guildId, so these listeners hand off to
+  // `client` and let notifyMatchFound/notifyCreativeMatchFound/startTeamMatch resolve guilds
+  // per-player via match-channels.js / team-match-lifecycle.js.
+  matchEvents.on('matchFound', ({ unitA, unitB, tournamentName, region }) => {
+    notifyMatchFound(unitA, unitB, tournamentName, region, client).catch(console.error);
   });
 
   startCreativeMatchSweep();
-  creativeMatchEvents.on('matchFound', ({ unitA, unitB, mode, region, guildId }) => {
-    const guild = client.guilds.cache.get(guildId);
-    if (guild) notifyCreativeMatchFound(unitA, unitB, mode, region, guild).catch(console.error);
+  creativeMatchEvents.on('matchFound', ({ unitA, unitB, mode, region }) => {
+    notifyCreativeMatchFound(unitA, unitB, mode, region, client).catch(console.error);
   });
 
   creativeTeamQueue.startCreativeTeamMatchSweep();
-  creativeTeamQueue.creativeTeamMatchEvents.on('matchFormed', ({ units, mode, region, guildId }) => {
-    const guild = client.guilds.cache.get(guildId);
-    if (guild) teamMatchLifecycle.startTeamMatch(units, mode, region, guild, client).catch(console.error);
+  creativeTeamQueue.creativeTeamMatchEvents.on('matchFormed', ({ units, mode, region, completingGuildId }) => {
+    teamMatchLifecycle.startTeamMatch(units, mode, region, completingGuildId, client).catch(console.error);
+  });
+
+  matching.matchLifecycleEvents.on('expired', ({ channelsByGuildId }) => {
+    closeMatchChannelCluster(channelsByGuildId, '⌛ This match expired with no response — you have been re-queued automatically.').catch(console.error);
   });
 
   channelLifecycle.restoreScheduledDeletions(client);
-  channelLifecycle.channelLifecycleEvents.on('channelDeleted', ({ textChannelId, kind }) => {
-    if (kind === 'creative-team') teamMatchLifecycle.endTeamMatch(textChannelId);
+  channelLifecycle.channelLifecycleEvents.on('channelDeleted', ({ channels, kind }) => {
+    if (kind === 'creative-team') {
+      for (const c of channels) teamMatchLifecycle.endTeamMatch(c.textChannelId);
+    }
   });
 
   startAccessScheduler(client);
@@ -350,12 +357,13 @@ async function handleInteraction(interaction) {
 
       await interaction.editReply({ content: `🗳️ Vote-kick started against **${target.username}**.` });
 
-      await interaction.channel.send({
-        embeds: [buildVoteKickEmbed(interaction.user.username, target.username, 0, 0, result.eligibleCount)],
-        components: [buildVoteKickButtons(result.voteId)],
-      });
+      // Broadcast to every channel in the match's cluster, not just this one — anyone in any
+      // involved guild's channel should be able to vote.
+      await teamMatchLifecycle.broadcastVoteKickStart(
+        result.matchState, client, interaction.user.username, target.username, result.voteId, result.eligibleCount
+      );
 
-      teamMatchLifecycle.startVoteResolutionTimer(interaction.channelId, result.voteId, interaction.guild, client, interaction.channel);
+      teamMatchLifecycle.startVoteResolutionTimer(interaction.channelId, result.voteId, client);
     }
 
     // /refresh-stats — force a rescrape of the caller's own stats, rate-limited to once/hour
@@ -564,10 +572,17 @@ async function handleInteraction(interaction) {
 
       const memberIds = record.members.map(m => m.discordId);
 
-      // Reject any pending match first (requeues both units in that match)...
+      // Reject any pending match first (requeues both units in that match, and tears down its
+      // channel cluster — the match channel now exists from the moment a match is found, not
+      // just after confirm, so this can't be skipped anymore).
       for (const discordId of memberIds) {
         const pending = getPendingMatchByDiscordId(interaction.guild.id, discordId);
-        if (pending) rejectMatch(pending.matchId, discordId);
+        if (pending) {
+          const result = rejectMatch(pending.matchId, discordId);
+          if (result.status === 'rejected') {
+            await closeMatchChannelCluster(result.channelsByGuildId, '❌ Match declined — a party member disbanded. This channel will close shortly.');
+          }
+        }
       }
       // ...then pull the disbanding unit back out again, wherever it ended up.
       for (const discordId of memberIds) {
@@ -664,28 +679,28 @@ async function handleInteraction(interaction) {
       await interaction.editReply({ embeds: [buildPlayerLookupEmbed(target, playerDoc, accessStatus)] });
     }
 
-    // /clear-queue
+    // /clear-queue — the queue pool is global (cross-server matchmaking), so this clears the
+    // tournament's queue everywhere, not just for this guild's players.
     if (interaction.commandName === 'clear-queue') {
       await interaction.deferReply({ flags: 64 });
       if (!isModMember(interaction.guild.id, interaction)) return replyModOnly(interaction);
 
       const guildId = interaction.guild.id;
       const tournamentName = interaction.options.getString('tournament');
-      const guildQueues = store.queues[guildId] ?? {};
-      const matchedKey = Object.keys(guildQueues).find(k => k.toLowerCase() === tournamentName.toLowerCase());
+      const matchedKey = Object.keys(store.queues).find(k => k.toLowerCase() === tournamentName.toLowerCase());
 
       if (!matchedKey) {
         return interaction.editReply({ content: `❌ No active queue found for "${tournamentName}".` });
       }
 
       let cleared = 0;
-      for (const region of Object.keys(guildQueues[matchedKey])) {
+      for (const region of Object.keys(store.queues[matchedKey])) {
         cleared += getQueueCount(guildId, matchedKey, region);
-        guildQueues[matchedKey][region] = [];
+        store.queues[matchedKey][region] = [];
       }
       saveStore(guildId);
 
-      await interaction.editReply({ content: `✅ Cleared **${matchedKey}** — removed ${cleared} player(s) across all regions.` });
+      await interaction.editReply({ content: `✅ Cleared **${matchedKey}** globally — removed ${cleared} player(s) across all regions and servers.` });
     }
 
     // /force-refresh
@@ -909,8 +924,10 @@ async function handleInteraction(interaction) {
 
         const player = await buildPlayer({
           guildId: guild.id,
+          guildName: guild.name,
           discordId: user.id,
           discordUsername: user.username,
+          discordTag: user.tag,
           epicUsername,
           epicId,
           tournamentName,
@@ -929,7 +946,7 @@ async function handleInteraction(interaction) {
         await updateQueueEmbed(guild.id, channelId, tournamentName, region, isTrios);
 
         await interaction.editReply({
-          content: `✅ You are now in queue for **${tournamentName}**! We'll DM you the moment a match is found.`,
+          content: `✅ You are now in queue for **${tournamentName}**! A match channel will be created here the moment one is found.`,
         });
 
       } catch (err) {
@@ -1019,8 +1036,10 @@ async function handleInteraction(interaction) {
           const identity = await resolveEpicIdentity(guild, member);
           return buildPlayer({
             guildId: guild.id,
+            guildName: guild.name,
             discordId: member.id,
             discordUsername: member.user.username,
+            discordTag: member.user.tag,
             epicUsername: identity.epicUsername,
             epicId: identity.epicId,
             tournamentName,
@@ -1047,7 +1066,7 @@ async function handleInteraction(interaction) {
         await updateQueueEmbed(guild.id, channelId, tournamentName, region, isTrios);
 
         await interaction.editReply({
-          content: `✅ Your party is now in queue for **${tournamentName}**! We'll DM you both the moment a third player is found.`,
+          content: `✅ Your party is now in queue for **${tournamentName}**! A match channel will be created here the moment a third player is found.`,
         });
 
       } catch (err) {
@@ -1080,6 +1099,9 @@ async function handleInteraction(interaction) {
     }
 
     // ── ACCEPT MATCH ─────────────────────────────────────────────────────────
+    // The match channel itself was created immediately when the match was found (see
+    // notifyMatchFound/notifyCreativeMatchFound + match-channels.js) — Accept just resolves
+    // whether everyone's in, no channel creation happens here anymore.
     if (customId.startsWith('accept_')) {
       await interaction.deferReply({ flags: 64 });
 
@@ -1091,89 +1113,21 @@ async function handleInteraction(interaction) {
       }
 
       if (result.status === 'waiting') {
+        const match = matching.getMatch(matchId);
+        if (match) {
+          await notifyOtherMatchChannels(
+            match, interaction.guildId,
+            `✅ **${user.username}** accepted (${result.acceptedCount}/${result.totalCount}).`
+          );
+        }
         return interaction.editReply({
           content: `✅ You accepted! Waiting for ${result.totalCount - result.acceptedCount} more player(s)...`,
         });
       }
 
       if (result.status === 'confirmed') {
-        const { match } = result;
-        const players = match.players;
-        const isCreative = match.kind === 'creative';
-
-        // Accept is clicked from the DM'd match card, where interaction.guild is null (DMs
-        // aren't part of a guild) — resolve the actual guild the match belongs to instead
-        // (every match carries its guildId since queue.js/creative-queue.js stamp it on units).
-        const matchGuild = interaction.guild ?? client.guilds.cache.get(match.guildId);
-        const category = await channelLifecycle.getOrCreateMatchCategory(matchGuild);
-
-        const channelName = `${isCreative ? 'creative' : 'match'}-${players.map(p => p.epicUsername).join('-')}`
-          .toLowerCase()
-          .replace(/\s+/g, '-')
-          .slice(0, 100);
-
-        const modRoleId = getRoleId(matchGuild.id, 'mod');
-
-        const privateChannel = await matchGuild.channels.create({
-          name: channelName,
-          type: ChannelType.GuildText,
-          parent: category.id,
-          permissionOverwrites: [
-            { id: matchGuild.roles.everyone, deny: [PermissionFlagsBits.ViewChannel] },
-            { id: client.user.id, allow: [PermissionFlagsBits.ViewChannel] },
-            ...players.map(p => ({ id: p.discordId, allow: [PermissionFlagsBits.ViewChannel] })),
-            ...(modRoleId ? [{ id: modRoleId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages] }] : []),
-          ],
-        });
-
-        if (isCreative) {
-          // match.tournamentName holds the creative mode string here — createMatch's third
-          // positional arg is generic, notifyCreativeMatchFound just passes `mode` into it.
-          await privateChannel.send({
-            content: players.map(p => `<@${p.discordId}>`).join(' '),
-            embeds: [buildCreativeMatchConfirmedEmbed(players, match.tournamentName)],
-            components: [buildCloseChannelButton()],
-          });
-
-          const pinMsg = await privateChannel.send('⏰ This channel will automatically delete in 5 minutes.');
-          await pinMsg.pin().catch(err => console.error('Failed to pin deletion notice:', err.message));
-
-          channelLifecycle.scheduleChannelDeletion({
-            client, guildId: matchGuild.id, textChannelId: privateChannel.id,
-            deleteAtMs: Date.now() + 5 * 60 * 1000, kind: 'creative-pairwise',
-          });
-
-          // Fixed 2-player roster for the lifetime of this channel — unlike 6s/8s, there's no
-          // backfill/vote-kick here, so a plain closure over `players` is enough.
-          credits.scheduleCreditTimer(privateChannel.id, () => players);
-        } else {
-          const voiceChannel = await matchGuild.channels.create({
-            name: `vc-${channelName}`.slice(0, 100),
-            type: ChannelType.GuildVoice,
-            parent: category.id,
-            permissionOverwrites: [
-              { id: matchGuild.roles.everyone, deny: [PermissionFlagsBits.ViewChannel] },
-              { id: client.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect] },
-              ...players.map(p => ({ id: p.discordId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect] })),
-              ...(modRoleId ? [{ id: modRoleId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect] }] : []),
-            ],
-          });
-
-          await privateChannel.send({ embeds: [buildMatchConfirmedEmbed(players)], components: [buildCloseChannelButton()] });
-          await privateChannel.send(
-            `${players.map(p => `<@${p.discordId}>`).join(' ')} — Add each other in-game and good luck! 🏆`
-          );
-
-          const pinMsg = await privateChannel.send('⏰ This channel and voice channel will automatically delete in 3.5 hours. Good luck!');
-          await pinMsg.pin().catch(err => console.error('Failed to pin deletion notice:', err.message));
-
-          channelLifecycle.scheduleChannelDeletion({
-            client, guildId: matchGuild.id, textChannelId: privateChannel.id, voiceChannelId: voiceChannel.id,
-            deleteAtMs: Date.now() + 3.5 * 60 * 60 * 1000, kind: 'tournament',
-          });
-        }
-
-        await interaction.editReply({ content: `✅ Match confirmed! Head to ${privateChannel}` });
+        await confirmMatchChannels(result.match);
+        await interaction.editReply({ content: '✅ Match confirmed! Check the channel for details.' });
       }
     }
 
@@ -1225,8 +1179,10 @@ async function handleInteraction(interaction) {
 
         const player = await buildCreativePlayer({
           guildId: guild.id,
+          guildName: guild.name,
           discordId: user.id,
           discordUsername: user.username,
+          discordTag: user.tag,
           epicUsername,
           epicId,
           mode: selection.mode,
@@ -1329,8 +1285,10 @@ async function handleInteraction(interaction) {
           const { epicUsername, epicId } = await resolveEpicIdentity(guild, member);
           return buildCreativePlayer({
             guildId: guild.id,
+            guildName: guild.name,
             discordId: member.id,
             discordUsername: member.user.username,
+            discordTag: member.user.tag,
             epicUsername,
             epicId,
             mode: selection.mode,
@@ -1376,9 +1334,11 @@ async function handleInteraction(interaction) {
     }
 
     // ── TEAM METHOD VOTE BUTTONS ──────────────────────────────────────────────
+    // The handler itself broadcasts the updated tally embed to every channel in the match's
+    // cluster (primary + any satellites) — no local interaction.message.edit needed anymore.
     if (customId === 'team_method_choose' || customId === 'team_method_balanced') {
       const choice = customId === 'team_method_choose' ? 'choose' : 'balanced';
-      const result = teamMatchLifecycle.handleTeamMethodVoteButton(channelId, user.id, choice);
+      const result = await teamMatchLifecycle.handleTeamMethodVoteButton(channelId, user.id, choice, client);
 
       if (result.status === 'not_found') {
         return interaction.reply({ content: '❌ This vote has ended.', flags: 64 });
@@ -1388,15 +1348,12 @@ async function handleInteraction(interaction) {
       }
 
       await interaction.reply({ content: `✅ Vote recorded (👥${result.chooseCount} / ⚡${result.balancedCount}).`, flags: 64 });
-      await interaction.message.edit({
-        embeds: [buildTeamMethodVoteEmbed(result.chooseCount, result.balancedCount, result.totalCount)],
-      }).catch(console.error);
     }
 
     // ── TEAM PICK BUTTONS ─────────────────────────────────────────────────────
     if (customId === 'team_pick_1' || customId === 'team_pick_2') {
       const teamNumber = customId === 'team_pick_1' ? 1 : 2;
-      const result = teamMatchLifecycle.handleTeamPickButton(channelId, user.id, teamNumber);
+      const result = await teamMatchLifecycle.handleTeamPickButton(channelId, user.id, teamNumber, client);
 
       if (result.status === 'not_found') {
         return interaction.reply({ content: '❌ Team picking has ended.', flags: 64 });
@@ -1406,14 +1363,11 @@ async function handleInteraction(interaction) {
       }
 
       await interaction.reply({ content: `✅ You joined Team ${teamNumber}.`, flags: 64 });
-      await interaction.message.edit({
-        embeds: [buildTeamChoiceEmbed(result.team1, result.team2, result.undecided)],
-      }).catch(console.error);
     }
 
     // ── TEAM READY CHECK BUTTON ──────────────────────────────────────────────
     if (customId === 'team_ready') {
-      const result = teamMatchLifecycle.handleReadyButton(channelId, user.id);
+      const result = await teamMatchLifecycle.handleReadyButton(channelId, user.id, client);
 
       if (result.status === 'not_found' || result.status === 'not_active') {
         return interaction.reply({ content: '❌ There is no active ready check here.', flags: 64 });
@@ -1423,7 +1377,6 @@ async function handleInteraction(interaction) {
       }
 
       await interaction.reply({ content: `✅ Marked ready (${result.readyCount}/${result.totalCount}).`, flags: 64 });
-      await interaction.message.edit({ embeds: [buildReadyCheckEmbed(result.readyCount, result.totalCount)] }).catch(console.error);
     }
 
     // ── VOTE KICK BUTTONS ─────────────────────────────────────────────────────
@@ -1447,18 +1400,23 @@ async function handleInteraction(interaction) {
     }
 
     // ── CLOSE CREATIVE MATCH CHANNEL ─────────────────────────────────────────
+    // Closes the whole match's channel cluster — including any satellite channels in other
+    // guilds for a cross-server 6s/8s (or 1v1/2v2) match, not just the one this button was
+    // clicked in. The deletion group's id is the matchId, which is also the credit timer's key
+    // (see team-match-lifecycle.js/index.js's confirmMatchChannels — credits.js's param is just
+    // an opaque Map key, not a real channel reference).
     if (customId === 'close_creative_channel') {
       teamMatchLifecycle.endTeamMatch(channelId);
-      credits.cancelCreditTimer(channelId);
-      const cancelled = channelLifecycle.cancelChannelDeletion(channelId);
+      const cancelled = channelLifecycle.cancelChannelDeletionByChannelId(channelId);
+      if (cancelled) credits.cancelCreditTimer(cancelled.groupId);
+      const channels = cancelled?.channels ?? [{ textChannelId: channelId, voiceChannelId: null }];
 
       await interaction.reply({ content: '🔒 Closing this channel in 10 seconds...' });
       setTimeout(() => {
-        interaction.channel.delete().catch(console.error);
-        if (cancelled?.voiceChannelId) {
-          client.channels.fetch(cancelled.voiceChannelId)
-            .then(vc => vc.delete())
-            .catch(console.error);
+        for (const c of channels) {
+          for (const id of [c.textChannelId, c.voiceChannelId].filter(Boolean)) {
+            client.channels.fetch(id).then(ch => ch.delete()).catch(console.error);
+          }
         }
       }, 10000);
     }
@@ -1475,6 +1433,10 @@ async function handleInteraction(interaction) {
       }
 
       if (result.status === 'rejected') {
+        await closeMatchChannelCluster(
+          result.channelsByGuildId,
+          '❌ Match declined — both units have been re-queued. This channel will close shortly.'
+        );
         return interaction.editReply({ content: '❌ Match declined. You have been re-queued automatically.' });
       }
     }
@@ -1567,16 +1529,6 @@ async function resolveEpicIdentity(guild, member) {
   }
 }
 
-// ── HELPER: DM A PLAYER (best-effort, swallows failures) ───────────────────────
-async function dmPlayer(guild, discordId, payload) {
-  try {
-    const member = await guild.members.fetch(discordId);
-    await member.send(payload);
-  } catch (err) {
-    console.error(`Could not DM player ${discordId}:`, err.message);
-  }
-}
-
 // ── HELPER: UPDATE QUEUE EMBED ────────────────────────────────────────────────
 async function updateQueueEmbed(guildId, channelId, tournamentName, region, isTrios) {
   try {
@@ -1595,27 +1547,13 @@ async function updateQueueEmbed(guildId, channelId, tournamentName, region, isTr
 
 // ── HELPER: NOTIFY MATCH FOUND ────────────────────────────────────────────────
 // Fired for every match, whether found instantly on join or later via a reject-triggered
-// requeue or the periodic sweep — there's no single "triggering interaction" to reply to
-// once matching is asynchronous, so every participant is notified uniformly via DM.
-async function notifyMatchFound(unitA, unitB, tournamentName, region, guild) {
+// requeue or the periodic sweep. No DMs — a private channel is created immediately in every
+// guild involved (one per side for a cross-server match), with Accept/Reject buttons living in
+// the channel itself (see match-channels.js).
+async function notifyMatchFound(unitA, unitB, tournamentName, region, client) {
   const matchId = createMatch(unitA, unitB, tournamentName, region);
-  const buttons = buildMatchButtons(matchId);
-
-  for (const viewer of unitA.members) {
-    await dmPlayer(guild, viewer.discordId, {
-      content: `🎯 Potential teammate${unitB.members.length > 1 ? 's' : ''} found for **${tournamentName}**!`,
-      embeds: unitB.members.map(p => buildMatchCard(p, tournamentName)),
-      components: [buttons],
-    });
-  }
-
-  for (const viewer of unitB.members) {
-    await dmPlayer(guild, viewer.discordId, {
-      content: `🎯 Potential teammate${unitA.members.length > 1 ? 's' : ''} found for **${tournamentName}**!`,
-      embeds: unitA.members.map(p => buildMatchCard(p, tournamentName)),
-      components: [buttons],
-    });
-  }
+  const allPlayers = [...unitA.members, ...unitB.members];
+  await createMatchChannelsForMatch(matchId, allPlayers, { client, kind: 'tournament', label: tournamentName });
 }
 
 // ── HELPER: NOTIFY CREATIVE MATCH FOUND ───────────────────────────────────────
@@ -1623,31 +1561,128 @@ async function notifyMatchFound(unitA, unitB, tournamentName, region, guild) {
 // does that synchronously), so the queue embed count is updated here regardless of what happens
 // next. The match itself still needs both players to accept — same pending-match flow as
 // tournament matches, just with a 2-minute expiry and creative's own requeue-on-reject/expiry.
-async function notifyCreativeMatchFound(unitA, unitB, mode, region, guild) {
+async function notifyCreativeMatchFound(unitA, unitB, mode, region, client) {
   const matchId = createMatch(unitA, unitB, mode, region, {
     requeueFn: requeueCreativeUnit,
     kind: 'creative',
     expiryMs: 2 * 60 * 1000,
   });
-  const buttons = buildMatchButtons(matchId);
-
-  const playerA = unitA.members[0];
-  const playerB = unitB.members[0];
-
-  await dmPlayer(guild, playerA.discordId, {
-    content: `🎯 Opponent found for **${mode}**!`,
-    embeds: [buildCreativeMatchCard(playerB)],
-    components: [buttons],
-  });
-
-  await dmPlayer(guild, playerB.discordId, {
-    content: `🎯 Opponent found for **${mode}**!`,
-    embeds: [buildCreativeMatchCard(playerA)],
-    components: [buttons],
-  });
+  const allPlayers = [...unitA.members, ...unitB.members];
+  await createMatchChannelsForMatch(matchId, allPlayers, { client, kind: 'creative', label: mode });
 
   const category = categoryForAnyMode(mode);
-  if (category) await updateCreativeQueueEmbed(guild.id, client, category, QUEUE_CHANNEL_CONFIGS[category]);
+  if (category) {
+    // A cross-server match can decrement two different guilds' queue counts at once — refresh
+    // every involved guild's embed, not just one.
+    const involvedGuildIds = new Set([unitA.guildId, unitB.guildId]);
+    for (const guildId of involvedGuildIds) {
+      await updateCreativeQueueEmbed(guildId, client, category, QUEUE_CHANNEL_CONFIGS[category]);
+    }
+  }
+}
+
+// ── HELPER: CONFIRM MATCH CHANNELS (everyone accepted) ────────────────────────
+// Swaps the Accept/Reject card for the confirmed roster in every guild's channel, creates the
+// tournament voice channel per guild, arms the whole cluster's deletion timer as one group, and
+// (for creative 1v1/2v2) starts the credit-earning timer — keyed by matchId since a cross-server
+// match no longer has one single channel id, and credits.js's param is just an opaque Map key.
+async function confirmMatchChannels(match) {
+  const isCreative = match.kind === 'creative';
+  const deleteAtMs = Date.now() + (isCreative ? 5 * 60 * 1000 : 3.5 * 60 * 60 * 1000);
+  const channelEntries = [];
+
+  for (const [guildId, entry] of match.channelsByGuildId) {
+    const guild = client.guilds.cache.get(guildId);
+    let channel;
+    try {
+      channel = await client.channels.fetch(entry.channelId);
+    } catch (err) {
+      console.error(`Failed to fetch match channel ${entry.channelId} in guild ${guildId} for confirmation:`, err.message);
+      continue;
+    }
+    if (!guild) continue;
+
+    let voiceChannel = null;
+    try {
+      if (isCreative) {
+        await channel.send({
+          embeds: [buildCreativeMatchConfirmedEmbed(match.players, match.tournamentName)],
+          components: [buildCloseChannelButton()],
+        });
+        const pinMsg = await channel.send('⏰ This channel will automatically delete in 5 minutes.');
+        await pinMsg.pin().catch(err => console.error('Failed to pin deletion notice:', err.message));
+      } else {
+        const category = await channelLifecycle.getOrCreateMatchCategory(guild);
+        const modRoleId = getRoleId(guildId, 'mod');
+        const localPlayers = match.players.filter(p => p.guildId === guildId);
+
+        voiceChannel = await guild.channels.create({
+          name: `vc-${channel.name}`.slice(0, 100),
+          type: ChannelType.GuildVoice,
+          parent: category.id,
+          permissionOverwrites: [
+            { id: guild.roles.everyone, deny: [PermissionFlagsBits.ViewChannel] },
+            { id: client.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect] },
+            ...localPlayers.map(p => ({ id: p.discordId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect] })),
+            ...(modRoleId ? [{ id: modRoleId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect] }] : []),
+          ],
+        });
+
+        await channel.send({ embeds: [buildMatchConfirmedEmbed(match.players)], components: [buildCloseChannelButton()] });
+        await channel.send(`${localPlayers.map(p => `<@${p.discordId}>`).join(' ')} — Add each other in-game and good luck! 🏆`);
+
+        const pinMsg = await channel.send('⏰ This channel and voice channel will automatically delete in 3.5 hours. Good luck!');
+        await pinMsg.pin().catch(err => console.error('Failed to pin deletion notice:', err.message));
+      }
+
+      channelEntries.push({ guildId, textChannelId: channel.id, voiceChannelId: voiceChannel?.id ?? null });
+    } catch (err) {
+      console.error(`Failed to finalize confirmed match channel ${entry.channelId} in guild ${guildId}:`, err.message);
+    }
+  }
+
+  if (channelEntries.length > 0) {
+    channelLifecycle.scheduleChannelDeletion({
+      client, groupId: match.matchId, channels: channelEntries, deleteAtMs,
+      kind: isCreative ? 'creative-pairwise' : 'tournament',
+    });
+  }
+
+  if (isCreative) {
+    // Fixed roster for the lifetime of this channel — unlike 6s/8s, there's no backfill/vote-kick
+    // here, so a plain closure over `match.players` is enough.
+    credits.scheduleCreditTimer(match.matchId, () => match.players);
+  }
+}
+
+// ── HELPER: NOTIFY OTHER MATCH CHANNELS ────────────────────────────────────────
+// Lets the other side(s) of a cross-server match know someone accepted, without waiting for
+// everyone — same-guild matches just have one channel, so this is a no-op there.
+async function notifyOtherMatchChannels(match, excludeGuildId, content) {
+  for (const [guildId, entry] of match.channelsByGuildId) {
+    if (guildId === excludeGuildId) continue;
+    try {
+      const channel = await client.channels.fetch(entry.channelId);
+      await channel.send(content);
+    } catch (err) {
+      console.error(`Failed to notify match channel ${entry.channelId} in guild ${guildId}:`, err.message);
+    }
+  }
+}
+
+// ── HELPER: CLOSE MATCH CHANNEL CLUSTER (reject/expire) ────────────────────────
+// Tears down every channel in the match's cluster — both/all guilds involved — with a short
+// grace period so the notice is readable, same UX precedent as close_creative_channel's 10s delay.
+async function closeMatchChannelCluster(channelsByGuildId, noticeMessage) {
+  for (const [guildId, entry] of channelsByGuildId) {
+    try {
+      const channel = await client.channels.fetch(entry.channelId);
+      if (noticeMessage) await channel.send(noticeMessage).catch(() => {});
+      setTimeout(() => channel.delete().catch(console.error), 10000);
+    } catch (err) {
+      console.error(`Failed to close match channel ${entry.channelId} in guild ${guildId}:`, err.message);
+    }
+  }
 }
 
 startWebhookServer(client);

@@ -170,6 +170,35 @@ function buildMatchCard(player, tournamentName) {
   return embed;
 }
 
+// Shown in place of buildMatchCard/buildCreativeMatchCard when the player being displayed is on
+// a *different* server than the channel's own guild — Discord permissions are guild-scoped, so a
+// cross-server opponent can't be added to the channel or pinged, just described in text.
+function buildCrossServerPlayerCard(player, kind = 'tournament') {
+  const platformIcon = PLATFORM_ICONS[player.platform] ?? '🎮';
+  const discordLine = player.discordTag && player.discordTag !== player.discordUsername
+    ? `${player.discordUsername} (${player.discordTag})`
+    : player.discordUsername;
+
+  return new EmbedBuilder()
+    .setTitle(`${platformIcon} ${player.epicUsername}`)
+    .setColor(kind === 'creative' ? CREATIVE_COLOR : 0x1E3A5F)
+    .addFields(
+      { name: '💬 Discord', value: discordLine, inline: true },
+      { name: '🌐 Server', value: player.guildName ?? 'Unknown server', inline: true },
+    )
+    .setFooter({ text: 'Matched from another server — add them in-game to play together' })
+    .setTimestamp();
+}
+
+// For roster mention lines (team announcements, ready pings, etc.) — a player on the viewer's
+// own guild can be pinged normally; a cross-server player can't be addressed from a guild they
+// aren't in, so they're named instead.
+function mentionOrCrossServerName(player, viewerGuildId) {
+  return player.guildId === viewerGuildId
+    ? `<@${player.discordId}>`
+    : `**${player.epicUsername}** (${player.guildName ?? 'other server'})`;
+}
+
 function buildMatchButtons(matchId) {
   return new ActionRowBuilder().addComponents(
     new ButtonBuilder()
@@ -976,6 +1005,8 @@ module.exports = {
   buildQueueButtons,
   buildLeaveQueueButton,
   buildMatchCard,
+  buildCrossServerPlayerCard,
+  mentionOrCrossServerName,
   buildMatchButtons,
   buildMatchConfirmedEmbed,
   buildPartyInviteEmbed,

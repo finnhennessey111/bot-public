@@ -1,16 +1,23 @@
-// store.js - Persists pinnedMessages, tournament + creative queue data, parties, and
-// matchChannels to MongoDB, scoped per guild. Falls back to a local data.json file if MongoDB
-// isn't configured or fails to connect — call init(client) once at startup.
+// store.js - Persists pinnedMessages, matchmaking queue data, parties, and matchChannels to
+// MongoDB, scoped per guild — except the matchmaking queue pool itself, which is shared globally
+// across every installed guild (cross-server matchmaking). Falls back to a local data.json file
+// if MongoDB isn't configured or fails to connect — call init(client) once at startup.
 //
 // In-memory shapes:
 //   pinnedMessages: flat, keyed by channelId (channel IDs are globally unique) — each record
 //     carries its own `guildId` field.
-//   queues / creativeQueues: keyed [guildId][tournamentName-or-mode][region] -> array of units.
-//   parties / matchChannels: flat, keyed by partyId / textChannelId (globally unique) — each
-//     record already carries its own `guildId` field.
+//   queues / creativeQueues: flat, keyed [tournamentName-or-mode][region] -> array of units — no
+//     guildId nesting; every installed guild's players share one pool. Each unit/player still
+//     carries its own guildId for channel routing (queue.js/creative-queue.js/
+//     creative-team-queue.js), just not as a partition key here.
+//   parties: flat, keyed by partyId (globally unique) — each record carries its own `guildId`
+//     (parties are still same-server; cross-server matching only pools already-built units).
+//   matchChannels: flat, keyed by groupId (one match's whole channel cluster, possibly spanning
+//     several guilds for a cross-server match) — each record carries a `channels` array of
+//     {guildId, textChannelId, voiceChannelId}.
 //
-// creativeChannels/settings (per-guild config, not queue/match data) moved to guild-config.js /
-// models/Guild.js as part of the multi-guild rework — they're no longer store.js's concern.
+// creativeChannels/settings (per-guild config, not queue/match data) live in guild-config.js /
+// models/Guild.js, not here.
 
 const fs = require('fs');
 const path = require('path');
@@ -22,12 +29,15 @@ const MatchChannelModel = require('./models/MatchChannel');
 
 const DATA_FILE = path.join(__dirname, 'data.json');
 
+// The queue pool has no per-guild ownership anymore — one shared document, keyed by this
+// constant rather than a real guild ID.
+const GLOBAL_QUEUE_KEY = '__global__';
+
 // One-time migration for a data.json written before the multi-guild rework: pinnedMessages
 // records had no `guildId`, and queues/creativeQueues had no `[guildId]` outer nesting (they
-// were flat `{tournamentName: {region: [...]}}`). Both are folded under process.env.GUILD_ID
-// (the bot's original single guild) here — a no-op once data.json has been saved at least once
-// under the new shape (detected via a snowflake-shaped top-level key, or a `guildId` already
-// present on each pinnedMessages record).
+// were flat `{tournamentName: {region: [...]}}`, exactly the shape we're moving back to now —
+// so a genuinely legacy single-guild file needs no queues/creativeQueues change at all here,
+// just the pinnedMessages backfill).
 function migratePinnedMessagesShape(pinnedMessages) {
   const legacyGuildId = process.env.GUILD_ID ?? null;
   const migrated = {};
@@ -37,11 +47,26 @@ function migratePinnedMessagesShape(pinnedMessages) {
   return migrated;
 }
 
-function migrateQueuesShape(queues) {
-  if (!process.env.GUILD_ID) return queues; // nothing to key legacy data under
-  const alreadyNamespaced = Object.keys(queues).every(key => /^\d{15,25}$/.test(key));
-  if (alreadyNamespaced) return queues;
-  return { [process.env.GUILD_ID]: queues };
+// Un-does the per-guild-nesting rework: if queues/creativeQueues in data.json still have the
+// `{guildId: {tournamentName: {region: [...]}}}` shape from the per-guild era, flatten it back
+// into one global pool, concatenating unit arrays where two guilds happened to have units
+// waiting for the same tournament+region (or mode+region) at once. A no-op once data.json has
+// been saved at least once under the new flat shape.
+function flattenAcrossGuilds(queues) {
+  const looksGuildNested = Object.keys(queues).every(key => /^\d{15,25}$/.test(key));
+  if (!looksGuildNested) return queues; // already flat (or empty)
+
+  const flat = {};
+  for (const guildId of Object.keys(queues)) {
+    for (const outerKey of Object.keys(queues[guildId])) {
+      if (!flat[outerKey]) flat[outerKey] = {};
+      for (const region of Object.keys(queues[guildId][outerKey])) {
+        const existing = flat[outerKey][region] ?? [];
+        flat[outerKey][region] = [...existing, ...(queues[guildId][outerKey][region] ?? [])];
+      }
+    }
+  }
+  return flat;
 }
 
 function load() {
@@ -50,10 +75,10 @@ function load() {
     const parsed = JSON.parse(raw);
     return {
       pinnedMessages: migratePinnedMessagesShape(parsed.pinnedMessages ?? {}),
-      queues: migrateQueuesShape(parsed.queues ?? {}),
+      queues: flattenAcrossGuilds(parsed.queues ?? {}),
       parties: parsed.parties ?? {}, // already guildId-per-record, no shape change needed
-      creativeQueues: migrateQueuesShape(parsed.creativeQueues ?? {}),
-      matchChannels: parsed.matchChannels ?? {}, // already guildId-per-record
+      creativeQueues: flattenAcrossGuilds(parsed.creativeQueues ?? {}),
+      matchChannels: parsed.matchChannels ?? {}, // migrated to groupId-keyed on first save
     };
   } catch (err) {
     return {
@@ -98,25 +123,54 @@ function filterByGuild(entries, guildId) {
   return Object.fromEntries(Object.entries(entries).filter(([, record]) => record.guildId === guildId));
 }
 
-// Hydrates every known guild's data from Mongo into the shared in-memory objects, replacing
-// whatever data.json had loaded. Any guild present in the JSON-loaded state with no Mongo doc
-// yet gets seeded INTO Mongo first (mirrors the original single-guild firstRun migration,
-// generalized to however many guilds data.json happens to hold — in practice just the legacy
-// guild, or none at all on a fresh Mongo-backed deployment).
+function mergeQueueBlobs(a, b) {
+  const merged = { ...a };
+  for (const outerKey of Object.keys(b)) {
+    merged[outerKey] = { ...merged[outerKey] };
+    for (const region of Object.keys(b[outerKey])) {
+      merged[outerKey][region] = [...(merged[outerKey][region] ?? []), ...(b[outerKey][region] ?? [])];
+    }
+  }
+  return merged;
+}
+
+// One-time migration for a live deployment that still has one QueueModel doc per real guildId
+// (the per-guild-partitioned era) and no '__global__' doc yet: merges every existing guild's
+// `data`/`creativeData` together into the new global doc, concatenating unit arrays on overlap.
+// The old per-guild docs are left in place untouched (not deleted) — harmless once nothing reads
+// them, and recoverable if this migration ever needs to be re-run or audited.
+async function migrateLegacyPerGuildQueueDocs() {
+  const legacyDocs = await QueueModel.find({ guildId: { $ne: GLOBAL_QUEUE_KEY } }).lean();
+  if (legacyDocs.length === 0) return { data: {}, creativeData: {} };
+
+  let data = {};
+  let creativeData = {};
+  for (const doc of legacyDocs) {
+    data = mergeQueueBlobs(data, doc.data ?? {});
+    creativeData = mergeQueueBlobs(creativeData, doc.creativeData ?? {});
+  }
+
+  console.log(`[Store] Migrated ${legacyDocs.length} per-guild queue doc(s) into the new global queue pool.`);
+  return { data, creativeData };
+}
+
+// Hydrates every known guild's pinnedMessages/parties/matchChannels from Mongo, plus the one
+// global queue doc, into the shared in-memory objects, replacing whatever data.json had loaded.
+// Any guild present in the JSON-loaded state with no Mongo doc yet gets seeded INTO Mongo first
+// (mirrors the original single-guild firstRun migration, generalized to however many guilds
+// data.json happens to hold).
 async function hydrateFromMongoAll() {
   const existingGuildIds = new Set((await GuildModel.find({}, 'guildId').lean()).map(d => d.guildId));
 
   const jsonGuildIds = new Set([
-    ...Object.keys(state.queues),
-    ...Object.keys(state.creativeQueues),
     ...Object.values(state.pinnedMessages).map(r => r.guildId).filter(Boolean),
     ...Object.values(state.parties).map(r => r.guildId).filter(Boolean),
-    ...Object.values(state.matchChannels).map(r => r.guildId).filter(Boolean),
+    ...(state.matchChannels ? Object.values(state.matchChannels).flatMap(r => (r.channels ?? []).map(c => c.guildId)) : []),
   ]);
 
   for (const guildId of jsonGuildIds) {
     if (!existingGuildIds.has(guildId)) {
-      await persistToMongo(guildId);
+      await persistGuildScopedData(guildId);
       console.log(`[Store] No existing MongoDB data for guild ${guildId} — migrated data.json into MongoDB.`);
     }
   }
@@ -131,15 +185,18 @@ async function hydrateFromMongoAll() {
   }
   replaceContents(state.pinnedMessages, pinnedMessages);
 
-  const queueDocs = await QueueModel.find({}).lean();
-  const queues = {};
-  const creativeQueues = {};
-  for (const doc of queueDocs) {
-    queues[doc.guildId] = doc.data ?? {};
-    creativeQueues[doc.guildId] = doc.creativeData ?? {};
+  let globalQueueDoc = await QueueModel.findOne({ guildId: GLOBAL_QUEUE_KEY }).lean();
+  if (!globalQueueDoc) {
+    const migrated = await migrateLegacyPerGuildQueueDocs();
+    await QueueModel.updateOne(
+      { guildId: GLOBAL_QUEUE_KEY },
+      { $set: migrated },
+      { upsert: true }
+    );
+    globalQueueDoc = migrated;
   }
-  replaceContents(state.queues, queues);
-  replaceContents(state.creativeQueues, creativeQueues);
+  replaceContents(state.queues, globalQueueDoc.data ?? {});
+  replaceContents(state.creativeQueues, globalQueueDoc.creativeData ?? {});
 
   const partyDocs = await PartyModel.find({}).lean();
   const parties = {};
@@ -158,23 +215,25 @@ async function hydrateFromMongoAll() {
 
   const channelDocs = await MatchChannelModel.find({}).lean();
   const matchChannels = {};
-  for (const c of channelDocs) matchChannels[c.textChannelId] = { ...c.data, guildId: c.guildId };
+  for (const c of channelDocs) matchChannels[c.groupId] = c.data;
   replaceContents(state.matchChannels, matchChannels);
 }
 
 // Full reconcile of a keyed store field (parties, matchChannels), scoped to one guild's entries:
 // upserts every current entry, then deletes any doc for this guild no longer present in-memory.
-async function syncCollection(Model, keyField, guildId, entries, toDoc) {
+async function syncCollection(Model, keyField, scopeField, guildId, entries, toDoc) {
   const keys = Object.keys(entries);
   await Promise.all(
     keys.map(key =>
       Model.updateOne({ [keyField]: key }, { $set: toDoc(key, entries[key]) }, { upsert: true })
     )
   );
-  await Model.deleteMany({ guildId, [keyField]: { $nin: keys } });
+  await Model.deleteMany({ [scopeField]: guildId, [keyField]: { $nin: keys } });
 }
 
-async function persistToMongo(guildId) {
+// Persists just this guild's slice of pinnedMessages/parties (matchChannels handled separately
+// below, since a group can span multiple guilds and isn't cleanly "this guild's slice").
+async function persistGuildScopedData(guildId) {
   const guildPinnedMessages = filterByGuild(state.pinnedMessages, guildId);
 
   await GuildModel.updateOne(
@@ -183,13 +242,7 @@ async function persistToMongo(guildId) {
     { upsert: true }
   );
 
-  await QueueModel.updateOne(
-    { guildId },
-    { $set: { data: state.queues[guildId] ?? {}, creativeData: state.creativeQueues[guildId] ?? {} } },
-    { upsert: true }
-  );
-
-  await syncCollection(PartyModel, 'partyId', guildId, filterByGuild(state.parties, guildId), (partyId, p) => ({
+  await syncCollection(PartyModel, 'partyId', 'guildId', guildId, filterByGuild(state.parties, guildId), (partyId, p) => ({
     partyId,
     guildId,
     leaderId: p.leaderId,
@@ -198,26 +251,57 @@ async function persistToMongo(guildId) {
     channelId: p.channelId,
     createdAt: p.createdAt,
   }));
+}
 
-  await syncCollection(MatchChannelModel, 'textChannelId', guildId, filterByGuild(state.matchChannels, guildId), (textChannelId, rec) => ({
-    textChannelId,
-    guildId,
-    data: rec,
-  }));
+// The global queue pool has no single "owning" guild, so it's persisted independently of any one
+// guild's save() call, keyed by the constant GLOBAL_QUEUE_KEY.
+async function persistGlobalQueue() {
+  await QueueModel.updateOne(
+    { guildId: GLOBAL_QUEUE_KEY },
+    { $set: { data: state.queues, creativeData: state.creativeQueues } },
+    { upsert: true }
+  );
+}
+
+// matchChannels groups can span multiple guilds — reconcile scoped to whichever guildIds this
+// particular save() call cares about isn't meaningful, so this always does a full reconcile
+// against every currently-known guild rather than filtering by one.
+async function persistMatchChannels() {
+  const keys = Object.keys(state.matchChannels);
+  await Promise.all(
+    keys.map(groupId => MatchChannelModel.updateOne(
+      { groupId },
+      {
+        $set: {
+          groupId,
+          guildIds: (state.matchChannels[groupId].channels ?? []).map(c => c.guildId),
+          data: state.matchChannels[groupId],
+        },
+      },
+      { upsert: true }
+    ))
+  );
+  await MatchChannelModel.deleteMany({ groupId: { $nin: keys } });
 }
 
 // Every mutation site already knows which guild it's acting on (a Discord interaction always
-// carries one) — save(guildId) persists just that guild's slice rather than everything, so two
-// guilds' concurrent activity never contends on an unrelated write.
+// carries one) — save(guildId) persists that guild's pinnedMessages/parties slice, plus the
+// (guild-agnostic) global queue pool and matchChannels every time, since either can change
+// as a side effect of any guild's activity.
 function save(guildId) {
   saveJson();
-  if (mongoReady && guildId) {
-    persistToMongo(guildId).catch(err => console.error(`[MongoDB] Failed to persist guild ${guildId}:`, err.message));
+  if (!mongoReady) return;
+
+  if (guildId) {
+    persistGuildScopedData(guildId).catch(err => console.error(`[MongoDB] Failed to persist guild ${guildId}:`, err.message));
   }
+  persistGlobalQueue().catch(err => console.error('[MongoDB] Failed to persist global queue:', err.message));
+  persistMatchChannels().catch(err => console.error('[MongoDB] Failed to persist match channels:', err.message));
 }
 
 // Attempts the MongoDB connection and, if successful, hydrates every known guild's
-// pinnedMessages/queues/creativeQueues/parties/matchChannels from it. Call once at startup,
+// pinnedMessages/parties/matchChannels plus the global queue pool from it (every Guild doc that
+// exists, not just guilds the bot is currently in — no client needed here). Call once at startup,
 // before the bot starts handling events. Safe to call even without MONGODB_URI set — falls back
 // to the JSON store (already loaded into `state` at module load).
 async function init() {
@@ -231,7 +315,7 @@ async function init() {
   try {
     await hydrateFromMongoAll();
     mongoReady = true;
-    console.log('[Store] Using MongoDB for persistence (pinnedMessages, queues, creativeQueues, parties, matchChannels).');
+    console.log('[Store] Using MongoDB for persistence (pinnedMessages, global queue pool, creativeQueues, parties, matchChannels).');
   } catch (err) {
     mongoReady = false;
     console.error('[Store] Failed to hydrate from MongoDB — using local JSON file (data.json) for persistence:', err.message);

@@ -4,6 +4,15 @@
 // creative-team-queue.js emits 'matchFormed', that engine is done with these players; this
 // module takes over until the channel is eventually closed.
 //
+// Cross-server matches (players queued in from more than one guild) get one channel *per guild
+// involved* instead of one shared channel — Discord permissions are guild-scoped, so a player
+// can only ever see their own server's channel. The guild of whoever completed the match's final
+// slot (creativeTeamQueue's `completingGuildId`) hosts the "primary" channel (leader-add
+// instructions, lock/unlock timing); every other involved guild gets a "satellite" channel
+// showing the same roster and mirrored state. Every interactive prompt (ready check, team-method
+// vote, team pick, vote-kick) can be resolved from *any* of these channels — they all read and
+// write the same in-memory matchState, keyed by matchId, not by channel.
+//
 // In-memory only (not persisted), same precedent as matching.js's pendingMatches and
 // party.js's pendingInvites — a restart loses any in-progress lock/ready-check/vote state.
 
@@ -20,104 +29,146 @@ const {
   buildTeamMethodVoteEmbed, buildTeamMethodVoteButtons,
   buildTeamChoiceEmbed, buildTeamChoiceButtons,
   buildTeamsAnnouncementEmbed,
+  buildVoteKickEmbed, buildVoteKickButtons,
+  mentionOrCrossServerName,
 } = require('./embeds');
 
-// channelId -> matchState. matchState.players is the live, mutable roster (shrinks/grows as
+// matchId -> matchState. matchState.players is the live, mutable roster (shrinks/grows as
 // people are removed/backfilled); matchState.votekick tracks the one-vote-per-player cap,
 // per-target fail cooldowns, and the currently active vote (if any).
-const activeTeamMatches = new Map();
+const matchesById = new Map();
+// Every channel (primary + every satellite) that belongs to a match, so any one of them can be
+// used to look the match up — button/command handlers only know "which channel was this clicked
+// in", never which match id.
+const channelToMatchId = new Map();
 
 function generateId(prefix) {
   return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
 }
 
 function getMatchByChannelId(channelId) {
-  return activeTeamMatches.get(channelId) ?? null;
+  const matchId = channelToMatchId.get(channelId);
+  return matchId ? (matchesById.get(matchId) ?? null) : null;
 }
 
+// guildId kept for call-site compatibility but no longer used to scope the search — a Discord ID
+// can only be in one active match at a time regardless of which guild is asking (the queue pool
+// is global now).
 function isPlayerInActiveTeamMatch(guildId, discordId) {
-  for (const matchState of activeTeamMatches.values()) {
-    if (matchState.guildId !== guildId) continue;
+  for (const matchState of matchesById.values()) {
     if (matchState.players.some(p => p.discordId === discordId)) return true;
   }
   return false;
 }
 
+// Ends the whole match session (all channels), looked up from any single channel in it — e.g.
+// one channel got auto-deleted, or the close button was clicked in one of them.
 function endTeamMatch(channelId) {
-  activeTeamMatches.delete(channelId);
+  const matchId = channelToMatchId.get(channelId);
+  if (!matchId) return;
+  const matchState = matchesById.get(matchId);
+  if (matchState) {
+    for (const entry of matchState.channelsByGuildId.values()) {
+      channelToMatchId.delete(entry.textChannelId);
+      if (entry.voiceChannelId) channelToMatchId.delete(entry.voiceChannelId);
+    }
+  }
+  matchesById.delete(matchId);
 }
 
 // Count of confirmed 6s/8s matches currently in their post-formation lifecycle (team pick/lock/
-// ready-check/live), scoped to this guild — used by /bot-status.
+// ready-check/live), across every guild — used by /bot-status. guildId kept for call-site
+// compatibility, unused (see isPlayerInActiveTeamMatch).
 function getActiveTeamMatchCount(guildId) {
-  let count = 0;
-  for (const matchState of activeTeamMatches.values()) {
-    if (matchState.guildId === guildId) count++;
-  }
-  return count;
+  return matchesById.size;
 }
 
-async function startTeamMatch(units, mode, region, guild, client) {
+// ── CHANNEL HELPERS ────────────────────────────────────────────────────────────
+
+function groupPlayersByGuildId(players) {
+  const byGuild = new Map();
+  for (const p of players) {
+    if (!byGuild.has(p.guildId)) byGuild.set(p.guildId, []);
+    byGuild.get(p.guildId).push(p);
+  }
+  return byGuild;
+}
+
+function localPlayersFor(matchState, guildId) {
+  return matchState.players.filter(p => p.guildId === guildId);
+}
+
+// Runs fn(channel, guildId, entry) for every channel in the match's cluster, skipping (and
+// logging) any that can't currently be fetched rather than aborting the whole broadcast.
+async function forEachChannel(matchState, client, fn) {
+  for (const [guildId, entry] of matchState.channelsByGuildId) {
+    try {
+      const channel = await client.channels.fetch(entry.textChannelId);
+      await fn(channel, guildId, entry);
+    } catch (err) {
+      console.error(`[team-match] channel ${entry.textChannelId} (guild ${guildId}) unreachable:`, err.message);
+    }
+  }
+}
+
+async function createGuildChannelForMatch(guild, localPlayers, category, mode, shortId, client) {
+  const modRoleId = getRoleId(guild.id, 'mod');
+
+  const channel = await guild.channels.create({
+    name: `team-${creativeTeamQueue.categoryForMode(mode)}-${shortId}`,
+    type: ChannelType.GuildText,
+    parent: category.id,
+    permissionOverwrites: [
+      { id: guild.roles.everyone, deny: [PermissionFlagsBits.ViewChannel] },
+      { id: client.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages] },
+      ...localPlayers.map(p => ({ id: p.discordId, allow: [PermissionFlagsBits.ViewChannel], deny: [PermissionFlagsBits.SendMessages] })),
+      ...(modRoleId ? [{ id: modRoleId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages] }] : []),
+    ],
+  });
+
+  const voiceName = `vc-${creativeTeamQueue.categoryForMode(mode)}-${localPlayers[0].epicUsername}`
+    .toLowerCase()
+    .replace(/\s+/g, '-')
+    .replace(/[^a-z0-9-]/g, '')
+    .slice(0, 100);
+
+  const voiceChannel = await guild.channels.create({
+    name: voiceName,
+    type: ChannelType.GuildVoice,
+    parent: category.id,
+    permissionOverwrites: [
+      { id: guild.roles.everyone, deny: [PermissionFlagsBits.ViewChannel] },
+      { id: client.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect] },
+      ...localPlayers.map(p => ({ id: p.discordId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect] })),
+      ...(modRoleId ? [{ id: modRoleId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect] }] : []),
+    ],
+  });
+
+  return { channel, voiceChannel };
+}
+
+async function startTeamMatch(units, mode, region, completingGuildId, client) {
   const players = units.flatMap(u => u.players);
   const category = creativeTeamQueue.categoryForMode(mode);
   const shortId = Math.random().toString(36).slice(2, 7);
-  const matchCategory = await channelLifecycle.getOrCreateMatchCategory(guild);
+  const byGuild = groupPlayersByGuildId(players);
 
-  let channel;
-  let voiceChannel;
-  try {
-    const modRoleId = getRoleId(guild.id, 'mod');
-
-    channel = await guild.channels.create({
-      name: `team-${category}-${shortId}`,
-      type: ChannelType.GuildText,
-      parent: matchCategory.id,
-      permissionOverwrites: [
-        { id: guild.roles.everyone, deny: [PermissionFlagsBits.ViewChannel] },
-        { id: client.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages] },
-        ...players.map(p => ({
-          id: p.discordId,
-          allow: [PermissionFlagsBits.ViewChannel],
-          deny: [PermissionFlagsBits.SendMessages], // locked until unlockAndStartReadyCheck
-        })),
-        ...(modRoleId ? [{ id: modRoleId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages] }] : []),
-      ],
-    });
-
-    const voiceName = `vc-${category}-${players[0].epicUsername}`
-      .toLowerCase()
-      .replace(/\s+/g, '-')
-      .replace(/[^a-z0-9-]/g, '')
-      .slice(0, 100);
-
-    voiceChannel = await guild.channels.create({
-      name: voiceName,
-      type: ChannelType.GuildVoice,
-      parent: matchCategory.id,
-      permissionOverwrites: [
-        { id: guild.roles.everyone, deny: [PermissionFlagsBits.ViewChannel] },
-        { id: client.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect] },
-        ...players.map(p => ({ id: p.discordId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect] })),
-        ...(modRoleId ? [{ id: modRoleId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect] }] : []),
-      ],
-    });
-  } catch (err) {
-    console.error('Failed to create team match channel(s):', err.message);
+  const primaryGuildId = byGuild.has(completingGuildId) ? completingGuildId : [...byGuild.keys()][0];
+  const primaryGuild = client.guilds.cache.get(primaryGuildId);
+  if (!primaryGuild) {
+    console.error(`Failed to start team match — bot is not in primary guild ${primaryGuildId}`);
     return;
   }
 
-  const leader = players.reduce((best, p) => (p.totalPR > best.totalPR ? p : best));
-
   const matchState = {
     matchId: generateId('team'),
-    guildId: guild.id,
-    channelId: channel.id,
-    voiceChannelId: voiceChannel.id,
+    channelsByGuildId: new Map(), // guildId -> { textChannelId, voiceChannelId }
+    primaryGuildId,
     mode,
     region,
     units: [...units],
     players: [...players],
-    leaderId: leader.discordId,
+    leaderId: players.reduce((best, p) => (p.totalPR > best.totalPR ? p : best)).discordId,
     createdAt: new Date(),
     readyBy: new Set(),
     readyCheckActive: false,
@@ -126,36 +177,67 @@ async function startTeamMatch(units, mode, region, guild, client) {
     // Anyone ever removed from this specific match (vote-kicked or a ready-check no-show) —
     // excluded from backfilling back into it, see removePlayerAndBackfill.
     removedPlayerIds: new Set(),
+    messageIds: { teamMethodVote: new Map(), teamChoice: new Map(), readyCheck: new Map() },
   };
-  activeTeamMatches.set(channel.id, matchState);
 
-  try {
-    await channel.send({
-      content: players.map(p => `<@${p.discordId}>`).join(' '),
-      embeds: [buildCreativeMatchConfirmedEmbed(players, mode)],
-      components: [buildCloseChannelButton()],
-    });
+  const channelClusterForDeletion = [];
 
-    const deletionPinMsg = await channel.send('⏰ This channel and voice channel will automatically delete in 2 hours.');
-    await deletionPinMsg.pin();
-  } catch (err) {
-    console.error('Failed to post/pin confirmed match/deletion messages:', err.message);
+  for (const [guildId, localPlayers] of byGuild) {
+    const guild = guildId === primaryGuildId ? primaryGuild : client.guilds.cache.get(guildId);
+    if (!guild) {
+      console.error(`Skipping satellite channel — bot is not in guild ${guildId} (player(s): ${localPlayers.map(p => p.discordUsername).join(', ')})`);
+      continue;
+    }
+
+    let channel, voiceChannel;
+    try {
+      const matchCategory = await channelLifecycle.getOrCreateMatchCategory(guild);
+      ({ channel, voiceChannel } = await createGuildChannelForMatch(guild, localPlayers, matchCategory, mode, shortId, client));
+    } catch (err) {
+      console.error(`Failed to create team match channel(s) in guild ${guildId}:`, err.message);
+      continue;
+    }
+
+    matchState.channelsByGuildId.set(guildId, { textChannelId: channel.id, voiceChannelId: voiceChannel.id });
+    channelToMatchId.set(channel.id, matchState.matchId);
+    channelToMatchId.set(voiceChannel.id, matchState.matchId);
+    channelClusterForDeletion.push({ guildId, textChannelId: channel.id, voiceChannelId: voiceChannel.id });
+
+    try {
+      const mentionLine = localPlayers.map(p => `<@${p.discordId}>`).join(' ');
+      await channel.send({
+        content: mentionLine,
+        embeds: [buildCreativeMatchConfirmedEmbed(players, mode)],
+        components: [buildCloseChannelButton()],
+      });
+
+      const deletionPinMsg = await channel.send('⏰ This channel and voice channel will automatically delete in 2 hours.');
+      await deletionPinMsg.pin();
+    } catch (err) {
+      console.error(`Failed to post/pin confirmed match/deletion messages in guild ${guildId}:`, err.message);
+    }
   }
 
+  matchesById.set(matchState.matchId, matchState);
+
   channelLifecycle.scheduleChannelDeletion({
-    client, guildId: guild.id, textChannelId: channel.id, voiceChannelId: voiceChannel.id,
+    client, groupId: matchState.matchId, channels: channelClusterForDeletion,
     deleteAtMs: Date.now() + 2 * 60 * 60 * 1000, kind: 'creative-team',
   });
 
   // Reads matchState.players at fire time (5 min out), not the roster captured here — a
   // vote-kick or ready-check no-show + backfill can change who's actually in the match before
-  // then, and credits should follow who's really there.
-  credits.scheduleCreditTimer(channel.id, () => getMatchByChannelId(channel.id)?.players ?? []);
+  // then, and credits should follow who's really there. Keyed by matchId (not a channel id) —
+  // there's no single channel to key by once a match can have several across guilds, and
+  // credits.js's param is just an opaque Map key, not a real channel reference.
+  credits.scheduleCreditTimer(matchState.matchId, () => matchesById.get(matchState.matchId)?.players ?? []);
 
   // Teams have to be settled before the lock/ready-check timer starts — startTeamMethodVote's
   // chain (vote -> [team choice] -> announceTeams) posts the leader-lock message and arms that
-  // timer itself once team assignment is finalised.
-  await startTeamMethodVote(matchState, guild, client, channel);
+  // timer itself once team assignment is finalised. Returning matchState is only used by tests;
+  // index.js's caller fires-and-forgets this promise.
+  await startTeamMethodVote(matchState, client);
+  return matchState;
 }
 
 // ── TEAM ASSIGNMENT ──────────────────────────────────────────────────────────
@@ -240,21 +322,23 @@ function equalizeTeamSizes(team1, team2, unitByDiscordId) {
   }
 }
 
-async function startTeamMethodVote(matchState, guild, client, channel) {
+async function startTeamMethodVote(matchState, client) {
   matchState.teamMethodVote = { votes: new Map(), resolved: false };
 
-  try {
-    const msg = await channel.send({
-      embeds: [buildTeamMethodVoteEmbed(0, 0, matchState.players.length)],
-      components: [buildTeamMethodVoteButtons()],
-    });
-    matchState.teamMethodVoteMessageId = msg.id;
-  } catch (err) {
-    console.error('Failed to post team method vote:', err.message);
-  }
+  await forEachChannel(matchState, client, async (channel) => {
+    try {
+      const msg = await channel.send({
+        embeds: [buildTeamMethodVoteEmbed(0, 0, matchState.players.length)],
+        components: [buildTeamMethodVoteButtons()],
+      });
+      matchState.messageIds.teamMethodVote.set(channel.id, msg.id);
+    } catch (err) {
+      console.error('Failed to post team method vote:', err.message);
+    }
+  });
 
   setTimeout(
-    () => resolveTeamMethodVote(matchState, guild, client, channel).catch(console.error),
+    () => resolveTeamMethodVote(matchState, client).catch(console.error),
     config.teamQueue.teamMethodVoteSeconds * 1000
   );
 }
@@ -268,8 +352,8 @@ function tallyTeamMethodVote(matchState) {
   return { chooseCount, balancedCount };
 }
 
-function handleTeamMethodVoteButton(channelId, discordId, choice) {
-  const matchState = activeTeamMatches.get(channelId);
+async function handleTeamMethodVoteButton(channelId, discordId, choice, client) {
+  const matchState = getMatchByChannelId(channelId);
   if (!matchState || !matchState.teamMethodVote || matchState.teamMethodVote.resolved) {
     return { status: 'not_found' };
   }
@@ -278,11 +362,18 @@ function handleTeamMethodVoteButton(channelId, discordId, choice) {
   matchState.teamMethodVote.votes.set(discordId, choice);
   const { chooseCount, balancedCount } = tallyTeamMethodVote(matchState);
 
+  await forEachChannel(matchState, client, async (channel) => {
+    const messageId = matchState.messageIds.teamMethodVote.get(channel.id);
+    if (!messageId) return;
+    const msg = await channel.messages.fetch(messageId);
+    await msg.edit({ embeds: [buildTeamMethodVoteEmbed(chooseCount, balancedCount, matchState.players.length)] });
+  });
+
   return { status: 'ok', chooseCount, balancedCount, totalCount: matchState.players.length };
 }
 
-async function resolveTeamMethodVote(matchState, guild, client, channel) {
-  if (!activeTeamMatches.has(matchState.channelId)) return;
+async function resolveTeamMethodVote(matchState, client) {
+  if (!matchesById.has(matchState.matchId)) return;
   if (!matchState.teamMethodVote || matchState.teamMethodVote.resolved) return;
   matchState.teamMethodVote.resolved = true;
 
@@ -290,17 +381,17 @@ async function resolveTeamMethodVote(matchState, guild, client, channel) {
   const method = chooseCount > balancedCount ? 'choose' : 'balanced';
   const tieNote = chooseCount === balancedCount ? ' — tied, defaulting to PR Balanced Teams' : '';
 
-  await channel.send(
+  await forEachChannel(matchState, client, channel => channel.send(
     `🗳️ Vote result: **${method === 'choose' ? 'Choose Own Teams' : 'PR Balanced Teams'}** wins `
     + `(👥${chooseCount} / ⚡${balancedCount})${tieNote}.`
-  ).catch(console.error);
+  ).catch(console.error));
 
   if (method === 'choose') {
-    await startTeamChoicePhase(matchState, guild, client, channel);
+    await startTeamChoicePhase(matchState, client);
   } else {
     const halfSize = creativeTeamQueue.targetSizeForMode(matchState.mode) / 2;
     const { team1, team2 } = assignPartyAwareTeams(matchState.units, halfSize);
-    await announceTeams(matchState, guild, client, channel, team1, team2);
+    await announceTeams(matchState, client, team1, team2);
   }
 }
 
@@ -325,21 +416,23 @@ function currentTeamChoiceRosters(matchState) {
   return { team1, team2, undecided };
 }
 
-async function startTeamChoicePhase(matchState, guild, client, channel) {
+async function startTeamChoicePhase(matchState, client) {
   matchState.teamChoice = { picks: new Map(), resolved: false }; // unitId -> 1 | 2
 
-  try {
-    const msg = await channel.send({
-      embeds: [buildTeamChoiceEmbed([], [], matchState.players)],
-      components: [buildTeamChoiceButtons()],
-    });
-    matchState.teamChoiceMessageId = msg.id;
-  } catch (err) {
-    console.error('Failed to post team choice prompt:', err.message);
-  }
+  await forEachChannel(matchState, client, async (channel) => {
+    try {
+      const msg = await channel.send({
+        embeds: [buildTeamChoiceEmbed([], [], matchState.players)],
+        components: [buildTeamChoiceButtons()],
+      });
+      matchState.messageIds.teamChoice.set(channel.id, msg.id);
+    } catch (err) {
+      console.error('Failed to post team choice prompt:', err.message);
+    }
+  });
 
   setTimeout(
-    () => resolveTeamChoicePhase(matchState, guild, client, channel).catch(console.error),
+    () => resolveTeamChoicePhase(matchState, client).catch(console.error),
     config.teamQueue.teamChoiceSeconds * 1000
   );
 }
@@ -347,8 +440,8 @@ async function startTeamChoicePhase(matchState, guild, client, channel) {
 // Clicking Join Team 1/2 assigns the player's *whole unit* (their party, if any) to that team —
 // so a party always moves together regardless of which member happens to click. Re-clicking (by
 // the same or a different member of the same party) just overwrites the unit's pick.
-function handleTeamPickButton(channelId, discordId, teamNumber) {
-  const matchState = activeTeamMatches.get(channelId);
+async function handleTeamPickButton(channelId, discordId, teamNumber, client) {
+  const matchState = getMatchByChannelId(channelId);
   if (!matchState || !matchState.teamChoice || matchState.teamChoice.resolved) {
     return { status: 'not_found' };
   }
@@ -359,11 +452,18 @@ function handleTeamPickButton(channelId, discordId, teamNumber) {
   matchState.teamChoice.picks.set(unit.unitId, teamNumber);
   const { team1, team2, undecided } = currentTeamChoiceRosters(matchState);
 
+  await forEachChannel(matchState, client, async (channel) => {
+    const messageId = matchState.messageIds.teamChoice.get(channel.id);
+    if (!messageId) return;
+    const msg = await channel.messages.fetch(messageId);
+    await msg.edit({ embeds: [buildTeamChoiceEmbed(team1, team2, undecided)] });
+  });
+
   return { status: 'ok', team1, team2, undecided };
 }
 
-async function resolveTeamChoicePhase(matchState, guild, client, channel) {
-  if (!activeTeamMatches.has(matchState.channelId)) return;
+async function resolveTeamChoicePhase(matchState, client) {
+  if (!matchesById.has(matchState.matchId)) return;
   if (!matchState.teamChoice || matchState.teamChoice.resolved) return;
   matchState.teamChoice.resolved = true;
 
@@ -382,108 +482,124 @@ async function resolveTeamChoicePhase(matchState, guild, client, channel) {
   equalizeTeamSizes(team1, team2, unitByDiscordId);
 
   if (undecided.length > 0) {
-    await channel.send(
+    await forEachChannel(matchState, client, channel => channel.send(
       `⏱️ Team pick closed. Auto-assigned to balance: ${undecided.map(p => `**${p.epicUsername}**`).join(', ')}.`
-    ).catch(console.error);
+    ).catch(console.error));
   }
 
-  await announceTeams(matchState, guild, client, channel, team1, team2);
+  await announceTeams(matchState, client, team1, team2);
 }
 
 // Shared finalisation for both team-decision paths: records the split, announces it, then hands
 // off to the pre-existing lock/ready-check flow (unchanged from before team assignment existed).
-async function announceTeams(matchState, guild, client, channel, team1, team2) {
+async function announceTeams(matchState, client, team1, team2) {
   matchState.teams = { 1: team1, 2: team2 };
 
-  try {
-    const msg = await channel.send({ embeds: [buildTeamsAnnouncementEmbed(team1, team2)] });
-    await msg.pin().catch(err => console.error('Failed to pin teams announcement:', err.message));
-  } catch (err) {
-    console.error('Failed to post teams announcement:', err.message);
-  }
+  await forEachChannel(matchState, client, async (channel) => {
+    try {
+      const msg = await channel.send({ embeds: [buildTeamsAnnouncementEmbed(team1, team2)] });
+      await msg.pin().catch(err => console.error('Failed to pin teams announcement:', err.message));
+    } catch (err) {
+      console.error('Failed to post teams announcement:', err.message);
+    }
+  });
 
   const leader = matchState.players.find(p => p.discordId === matchState.leaderId);
 
-  try {
-    const pinMsg = await channel.send(
-      `🔒 Channel locked for ${config.teamQueue.lockSeconds}s. Add **${leader.epicUsername}** in game.`
-    );
-    await pinMsg.pin();
-  } catch (err) {
-    console.error('Failed to post/pin leader message:', err.message);
-  }
+  await forEachChannel(matchState, client, async (channel) => {
+    try {
+      const pinMsg = await channel.send(
+        `🔒 Channel locked for ${config.teamQueue.lockSeconds}s. Add **${leader.epicUsername}** in game.`
+      );
+      await pinMsg.pin();
+    } catch (err) {
+      console.error('Failed to post/pin leader message:', err.message);
+    }
+  });
 
   setTimeout(
-    () => unlockAndStartReadyCheck(matchState, guild, client, channel).catch(console.error),
+    () => unlockAndStartReadyCheck(matchState, client).catch(console.error),
     config.teamQueue.lockSeconds * 1000
   );
 }
 
-async function unlockAndStartReadyCheck(matchState, guild, client, channel) {
-  if (!activeTeamMatches.has(matchState.channelId)) return; // channel closed in the meantime
+async function unlockAndStartReadyCheck(matchState, client) {
+  if (!matchesById.has(matchState.matchId)) return; // channel closed in the meantime
 
-  for (const p of matchState.players) {
-    try {
-      await channel.permissionOverwrites.edit(p.discordId, { SendMessages: true });
-    } catch (err) {
-      console.error('Failed to unlock permissions for player:', err.message);
+  await forEachChannel(matchState, client, async (channel, guildId) => {
+    for (const p of localPlayersFor(matchState, guildId)) {
+      try {
+        await channel.permissionOverwrites.edit(p.discordId, { SendMessages: true });
+      } catch (err) {
+        console.error('Failed to unlock permissions for player:', err.message);
+      }
     }
-  }
+  });
 
   matchState.readyCheckActive = true;
   matchState.readyBy = new Set();
 
-  try {
-    const msg = await channel.send({
-      content: matchState.players.map(p => `<@${p.discordId}>`).join(' '),
-      embeds: [buildReadyCheckEmbed(0, matchState.players.length)],
-      components: [buildReadyButton()],
-    });
-    matchState.readyCheckMessageId = msg.id;
-  } catch (err) {
-    console.error('Failed to post ready-check message:', err.message);
-  }
+  await forEachChannel(matchState, client, async (channel, guildId) => {
+    try {
+      const mentionLine = localPlayersFor(matchState, guildId).map(p => `<@${p.discordId}>`).join(' ');
+      const msg = await channel.send({
+        content: mentionLine,
+        embeds: [buildReadyCheckEmbed(0, matchState.players.length)],
+        components: [buildReadyButton()],
+      });
+      matchState.messageIds.readyCheck.set(channel.id, msg.id);
+    } catch (err) {
+      console.error('Failed to post ready-check message:', err.message);
+    }
+  });
 
   setTimeout(
-    () => resolveReadyCheck(matchState, guild, client, channel).catch(console.error),
+    () => resolveReadyCheck(matchState, client).catch(console.error),
     config.teamQueue.readyCheckSeconds * 1000
   );
 }
 
-function handleReadyButton(channelId, discordId) {
-  const matchState = activeTeamMatches.get(channelId);
+async function handleReadyButton(channelId, discordId, client) {
+  const matchState = getMatchByChannelId(channelId);
   if (!matchState) return { status: 'not_found' };
   if (!matchState.readyCheckActive) return { status: 'not_active' };
   if (!matchState.players.some(p => p.discordId === discordId)) return { status: 'not_participant' };
 
   matchState.readyBy.add(discordId);
+
+  await forEachChannel(matchState, client, async (channel) => {
+    const messageId = matchState.messageIds.readyCheck.get(channel.id);
+    if (!messageId) return;
+    const msg = await channel.messages.fetch(messageId);
+    await msg.edit({ embeds: [buildReadyCheckEmbed(matchState.readyBy.size, matchState.players.length)] });
+  });
+
   return { status: 'ok', readyCount: matchState.readyBy.size, totalCount: matchState.players.length };
 }
 
-async function resolveReadyCheck(matchState, guild, client, channel) {
-  if (!activeTeamMatches.has(matchState.channelId)) return;
+async function resolveReadyCheck(matchState, client) {
+  if (!matchesById.has(matchState.matchId)) return;
   matchState.readyCheckActive = false;
 
   const nonResponders = matchState.players.filter(p => !matchState.readyBy.has(p.discordId));
 
   for (const p of nonResponders) {
-    await removePlayerAndBackfill(matchState, p.discordId, guild, client, channel);
+    await removePlayerAndBackfill(matchState, p.discordId, client);
   }
 
-  if (nonResponders.length > 0) {
-    await channel.send(
-      `⏱️ Ready check closed. Removed and re-queued: ${nonResponders.map(p => `**${p.discordUsername}**`).join(', ')}.`
-    ).catch(console.error);
-  } else {
-    await channel.send('✅ Everyone is ready!').catch(console.error);
-  }
+  await forEachChannel(matchState, client, channel => {
+    const message = nonResponders.length > 0
+      ? `⏱️ Ready check closed. Removed and re-queued: ${nonResponders.map(p => `**${p.discordUsername}**`).join(', ')}.`
+      : '✅ Everyone is ready!';
+    return channel.send(message).catch(console.error);
+  });
 }
 
 // Shared removal path for both ready-check timeout and a passed vote-kick: drop the player,
 // re-queue them as a solo unit, then try to backfill the vacancy straight from the team queue.
 // No fresh ready-check for backfilled players — they just joined the queue, so they're
 // presumed present; only players who were already in the match go through lock/ready.
-async function removePlayerAndBackfill(matchState, discordId, guild, client, channel) {
+async function removePlayerAndBackfill(matchState, discordId, client) {
   const removedPlayer = matchState.players.find(p => p.discordId === discordId);
   if (!removedPlayer) return;
 
@@ -495,23 +611,27 @@ async function removePlayerAndBackfill(matchState, discordId, guild, client, cha
     matchState.teams[2] = matchState.teams[2].filter(p => p.discordId !== discordId);
   }
 
-  try {
-    await channel.permissionOverwrites.edit(discordId, { ViewChannel: false, SendMessages: false });
-  } catch (err) {
-    console.error('Failed to remove permissions for departed player:', err.message);
+  const ownChannelEntry = matchState.channelsByGuildId.get(removedPlayer.guildId);
+  if (ownChannelEntry) {
+    try {
+      const channel = await client.channels.fetch(ownChannelEntry.textChannelId);
+      await channel.permissionOverwrites.edit(discordId, { ViewChannel: false, SendMessages: false });
+    } catch (err) {
+      console.error('Failed to remove permissions for departed player:', err.message);
+    }
   }
 
-  creativeTeamQueue.queueUnit(matchState.guildId, [removedPlayer], matchState.mode, matchState.region);
+  creativeTeamQueue.queueUnit(removedPlayer.guildId, [removedPlayer], matchState.mode, matchState.region);
 
-  await backfillVacancies(matchState, guild, client, channel);
+  await backfillVacancies(matchState, client);
 }
 
 // Keeps retrying every teamQueue.backfillRetrySeconds until the match is back at full size or
-// the channel is closed (activeTeamMatches no longer has it) — a single attempt right after a
+// the channel is closed (matchesById no longer has it) — a single attempt right after a
 // removal will often find nobody waiting yet, so this re-checks the queue periodically instead
 // of leaving the match permanently short-handed. matchState.backfillRetryScheduled guards
 // against stacking multiple parallel retry chains if removals happen close together.
-async function backfillVacancies(matchState, guild, client, channel) {
+async function backfillVacancies(matchState, client) {
   const targetSize = creativeTeamQueue.targetSizeForMode(matchState.mode);
   const vacantCount = targetSize - matchState.players.length;
 
@@ -522,7 +642,7 @@ async function backfillVacancies(matchState, guild, client, channel) {
     const groupPlats = new Set(matchState.players.map(p => p.platform));
 
     const pulledUnits = creativeTeamQueue.pullReplacementUnits(
-      matchState.guildId, matchState.mode, matchState.region, vacantCount, groupAvg, groupPlats, tier, matchState.removedPlayerIds
+      matchState.mode, matchState.region, vacantCount, groupAvg, groupPlats, tier, matchState.removedPlayerIds
     );
     const newPlayers = pulledUnits.flatMap(u => u.players);
 
@@ -543,22 +663,66 @@ async function backfillVacancies(matchState, guild, client, channel) {
         ]);
       }
 
-      for (const p of newPlayers) {
+      const byGuild = groupPlayersByGuildId(newPlayers);
+      for (const [guildId, guildNewPlayers] of byGuild) {
+        let entry = matchState.channelsByGuildId.get(guildId);
+
+        if (!entry) {
+          // Backfilled from a guild with no channel in this match yet — spin up a satellite on
+          // the fly, already unlocked (the match is already past the lock/ready-check phase by
+          // the time a backfill happens).
+          const guild = client.guilds.cache.get(guildId);
+          if (!guild) {
+            console.error(`Cannot backfill — bot is not in guild ${guildId}`);
+            continue;
+          }
+          try {
+            const matchCategory = await channelLifecycle.getOrCreateMatchCategory(guild);
+            const shortId = Math.random().toString(36).slice(2, 7);
+            const { channel, voiceChannel } = await createGuildChannelForMatch(
+              guild, guildNewPlayers, matchCategory, matchState.mode, shortId, client
+            );
+            entry = { textChannelId: channel.id, voiceChannelId: voiceChannel.id };
+            matchState.channelsByGuildId.set(guildId, entry);
+            channelToMatchId.set(channel.id, matchState.matchId);
+            channelToMatchId.set(voiceChannel.id, matchState.matchId);
+            await channel.send({
+              embeds: [buildCreativeMatchConfirmedEmbed(matchState.players, matchState.mode)],
+              components: [buildCloseChannelButton()],
+            }).catch(console.error);
+          } catch (err) {
+            console.error(`Failed to create backfill satellite channel in guild ${guildId}:`, err.message);
+            continue;
+          }
+        }
+
         try {
-          await channel.permissionOverwrites.edit(p.discordId, { ViewChannel: true, SendMessages: true });
+          const channel = await client.channels.fetch(entry.textChannelId);
+          for (const p of guildNewPlayers) {
+            await channel.permissionOverwrites.edit(p.discordId, { ViewChannel: true, SendMessages: true });
+          }
+
+          const mentionList = guildNewPlayers.map(p => {
+            const teamTag = teamByDiscordId ? ` (Team ${teamByDiscordId.get(p.discordId)})` : '';
+            return `<@${p.discordId}>${teamTag}`;
+          }).join(' ');
+
+          await channel.send({ content: `${mentionList} — added to fill an open slot. Welcome!` }).catch(console.error);
         } catch (err) {
-          console.error('Failed to grant permissions to backfilled player:', err.message);
+          console.error(`Failed to grant backfill permissions in guild ${guildId}:`, err.message);
         }
       }
 
-      const mentionList = newPlayers.map(p => {
-        const teamTag = teamByDiscordId ? ` (Team ${teamByDiscordId.get(p.discordId)})` : '';
-        return `<@${p.discordId}>${teamTag}`;
-      }).join(' ');
-
-      await channel.send({
-        content: `${mentionList} — added to fill an open slot. Welcome!`,
-      }).catch(console.error);
+      // Every other guild's channel just gets a text notice — those players can't be pinged (or
+      // permissioned) since the newcomer isn't in their server.
+      await forEachChannel(matchState, client, async (channel, guildId) => {
+        if (byGuild.has(guildId)) return; // already handled above with real permission grants
+        const names = newPlayers
+          .filter(p => p.guildId !== guildId)
+          .map(p => mentionOrCrossServerName(p, guildId))
+          .join(', ');
+        if (names) await channel.send(`${names} — added to fill an open slot. Welcome!`).catch(console.error);
+      });
     }
   }
 
@@ -567,8 +731,8 @@ async function backfillVacancies(matchState, guild, client, channel) {
     matchState.backfillRetryScheduled = true;
     setTimeout(() => {
       matchState.backfillRetryScheduled = false;
-      if (!activeTeamMatches.has(matchState.channelId)) return; // channel closed, stop retrying
-      backfillVacancies(matchState, guild, client, channel).catch(console.error);
+      if (!matchesById.has(matchState.matchId)) return; // channel closed, stop retrying
+      backfillVacancies(matchState, client).catch(console.error);
     }, config.teamQueue.backfillRetrySeconds * 1000);
   }
 }
@@ -576,7 +740,7 @@ async function backfillVacancies(matchState, guild, client, channel) {
 // ── VOTE KICK ───────────────────────────────────────────────────────────────────
 
 function handleVoteKickCommand(channelId, initiatorId, targetId) {
-  const matchState = activeTeamMatches.get(channelId);
+  const matchState = getMatchByChannelId(channelId);
   if (!matchState) return { status: 'not_in_match' };
 
   const age = (Date.now() - new Date(matchState.createdAt).getTime()) / 1000;
@@ -599,11 +763,21 @@ function handleVoteKickCommand(channelId, initiatorId, targetId) {
   const voteId = generateId('vote');
   matchState.votekick.activeVote = { voteId, initiatorId, targetId, yes: new Set(), no: new Set() };
 
-  return { status: 'started', voteId, targetId, initiatorId, eligibleCount: matchState.players.length - 1 };
+  return { status: 'started', voteId, targetId, initiatorId, eligibleCount: matchState.players.length - 1, matchState };
+}
+
+// Posts the vote-kick prompt to every channel in the match's cluster (not just the one the
+// command was run in) — vote-kick is a whole-match decision, so anyone in any guild's channel
+// should be able to weigh in, matching "vote kick happens in each server's channel".
+async function broadcastVoteKickStart(matchState, client, initiatorUsername, targetUsername, voteId, eligibleCount) {
+  await forEachChannel(matchState, client, channel => channel.send({
+    embeds: [buildVoteKickEmbed(initiatorUsername, targetUsername, 0, 0, eligibleCount)],
+    components: [buildVoteKickButtons(voteId)],
+  }).catch(console.error));
 }
 
 function handleVoteKickButton(channelId, voteId, discordId, choice) {
-  const matchState = activeTeamMatches.get(channelId);
+  const matchState = getMatchByChannelId(channelId);
   const vote = matchState?.votekick.activeVote;
   if (!vote || vote.voteId !== voteId) return { status: 'not_found' };
   if (discordId === vote.targetId) return { status: 'cannot_vote_self' };
@@ -616,15 +790,15 @@ function handleVoteKickButton(channelId, voteId, discordId, choice) {
   return { status: 'ok', yesCount: vote.yes.size, noCount: vote.no.size };
 }
 
-function startVoteResolutionTimer(channelId, voteId, guild, client, channel) {
+function startVoteResolutionTimer(channelId, voteId, client) {
   setTimeout(
-    () => resolveVoteKick(channelId, voteId, guild, client, channel).catch(console.error),
+    () => resolveVoteKick(channelId, voteId, client).catch(console.error),
     config.teamQueue.voteKickWindowSeconds * 1000
   );
 }
 
-async function resolveVoteKick(channelId, voteId, guild, client, channel) {
-  const matchState = activeTeamMatches.get(channelId);
+async function resolveVoteKick(channelId, voteId, client) {
+  const matchState = getMatchByChannelId(channelId);
   const vote = matchState?.votekick.activeVote;
   if (!vote || vote.voteId !== voteId) return;
 
@@ -635,17 +809,20 @@ async function resolveVoteKick(channelId, voteId, guild, client, channel) {
   matchState.votekick.activeVote = null;
 
   const targetPlayer = matchState.players.find(p => p.discordId === vote.targetId);
+  const initiatorPlayer = matchState.players.find(p => p.discordId === vote.initiatorId);
   const targetLabel = targetPlayer?.discordUsername ?? vote.targetId;
 
   if (passed) {
-    await channel.send(`✅ Vote passed (${vote.yes.size}/${eligibleCount}) — removing **${targetLabel}**.`).catch(console.error);
-    if (targetPlayer) await removePlayerAndBackfill(matchState, targetPlayer.discordId, guild, client, channel);
+    await forEachChannel(matchState, client, channel =>
+      channel.send(`✅ Vote passed (${vote.yes.size}/${eligibleCount}) — removing **${targetLabel}**.`).catch(console.error)
+    );
+    if (targetPlayer) await removePlayerAndBackfill(matchState, targetPlayer.discordId, client);
   } else {
     matchState.votekick.failCooldownByTarget.set(vote.targetId, Date.now() + config.teamQueue.voteKickFailCooldownSeconds * 1000);
     const cooldownMinutes = config.teamQueue.voteKickFailCooldownSeconds / 60;
-    await channel.send(
+    await forEachChannel(matchState, client, channel => channel.send(
       `❌ Vote failed (${vote.yes.size}/${eligibleCount}) — **${targetLabel}** stays. No new vote against them for ${cooldownMinutes} minutes.`
-    ).catch(console.error);
+    ).catch(console.error));
   }
 }
 
@@ -659,6 +836,7 @@ module.exports = {
   handleTeamMethodVoteButton,
   handleTeamPickButton,
   handleVoteKickCommand,
+  broadcastVoteKickStart,
   handleVoteKickButton,
   startVoteResolutionTimer,
 };

@@ -1,12 +1,14 @@
-// models/MatchChannel.js - One document per scheduled-deletion match channel
-// (channel-lifecycle.js), scoped per guild. `data` mirrors the record shape stored in
-// store.js's `matchChannels` (textChannelId, voiceChannelId, kind, deleteAt, warned, ...).
+// models/MatchChannel.js - One document per scheduled-deletion match channel *group*
+// (channel-lifecycle.js). A group is one or more channels tied to a single match — one text(+voice)
+// pair per guild involved, for cross-server matches. `guildIds` lists every guild the group touches
+// (used to scope Mongo sync), `data` mirrors the record shape stored in store.js's `matchChannels`
+// (groupId, channels: [{guildId, textChannelId, voiceChannelId}], kind, deleteAt, warned, ...).
 
 const mongoose = require('mongoose');
 
 const matchChannelSchema = new mongoose.Schema({
-  textChannelId: { type: String, required: true, unique: true },
-  guildId: { type: String, required: true },
+  groupId: { type: String, required: true, unique: true },
+  guildIds: { type: [String], default: [] },
   data: { type: mongoose.Schema.Types.Mixed, default: {} },
 }, { timestamps: true });
 

@@ -1,5 +1,9 @@
 // creative-team-queue.js - Partial-fill matching engine for 6s (3v3) and 8s (4v4) creative
-// queue, scoped per guild.
+// queue. The queue pool is shared globally across every guild the bot is installed in
+// (cross-server matchmaking) — it is NOT partitioned by guild. `queueUnit` still accepts a
+// `guildId` where it did before (so every existing call site keeps working unchanged), but it's
+// no longer used to key the pool — only stamped onto the unit (players[0].guildId, since a unit's
+// players are always from the same guild — a party formed within one server) for channel routing.
 //
 // Unlike creative-queue.js's pairwise 1v1/2v2 matcher (exactly 2 solo units, no party
 // involved), this assembles a full lobby of 6 or 8 *individual players* out of solo/party
@@ -31,8 +35,8 @@ const TARGET_SIZE = { '6s': 6, '8s': 8 };
 
 const creativeTeamMatchEvents = new EventEmitter();
 
-// formingMatches[guildId][mode][region] = array of { formingId, guildId, mode, region, units, createdAt }
-// each unit = { unitId, players, joinedAt } (players = 1-5 already-scraped creative-player
+// formingMatches[mode][region] = array of { formingId, mode, region, units, createdAt }
+// each unit = { unitId, guildId, players, joinedAt } (players = 1-5 already-scraped creative-player
 // objects — a solo queuer or a full party, from party.js's getPartyMembers).
 const formingMatches = {};
 
@@ -48,11 +52,10 @@ function targetSizeForMode(mode) {
   return TARGET_SIZE[categoryForMode(mode)];
 }
 
-function getBucket(guildId, mode, region) {
-  if (!formingMatches[guildId]) formingMatches[guildId] = {};
-  if (!formingMatches[guildId][mode]) formingMatches[guildId][mode] = {};
-  if (!Array.isArray(formingMatches[guildId][mode][region])) formingMatches[guildId][mode][region] = [];
-  return formingMatches[guildId][mode][region];
+function getBucket(mode, region) {
+  if (!formingMatches[mode]) formingMatches[mode] = {};
+  if (!Array.isArray(formingMatches[mode][region])) formingMatches[mode][region] = [];
+  return formingMatches[mode][region];
 }
 
 function groupPlayerCount(match) {
@@ -107,20 +110,24 @@ function evaluateJoin(unit, match, now) {
   return { fits: true, reason: null, diff };
 }
 
-function confirmMatch(bucket, match) {
+// completingUnit is whichever unit's join/merge pushed the match to full size — its guildId
+// picks the "primary" guild for the post-formation channel (team-match-lifecycle.js), with every
+// other involved guild getting a satellite channel.
+function confirmMatch(bucket, match, completingUnit) {
   bucket.splice(bucket.indexOf(match), 1);
   const players = match.units.flatMap(u => u.players);
-  console.log(`[creative-team-queue] MATCH FORMED ${match.mode}/${match.region} (guild ${match.guildId}): ${players.map(p => p.discordUsername).join(', ')}`);
+  console.log(`[creative-team-queue] MATCH FORMED ${match.mode}/${match.region}: ${players.map(p => p.discordUsername).join(', ')}`);
+  const completingGuildId = completingUnit.guildId;
   // units (not just the flattened players) are passed through so the post-formation lifecycle
   // can keep each party together when splitting the match into two teams.
-  creativeTeamMatchEvents.emit('matchFormed', { units: match.units, players, mode: match.mode, region: match.region, guildId: match.guildId });
+  creativeTeamMatchEvents.emit('matchFormed', { units: match.units, players, mode: match.mode, region: match.region, completingGuildId });
 }
 
 function queueUnit(guildId, players, mode, region) {
   const now = Date.now();
   const targetSize = targetSizeForMode(mode);
-  const bucket = getBucket(guildId, mode, region);
-  const unit = { unitId: generateId('tunit'), players, joinedAt: new Date() };
+  const bucket = getBucket(mode, region);
+  const unit = { unitId: generateId('tunit'), guildId, players, joinedAt: new Date() };
 
   console.log(
     `[creative-team-queue] JOIN ${describeUnit(unit)} guild=${guildId} mode=${mode} region=${region} `
@@ -147,21 +154,20 @@ function queueUnit(guildId, players, mode, region) {
     const filled = groupPlayerCount(bestMatch);
     console.log(`[creative-team-queue] ${describeUnit(unit)} joined ${bestMatch.formingId} — ${filled}/${targetSize}`);
 
-    if (filled === targetSize) confirmMatch(bucket, bestMatch);
+    if (filled === targetSize) confirmMatch(bucket, bestMatch, unit);
     return { unit, formingMatch: filled === targetSize ? null : bestMatch };
   }
 
-  const newMatch = { formingId: generateId('tmatch'), guildId, mode, region, units: [unit], createdAt: new Date() };
+  const newMatch = { formingId: generateId('tmatch'), mode, region, units: [unit], createdAt: new Date() };
   bucket.push(newMatch);
   console.log(`[creative-team-queue] ${describeUnit(unit)} started ${newMatch.formingId} — ${players.length}/${targetSize}`);
   return { unit, formingMatch: newMatch };
 }
 
 function findUnitByDiscordId(guildId, discordId) {
-  if (!formingMatches[guildId]) return null;
-  for (const mode of Object.keys(formingMatches[guildId])) {
-    for (const region of Object.keys(formingMatches[guildId][mode])) {
-      for (const match of formingMatches[guildId][mode][region]) {
+  for (const mode of Object.keys(formingMatches)) {
+    for (const region of Object.keys(formingMatches[mode])) {
+      for (const match of formingMatches[mode][region]) {
         const unit = match.units.find(u => u.players.some(p => p.discordId === discordId));
         if (unit) return { unit, match, mode, region };
       }
@@ -182,21 +188,21 @@ function removeFromTeamQueueAnywhere(guildId, discordId) {
   if (!found) return false;
 
   const { unit, match, mode, region } = found;
-  const bucket = getBucket(guildId, mode, region);
+  const bucket = getBucket(mode, region);
   match.units.splice(match.units.indexOf(unit), 1);
   if (match.units.length === 0) bucket.splice(bucket.indexOf(match), 1);
   return true;
 }
 
 function getTeamQueueWaitingCount(guildId, mode, region) {
-  return getBucket(guildId, mode, region).reduce((sum, match) => sum + groupPlayerCount(match), 0);
+  return getBucket(mode, region).reduce((sum, match) => sum + groupPlayerCount(match), 0);
 }
 
 // Tries to merge compatible forming matches together — lets two groups that started separately
 // (e.g. two 3-player parties for 6s) combine once they've both waited long enough to pass the
 // same compatibility check, without needing a fresh join to trigger it.
-function attemptMergeForBucket(guildId, mode, region) {
-  const bucket = getBucket(guildId, mode, region);
+function attemptMergeForBucket(mode, region) {
+  const bucket = getBucket(mode, region);
   const now = Date.now();
   const targetSize = targetSizeForMode(mode);
 
@@ -223,11 +229,12 @@ function attemptMergeForBucket(guildId, mode, region) {
 
         if (Math.abs(groupAvgLogPR(a) - groupAvgLogPR(b)) > tier.maxLogPRDiff) continue;
 
+        const mergedInUnit = b.units[0];
         a.units.push(...b.units);
         bucket.splice(j, 1);
-        console.log(`[creative-team-queue] MERGE ${mode}/${region} (guild ${guildId}): ${a.formingId} + ${b.formingId} -> ${groupPlayerCount(a)}/${targetSize}`);
+        console.log(`[creative-team-queue] MERGE ${mode}/${region}: ${a.formingId} + ${b.formingId} -> ${groupPlayerCount(a)}/${targetSize}`);
 
-        if (groupPlayerCount(a) === targetSize) confirmMatch(bucket, a);
+        if (groupPlayerCount(a) === targetSize) confirmMatch(bucket, a, mergedInUnit);
 
         merged = true;
         break outer; // buckets mutated — restart the scan
@@ -241,8 +248,8 @@ function attemptMergeForBucket(guildId, mode, region) {
 // platform/logPR compatibility check as normal queueing, judged against the confirmed group's
 // current average logPR/platform set — the caller (team-match-lifecycle.js) supplies those plus
 // the tier (looked up from its own match's age) since a confirmed match isn't a forming match.
-function pullReplacementUnits(guildId, mode, region, vacantCount, groupAvg, groupPlats, tier, excludeIds = null) {
-  const bucket = getBucket(guildId, mode, region);
+function pullReplacementUnits(mode, region, vacantCount, groupAvg, groupPlats, tier, excludeIds = null) {
+  const bucket = getBucket(mode, region);
   const pulled = [];
   let pulledCount = 0;
 
@@ -275,12 +282,10 @@ function pullReplacementUnits(guildId, mode, region, vacantCount, groupAvg, grou
 }
 
 function sweepAllTeamQueues() {
-  for (const guildId of Object.keys(formingMatches)) {
-    for (const mode of Object.keys(formingMatches[guildId])) {
-      for (const region of Object.keys(formingMatches[guildId][mode])) {
-        if (getBucket(guildId, mode, region).length > 1) {
-          attemptMergeForBucket(guildId, mode, region);
-        }
+  for (const mode of Object.keys(formingMatches)) {
+    for (const region of Object.keys(formingMatches[mode])) {
+      if (getBucket(mode, region).length > 1) {
+        attemptMergeForBucket(mode, region);
       }
     }
   }
