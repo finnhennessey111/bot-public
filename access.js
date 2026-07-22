@@ -192,17 +192,22 @@ async function getAccessStatus(discordId, { allowWindowStart = true } = {}) {
     return { kind: 'new' };
   }
 
-  if (isInTrial(doc, now)) {
-    return { kind: 'trial', trialDaysRemaining: daysUntil(trialEndsAt(doc), now), creditsEarned: doc.creditsEarned };
-  }
-
+  // Subscription takes priority over trial for display — a player who subscribes while still in
+  // their trial should immediately see their payment reflected, not just "Free Trial Active" with
+  // no sign it went through. trialDaysRemaining rides along so #access can still show the trial
+  // is counting down (still free) underneath the now-active subscription.
   if (hasActiveSubscription(doc, now)) {
     return {
       kind: 'subscription',
       subscriptionStatus: doc.status,
       subscriptionExpiry: doc.subscriptionExpiry,
       plan: doc.plan,
+      trialDaysRemaining: isInTrial(doc, now) ? daysUntil(trialEndsAt(doc), now) : null,
     };
+  }
+
+  if (isInTrial(doc, now)) {
+    return { kind: 'trial', trialDaysRemaining: daysUntil(trialEndsAt(doc), now), creditsEarned: doc.creditsEarned };
   }
 
   const windowResult = allowWindowStart

@@ -897,13 +897,20 @@ function buildAccessStatusEmbed(status) {
   if (status.kind === 'subscription') {
     const expiryTs = Math.floor(new Date(status.subscriptionExpiry).getTime() / 1000);
     const planLabel = status.plan === 'yearly' ? 'Yearly' : 'Monthly';
+    // trialDaysRemaining is only set when the player subscribed while still inside their trial —
+    // shown as a separate bonus line so it's clear their payment went through AND their remaining
+    // trial days still count (for free) before subscription billing effectively "kicks in".
+    const trialBonusLine = status.trialDaysRemaining != null
+      ? `\n\n🎁 **Trial bonus:** ${status.trialDaysRemaining} day(s) remaining (free)`
+      : '';
     return embed
       .setTitle('✅ Subscribed')
       .setColor(ACCESS_ACTIVE_COLOR)
       .setDescription(
         `**Plan:** ${planLabel}\n` +
         `**Status:** ${status.subscriptionStatus === 'cancelled' ? 'Cancelled — access continues until it expires' : 'Active'}\n` +
-        `**Access until:** <t:${expiryTs}:D>`
+        `**Subscribed ✅ — active until:** <t:${expiryTs}:D>` +
+        trialBonusLine
       );
   }
 
@@ -1121,7 +1128,9 @@ function buildQueueStatusEmbed({ tournamentEntries, creativeEntries, teamEntries
 // accessStatus comes straight from access.js's getAccessStatus(discordId) — access is global
 // per Discord ID, not guild-scoped, same as everywhere else it's read.
 function formatAccessSummary(status) {
-  const trialStatus = status.kind === 'trial'
+  // A subscribed player can still be mid-trial (status.trialDaysRemaining set on the
+  // 'subscription' kind) — treat that the same as kind === 'trial' rather than reporting "Ended".
+  const trialStatus = status.kind === 'trial' || status.trialDaysRemaining != null
     ? `Active — ${status.trialDaysRemaining} day(s) left`
     : status.kind === 'new'
       ? 'Not started'
