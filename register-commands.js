@@ -112,7 +112,7 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName('test-webhook')
-    .setDescription('[Mod] Simulate a Stripe checkout.session.completed event to test subscription activation, no real payment needed')
+    .setDescription('Simulate a successful Stripe payment to test subscription activation (mod only)')
     .addUserOption(o => o.setName('user').setDescription('User to simulate the subscription for (defaults to you)').setRequired(false))
     .addStringOption(o => o.setName('plan').setDescription('Plan to simulate (defaults to monthly)').setRequired(false)
       .addChoices(
