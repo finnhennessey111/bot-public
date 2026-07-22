@@ -2,7 +2,7 @@
 
 require('dotenv').config();
 const {
-  Client, GatewayIntentBits, ChannelType, PermissionFlagsBits,
+  Client, GatewayIntentBits, ChannelType, PermissionFlagsBits, AuditLogEvent,
   EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle,
   StringSelectMenuBuilder, StringSelectMenuOptionBuilder,
   ModalBuilder, TextInputBuilder, TextInputStyle
@@ -21,6 +21,7 @@ const { createMatchChannelsForMatch } = require('./match-channels');
 // name for arrays of built player objects, which would otherwise shadow this module import.
 const playerStore = require('./players');
 const { getEpicFromDiscord, checkYuniteReachable } = require('./yunite');
+const epicOAuth = require('./epic-oauth');
 const { startScheduler, checkAndCreateChannels } = require('./channel-manager');
 const { enforcePermissions } = require('./permissions');
 const guildConfig = require('./guild-config');
@@ -37,6 +38,7 @@ const {
   buildAccessStatusEmbed, buildAccessSubscribeButtons, buildNoAccessEmbed,
   buildUseCreditsButton, buildCreditWindowStartedDmEmbed,
   buildBotStatusEmbed, buildQueueStatusEmbed, buildPlayerLookupEmbed,
+  buildEpicAuthorizeLinkRow,
 } = require('./embeds');
 const store = require('./store');
 const { pinnedMessages, save: saveStore } = store;
@@ -451,6 +453,62 @@ client.once('clientReady', async () => {
 // Only fires for guilds joined WHILE the bot is running — guildConfig.init() (above) handles
 // backfilling config for guilds already joined at startup, without sending a DM for those.
 client.on('guildCreate', guild => guildConfig.handleNewGuild(guild).catch(console.error));
+
+// ── MOD ROLE GRANT GUARD ────────────────────────────────────────────────────────
+// The only sanctioned ways to hold the MatchMaker Mod role are /grant-mod (owner-only — see the
+// interaction handler above) or a server Administrator assigning it by hand in Discord. Anyone
+// else adding it — e.g. a non-admin with Manage Roles poking it on in the member list — gets it
+// immediately stripped back off and a DM explaining why, rather than silently letting it stand
+// until someone notices.
+client.on('guildMemberUpdate', (oldMember, newMember) => {
+  guardModRoleGrant(oldMember, newMember).catch(console.error);
+});
+
+async function guardModRoleGrant(oldMember, newMember) {
+  const guild = newMember.guild;
+  const modRoleId = getRoleId(guild.id, 'mod');
+  if (!modRoleId) return;
+
+  // Only care about the role being newly gained, not lost or untouched.
+  if (oldMember.roles.cache.has(modRoleId) || !newMember.roles.cache.has(modRoleId)) return;
+
+  let executor = null;
+  try {
+    const auditLogs = await guild.fetchAuditLogs({ type: AuditLogEvent.MemberRoleUpdate, limit: 5 });
+    const entry = auditLogs.entries.find(e =>
+      e.target?.id === newMember.id
+      && e.changes?.some(c => c.key === '$add' && Array.isArray(c.new) && c.new.some(r => r.id === modRoleId))
+    );
+    executor = entry?.executor ?? null;
+  } catch (err) {
+    console.error('Failed to fetch audit logs for MatchMaker Mod grant check:', err.message);
+  }
+
+  if (!executor) {
+    console.warn(`⚠️ MatchMaker Mod role was granted to ${newMember.user.tag} but the assigner could not be determined from audit logs — leaving it as-is.`);
+    return;
+  }
+
+  // /grant-mod performs the role add via the bot's own API call, so it shows up in the audit log
+  // with the bot itself as executor, not the owner who ran the command — that path is already
+  // gated to the guild owner in the command handler above, so it's exempt here.
+  if (executor.id === client.user.id) return;
+
+  const executorMember = await guild.members.fetch(executor.id).catch(() => null);
+  if (executorMember?.permissions.has(PermissionFlagsBits.Administrator)) return;
+
+  try {
+    await newMember.roles.remove(modRoleId, `Unauthorized MatchMaker Mod grant by ${executor.tag ?? executor.id}`);
+  } catch (err) {
+    console.error('Failed to remove unauthorized MatchMaker Mod role grant:', err.message);
+  }
+
+  await dmUser(client, executor.id, {
+    content: 'You do not have permission to assign the MatchMaker Mod role — only server administrators can do this.',
+  });
+
+  console.log(`🚫 Reverted unauthorized MatchMaker Mod grant: ${executor.tag ?? executor.id} tried to assign it to ${newMember.user.tag}.`);
+}
 
 // ── PLATFORM HELPERS ──────────────────────────────────────────────────────────
 
@@ -899,6 +957,29 @@ async function handleInteraction(interaction) {
 
       modal.addComponents(new ActionRowBuilder().addComponents(bioInput));
       await interaction.showModal(modal);
+    }
+
+    // ── EPIC ACCOUNT LINK (posted in #register) ───────────────────────────────
+    if (customId === 'epic_link_open') {
+      if (channelId !== getChannelId(guild.id, 'register')) {
+        return interaction.reply({
+          content: `❌ Use this in <#${getChannelId(guild.id, 'register')}>.`,
+          flags: 64,
+        });
+      }
+      if (!epicOAuth.isConfigured()) {
+        return interaction.reply({
+          content: '❌ Epic account linking isn\'t set up for this bot yet — link via Yunite in this channel instead.',
+          flags: 64,
+        });
+      }
+
+      const url = epicOAuth.buildAuthorizeUrl(user.id, guild.id);
+      await interaction.reply({
+        content: '🔗 Click below to link your Epic account. This link expires in 10 minutes.',
+        components: [buildEpicAuthorizeLinkRow(url)],
+        flags: 64,
+      });
     }
 
     // ── PARTY INVITE OPEN (button + user-select, primary path for /party-invite) ─────────────
@@ -1734,8 +1815,17 @@ async function assignRole(guild, discordId, roleId) {
   }
 }
 
-// ── HELPER: RESOLVE EPIC IDENTITY (Yunite lookup, falls back to Discord name) ──
+// ── HELPER: RESOLVE EPIC IDENTITY ──────────────────────────────────────────────
+// Epic OAuth (epic-oauth.js) is the primary link path — if this player has already completed it,
+// their epicId/epicUsername in Mongo are a real, player-confirmed link, so use those directly
+// without a network round trip. Otherwise falls back to a live Yunite lookup exactly as before,
+// and finally to the Discord display name if neither is available.
 async function resolveEpicIdentity(guild, member) {
+  const stored = await playerStore.getPlayer(guild.id, member.id);
+  if (stored?.epicOAuthLinked && stored.epicId && stored.epicUsername) {
+    return { epicUsername: stored.epicUsername, epicId: stored.epicId };
+  }
+
   try {
     const yuniteData = await getEpicFromDiscord(member.id, guild.id);
     if (yuniteData.platform) {

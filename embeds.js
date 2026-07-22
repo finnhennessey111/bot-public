@@ -770,12 +770,37 @@ function buildRegisterEmbed(getRolesChannelId) {
   return new EmbedBuilder()
     .setTitle('📋 Get Started')
     .setDescription(
-      '• 🔗 Link your Epic account using **Yunite** in this channel\n' +
+      '• 🔗 Click **Link Epic Account** below to link your Epic account\n' +
+      '  (or use **Yunite** in this channel if that\'s what this server has set up)\n' +
       `• ✅ Once linked, go to ${getRolesChannelId ? `<#${getRolesChannelId}>` : '#get-roles'} to complete your profile\n` +
       '• 🎮 Then you can queue in tournament and creative channels'
     )
     .setColor(0x4A90D9)
     .setFooter({ text: 'MatchMaker' });
+}
+
+// Opens the Epic OAuth flow — index.js's epic_link_open handler replies (ephemeral) with an
+// authorize URL wrapped in buildEpicAuthorizeLinkRow below.
+function buildEpicLinkButtonRow() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId('epic_link_open')
+      .setLabel('Link Epic Account')
+      .setEmoji('🔗')
+      .setStyle(ButtonStyle.Primary)
+  );
+}
+
+// A Link-style button (like buildAccessSubscribeButtons' Stripe checkout buttons below) opens the
+// URL directly on click — no interaction ever reaches the bot for this one, unlike the button
+// above, so there's nothing to handle in index.js for it.
+function buildEpicAuthorizeLinkRow(url) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setLabel('Continue to Epic Games')
+      .setStyle(ButtonStyle.Link)
+      .setURL(url)
+  );
 }
 
 // ── WELCOME DM ─────────────────────────────────────────────────────────────
@@ -1179,6 +1204,8 @@ module.exports = {
   buildRolesComponents,
   buildBioButtonRow,
   buildRegisterEmbed,
+  buildEpicLinkButtonRow,
+  buildEpicAuthorizeLinkRow,
   buildWelcomeDmEmbed,
   buildAccessChannelEmbed,
   buildAccessChannelButtons,

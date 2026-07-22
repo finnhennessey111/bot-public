@@ -1,16 +1,21 @@
-// webhook-server.js - Standalone Express app receiving Stripe webhook events. Does not start
-// listening at all if Stripe env vars are missing — no dangling unauthenticated port, and it
-// never blocks the bot's own startup. This is the only HTTP surface this bot exposes.
+// webhook-server.js - Standalone Express app receiving Stripe webhook events and the Epic OAuth
+// callback. Each route is only registered if its own env vars are present, and the server only
+// listens at all if at least one of them is — no dangling unauthenticated port, and it never
+// blocks the bot's own startup. This is the only HTTP surface this bot exposes.
 //
-// Deployment note: registering https://<your-domain>/stripe/webhook in the Stripe Dashboard, and
-// exposing this port publicly (reverse proxy, or a tunnel like ngrok/Cloudflare Tunnel for local
-// dev), are manual one-time steps this code cannot automate.
+// Deployment note: registering https://<your-domain>/stripe/webhook in the Stripe Dashboard,
+// registering https://<your-domain>/epic-callback as the OAuth redirect URI on the Epic
+// Games developer portal, and exposing this port publicly (reverse proxy, or a tunnel like
+// ngrok/Cloudflare Tunnel for local dev), are manual one-time steps this code cannot automate.
 
 const express = require('express');
 const SubscriptionModel = require('./models/Subscription');
 const access = require('./access');
 const { dmUser } = require('./discord-dm');
 const { buildPaymentFailedDmEmbed } = require('./embeds');
+const epicOAuth = require('./epic-oauth');
+const playerStore = require('./players');
+const { getRoleId, getChannelId } = require('./guild-config');
 
 function getStripeSdk() {
   if (!process.env.STRIPE_SECRET_KEY) return null;
@@ -126,46 +131,175 @@ async function handleInvoicePaymentFailed(invoice, client) {
   console.log(`[webhook] invoice.payment_failed — warned ${doc.discordId}`);
 }
 
+// Minimal HTML escape for values that end up in the browser-facing result page below — dn
+// (display name) comes back from Epic's token response, so it's attacker-influenceable in
+// principle (a crafted display name) even though Epic's own UI restricts what it can contain.
+function escapeHtml(str) {
+  return String(str).replace(/[&<>"']/g, ch => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[ch]));
+}
+
+// The browser tab Epic redirects back to after /epic-callback finishes — the actual "you're
+// linked" notification goes to Discord (notifyEpicLinkResult below); this is just what the player
+// sees in the tab itself so they know it's safe to close.
+function renderEpicResultPage(success, message) {
+  return `<!doctype html>
+<html><head><meta charset="utf-8"><title>${success ? 'Epic Account Linked' : 'Linking Failed'}</title></head>
+<body style="font-family: sans-serif; text-align: center; padding: 60px 20px;">
+  <h2>${success ? '✅ Success' : '❌ Something went wrong'}</h2>
+  <p>${message}</p>
+  <p>You can close this tab and return to Discord.</p>
+</body></html>`;
+}
+
+// DM first; if the player has DMs closed, fall back to posting in #register (tagging them) so the
+// result isn't silently lost. Deliberately separate from discord-dm.js's dmUser, which swallows
+// failures — this needs to know whether the DM actually landed to decide whether to fall back.
+async function notifyEpicLinkResult(client, discordId, guildId, content) {
+  try {
+    const user = await client.users.fetch(discordId);
+    await user.send({ content });
+    return;
+  } catch (err) {
+    console.warn(`[epic-oauth] Could not DM ${discordId}, falling back to #register:`, err.message);
+  }
+
+  const registerChannelId = getChannelId(guildId, 'register');
+  if (!registerChannelId) return;
+  try {
+    const channel = await client.channels.fetch(registerChannelId);
+    await channel.send({ content: `<@${discordId}> ${content}` });
+  } catch (err) {
+    console.error('[epic-oauth] Failed to post fallback link result in #register:', err.message);
+  }
+}
+
 function startWebhookServer(client) {
-  if (!process.env.STRIPE_SECRET_KEY || !process.env.STRIPE_WEBHOOK_SECRET) {
-    console.warn('[webhook] STRIPE_SECRET_KEY/STRIPE_WEBHOOK_SECRET not set — webhook server not started. Subscriptions are disabled.');
+  const stripeEnabled = !!(process.env.STRIPE_SECRET_KEY && process.env.STRIPE_WEBHOOK_SECRET);
+  const epicEnabled = epicOAuth.isConfigured();
+
+  if (!stripeEnabled && !epicEnabled) {
+    console.warn('[webhook] Neither Stripe nor Epic OAuth env vars are set — webhook server not started.');
     return null;
   }
 
-  const stripe = getStripeSdk();
   const app = express();
 
-  // express.raw (not express.json) on this route only — Stripe's signature check needs the
-  // exact raw bytes. No other routes or body-parser middleware exist on this app.
-  app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
-    let event;
-    try {
-      event = stripe.webhooks.constructEvent(req.body, req.headers['stripe-signature'], process.env.STRIPE_WEBHOOK_SECRET);
-    } catch (err) {
-      console.error('[webhook] Signature verification failed:', err.message);
-      return res.status(400).send(`Webhook signature verification failed: ${err.message}`);
-    }
+  if (!stripeEnabled) {
+    console.warn('[webhook] STRIPE_SECRET_KEY/STRIPE_WEBHOOK_SECRET not set — /stripe/webhook disabled. Subscriptions are disabled.');
+  }
+  if (!epicEnabled) {
+    console.warn('[webhook] EPIC_CLIENT_ID/EPIC_CLIENT_SECRET/EPIC_REDIRECT_URI not set — /epic-callback disabled. Epic linking falls back to Yunite only.');
+  }
 
-    try {
-      if (event.type === 'checkout.session.completed') {
-        await handleCheckoutCompleted(stripe, event.data.object);
-      } else if (event.type === 'customer.subscription.deleted') {
-        await handleSubscriptionDeleted(event.data.object);
-      } else if (event.type === 'customer.subscription.updated') {
-        await handleSubscriptionUpdated(event.data.object);
-      } else if (event.type === 'invoice.payment_failed') {
-        await handleInvoicePaymentFailed(event.data.object, client);
+  if (stripeEnabled) {
+    const stripe = getStripeSdk();
+
+    // express.raw (not express.json) on this route only — Stripe's signature check needs the
+    // exact raw bytes. No other routes or body-parser middleware exist on this app.
+    //
+    // type: '*/*' (not the default 'application/json') — body-parser only captures the body when
+    // the request's Content-Type header matches this filter; anything else leaves req.body
+    // undefined, which is what makes stripe.webhooks.constructEvent throw "No webhook payload was
+    // provided." A reverse proxy (Nginx here) sitting in front is a common way for that header to
+    // arrive altered or missing even though Stripe sent 'application/json' — since this route has
+    // no purpose other than consuming Stripe webhooks, always reading the raw body regardless of
+    // the advertised Content-Type is safe and removes that failure mode entirely.
+    app.post('/stripe/webhook', express.raw({ type: '*/*' }), async (req, res) => {
+      let event;
+      try {
+        event = stripe.webhooks.constructEvent(req.body, req.headers['stripe-signature'], process.env.STRIPE_WEBHOOK_SECRET);
+      } catch (err) {
+        console.error('[webhook] Signature verification failed:', err.message);
+        return res.status(400).send(`Webhook signature verification failed: ${err.message}`);
       }
-      res.json({ received: true });
-    } catch (err) {
-      console.error(`[webhook] Failed to handle ${event.type}:`, err.message);
-      res.status(500).json({ error: 'internal error handling event' });
-    }
-  });
+
+      try {
+        if (event.type === 'checkout.session.completed') {
+          await handleCheckoutCompleted(stripe, event.data.object);
+        } else if (event.type === 'customer.subscription.deleted') {
+          await handleSubscriptionDeleted(event.data.object);
+        } else if (event.type === 'customer.subscription.updated') {
+          await handleSubscriptionUpdated(event.data.object);
+        } else if (event.type === 'invoice.payment_failed') {
+          await handleInvoicePaymentFailed(event.data.object, client);
+        }
+        res.json({ received: true });
+      } catch (err) {
+        console.error(`[webhook] Failed to handle ${event.type}:`, err.message);
+        res.status(500).json({ error: 'internal error handling event' });
+      }
+    });
+  }
+
+  if (epicEnabled) {
+    // GET, not POST — this is a browser redirect from Epic's own authorize page, carrying `code`
+    // and `state` as query params, not a JSON body. No body-parser needed on this route at all.
+    app.get('/epic-callback', async (req, res) => {
+      const { code, state, error: epicError } = req.query;
+
+      if (epicError) {
+        return res.status(400).send(renderEpicResultPage(false, 'Epic Games declined the request.'));
+      }
+
+      const decoded = epicOAuth.decodeState(state);
+      if (!decoded) {
+        return res.status(400).send(renderEpicResultPage(
+          false, 'This link is invalid or has expired. Go back to #register in Discord and click "Link Epic Account" again.'
+        ));
+      }
+      const { discordId, guildId } = decoded;
+
+      if (!code) {
+        return res.status(400).send(renderEpicResultPage(false, 'No authorization code was provided by Epic Games.'));
+      }
+
+      let epicId, epicUsername;
+      try {
+        ({ epicId, epicUsername } = await epicOAuth.exchangeCodeForToken(code));
+      } catch (err) {
+        console.error('[epic-oauth] Token exchange failed:', err.message);
+        await notifyEpicLinkResult(
+          client, discordId, guildId,
+          '❌ Linking your Epic account failed. You can try again, or link via Yunite in #register in the meantime.'
+        );
+        return res.status(502).send(renderEpicResultPage(
+          false, 'Failed to complete linking with Epic Games. You can try again, or use Yunite instead.'
+        ));
+      }
+
+      try {
+        await playerStore.upsertPlayer(guildId, discordId, {
+          epicId, epicUsername, epicOAuthLinked: true, epicLinkedAt: new Date(),
+        });
+
+        // Mirrors what Yunite's own verified-role assignment used to do — see permissions.js's
+        // progressive-visibility ladder, which gates #get-roles/#how-to-use behind this role
+        // regardless of which linking method granted it.
+        const verifiedRoleId = getRoleId(guildId, 'yuniteVerified');
+        if (verifiedRoleId) {
+          const guild = await client.guilds.fetch(guildId).catch(() => null);
+          const member = await guild?.members.fetch(discordId).catch(() => null);
+          if (member) {
+            await member.roles.add(verifiedRoleId).catch(err => console.error('[epic-oauth] Failed to assign verified role:', err.message));
+          }
+        }
+
+        console.log(`[epic-oauth] Linked Discord ${discordId} <-> Epic ${epicUsername} (${epicId}) in guild ${guildId}`);
+        await notifyEpicLinkResult(client, discordId, guildId, `✅ Your Epic account **${epicUsername}** is now linked!`);
+        res.send(renderEpicResultPage(true, `Linked as ${escapeHtml(epicUsername)}!`));
+      } catch (err) {
+        console.error('[epic-oauth] Failed to store linked account:', err.message);
+        res.status(500).send(renderEpicResultPage(false, 'Linked with Epic Games, but saving your account failed. Please try again.'));
+      }
+    });
+  }
 
   const port = process.env.PORT || 3000;
   const server = app.listen(port, () => {
-    console.log(`[webhook] Stripe webhook server listening on port ${port} (POST /stripe/webhook)`);
+    const routes = [stripeEnabled && 'POST /stripe/webhook', epicEnabled && 'GET /epic-callback'].filter(Boolean);
+    console.log(`[webhook] Server listening on port ${port} (${routes.join(', ')})`);
   });
 
   return server;

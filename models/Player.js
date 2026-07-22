@@ -22,6 +22,13 @@ const playerSchema = new mongoose.Schema({
   guildId: { type: String, required: true },
   epicUsername: String,
   epicId: String,
+  // True once this player has completed the Epic OAuth flow (epic-oauth.js) themselves — as
+  // opposed to epicUsername/epicId having been populated from a Yunite lookup, which is re-fetched
+  // live on every resolve and never trusted as a standing record. Gates resolveEpicIdentity's
+  // Epic-OAuth-first path in index.js: without this flag, a stale Yunite-sourced epicId sitting in
+  // this same field could otherwise be mistaken for a real OAuth link.
+  epicOAuthLinked: { type: Boolean, default: false },
+  epicLinkedAt: { type: Date, default: null },
   platform: String,
   region: String,
   extraRegions: { type: [String], default: [] },

@@ -13,7 +13,7 @@ const { enforcePermissions, botAccessOverwrite } = require('./permissions');
 const { postCreativeQueueChannel } = require('./creative-channel');
 const { QUEUE_CHANNEL_CONFIGS } = require('./creative-channel-configs');
 const {
-  buildRolesEmbed, buildRolesComponents, buildBioButtonRow, buildRegisterEmbed,
+  buildRolesEmbed, buildRolesComponents, buildBioButtonRow, buildRegisterEmbed, buildEpicLinkButtonRow,
   buildHowtoEmbed, buildSetupInstructionsEmbed, buildFormPartyInstructionsEmbed,
   buildPartyInviteOpenButtonRow, buildAccessChannelEmbed, buildAccessChannelButtons,
 } = require('./embeds');
@@ -238,7 +238,7 @@ async function runMatchmakerSetup(guild, yuniteToken, yuniteVerifiedRoleId = nul
     );
     setupMessageIds.register = await ensurePosted(
       guild.client, config.setupMessageIds, channelIds, 'register',
-      () => ({ embeds: [buildRegisterEmbed(channelIds.getRoles)] })
+      () => ({ embeds: [buildRegisterEmbed(channelIds.getRoles)], components: [buildEpicLinkButtonRow()] })
     );
     setupMessageIds.access = await ensurePosted(
       guild.client, config.setupMessageIds, channelIds, 'access',
