@@ -25,26 +25,39 @@ const subscriptionSchema = new mongoose.Schema({
   // Correlates a customer.subscription.deleted webhook back to this record.
   stripeSubscriptionId: { type: String, default: null },
 
-  // Credit ledger — earned only from creative-queue matches (credits.js). Untouched by
-  // subscription state.
+  // Credit ledger — earned only from creative-queue matches played *during the trial*
+  // (credits.js checks isInTrial before awarding). Zeroed out on credit-window expiry (true
+  // forfeiture, not just "inaccessible") — see access.js/notifications.js.
   creditsEarned: { type: Number, default: 0 },
   lastCreditEarned: { type: Date, default: null },
 
+  // The manual, "use it or lose it" post-trial window — starts on the player's first interaction
+  // with the bot *after* their trial ends (a queue attempt or a Check My Access click; see
+  // access.js's ensureCreditWindowStarted), not automatically from trial end. Credits can only be
+  // spent (via the "Use Credits for Today" button) while now is between these two timestamps;
+  // once creditWindowExpiry passes, any remaining creditsEarned is forfeited.
+  creditWindowStart: { type: Date, default: null },
+  creditWindowExpiry: { type: Date, default: null },
+
   // Credit-day ladder — how many of the 7 escalating-cost extra days (post-trial) this player has
-  // ever bought with credits. Lifetime counter, never resets on a gap day. creditDaySpentDate
-  // (UTC 'YYYY-MM-DD') stops a second queue attempt on the same day from spending twice.
+  // ever bought with credits via the "Use Credits for Today" button. Resets to 0 if they
+  // subscribe and their subscription later expires (see notifications.js) — a lapsed subscriber's
+  // next credit purchase starts back at the cheap end of the ladder. creditDaySpentDate (UTC
+  // 'YYYY-MM-DD') is the day access was last bought with credits — access lasts until UTC
+  // midnight, which falls out of comparing this string to today's rather than a separate timer.
   creditDaysUsed: { type: Number, default: 0 },
   creditDaySpentDate: { type: String, default: null },
 
-  // One-time DM idempotency flags (notifications.js). trialExpiringSoonDmSent/trialExpiredDmSent/
-  // creditsLowDmSent/creditsExhaustedDmSent are pure lifetime flags — trial and the credit ladder
-  // never recur, so there's nothing to reset them on. subscriptionExpiredDmSent is the one
-  // exception, reset to false on every fresh checkout.session.completed so a resubscribe->lapse
-  // cycle still DMs on every lapse, not just the first.
+  // One-time DM idempotency flags (notifications.js). trialExpiringSoonDmSent is a pure lifetime
+  // flag. creditWindowExpiryWarningDmSent/creditWindowExpiredDmSent are lifetime too — the credit
+  // window itself is a one-shot, non-repeating event per player. midnightReminderSentDate (UTC
+  // 'YYYY-MM-DD') is different: it recurs once per day a credit-day is bought, so it's a date
+  // string rather than a boolean. subscriptionExpiredDmSent resets to false on every fresh
+  // checkout.session.completed so a resubscribe->lapse cycle still DMs on every lapse.
   trialExpiringSoonDmSent: { type: Boolean, default: false },
-  trialExpiredDmSent: { type: Boolean, default: false },
-  creditsLowDmSent: { type: Boolean, default: false },
-  creditsExhaustedDmSent: { type: Boolean, default: false },
+  creditWindowExpiryWarningDmSent: { type: Boolean, default: false },
+  creditWindowExpiredDmSent: { type: Boolean, default: false },
+  midnightReminderSentDate: { type: String, default: null },
   subscriptionExpiredDmSent: { type: Boolean, default: false },
 });
 

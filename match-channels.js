@@ -26,7 +26,7 @@ function buildPlayerCard(player, viewingGuildId, kind, label) {
   if (player.guildId === viewingGuildId) {
     return kind === 'creative' ? buildCreativeMatchCard(player) : buildMatchCard(player, label);
   }
-  return buildCrossServerPlayerCard(player, kind);
+  return buildCrossServerPlayerCard(player, kind, label);
 }
 
 // allPlayers is the full match roster (both units combined). Creates one channel per distinct

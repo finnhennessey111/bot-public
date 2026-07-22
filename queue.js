@@ -222,7 +222,8 @@ async function buildPlayer({
   platform,
   consoleOnly,
   ingameRoles,
-  language,
+  languages,
+  ageBracket,
   bio,
 }) {
   const playerData = await playerStore.getPlayerStats(guildId, discordId, epicUsername, epicId, homeRegion);
@@ -243,7 +244,8 @@ async function buildPlayer({
     platform: platform ?? 'PC',
     consoleOnly: consoleOnly ?? false,
     ingameRoles: ingameRoles ?? [],
-    language: language ?? null,
+    languages: languages ?? [],
+    ageBracket: ageBracket ?? null,
     bio: bio ?? null,
     totalPR: playerData.totalPR,
     thisSeasonPR: playerData.thisSeasonPR,

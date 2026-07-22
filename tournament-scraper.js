@@ -1,15 +1,12 @@
 const puppeteer = require('puppeteer');
 
-// Skip these entirely when creating queue channels (scrapeUpcomingTournaments) — ranked cups
-// still don't get channels even though they now appear on the calendar.
+// Skip these entirely when creating queue channels (scrapeUpcomingTournaments) — this (plus the
+// separate FNCS-Major compound check below) is the single source of truth for tournament channel
+// eligibility. channel-manager.js has no whitelist of its own — anything that survives this
+// filter gets a channel, including ranked cups, skin/creator cups (Mongraal Cup, Clix Cup, etc.),
+// victory cups, cash cups, reload cups, and FNCS divisions.
 const BLOCKED_KEYWORDS = [
-  'ranked cup',
-  'mobile series',
-  'mobile cup',
-  'play-ins',
-  'play ins',
-  'heats',
-  'finals',
+  'mobile',
   'solo',
 ];
 

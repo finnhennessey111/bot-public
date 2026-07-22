@@ -34,6 +34,7 @@ const {
   buildCreativeMatchConfirmedEmbed, buildCloseChannelButton,
   buildHowtoEmbed, buildRolesEmbed, buildRolesComponents,
   buildAccessStatusEmbed, buildAccessSubscribeButtons, buildNoAccessEmbed,
+  buildUseCreditsButton, buildCreditWindowStartedDmEmbed,
   buildBotStatusEmbed, buildQueueStatusEmbed, buildPlayerLookupEmbed,
 } = require('./embeds');
 const store = require('./store');
@@ -51,6 +52,7 @@ const channelLifecycle = require('./channel-lifecycle');
 const credits = require('./credits');
 const access = require('./access');
 const billing = require('./billing');
+const { dmUser } = require('./discord-dm');
 const { startWebhookServer } = require('./webhook-server');
 const { startAccessScheduler } = require('./notifications');
 const { QUEUE_CHANNEL_CONFIGS, categoryForAnyMode } = require('./creative-channel-configs');
@@ -68,6 +70,17 @@ function isModMember(guildId, interaction) {
 
 async function replyModOnly(interaction) {
   await interaction.editReply({ content: '❌ This command is restricted to the MatchMaker Mod role.' });
+}
+
+// Fires the one-time "your trial has ended" DM the moment a player's credit window actually
+// starts (access.js's ensureCreditWindowStarted, surfaced via checkAccess/getAccessStatus's
+// creditWindowJustStarted flag) — a player-triggered event, not something a periodic sweep
+// should discover after the fact, so this is called directly from every access-gating call site
+// and the Check My Access handler rather than from notifications.js.
+async function notifyCreditWindowStartedIfNeeded(client, discordId, accessResult) {
+  if (!accessResult?.creditWindowJustStarted) return;
+  const { creditsEarned, estimatedDays } = accessResult.windowStartInfo;
+  await dmUser(client, discordId, { embeds: [buildCreditWindowStartedDmEmbed(creditsEarned, estimatedDays)] });
 }
 
 // Non-empty queue buckets, one entry per tournament/mode+region combo currently holding at
@@ -673,7 +686,7 @@ async function handleInteraction(interaction) {
       const target = interaction.options.getUser('user');
       const [playerDoc, accessStatus] = await Promise.all([
         playerStore.getPlayer(interaction.guild.id, target.id),
-        access.getAccessStatus(target.id),
+        access.getAccessStatus(target.id, { allowWindowStart: false }),
       ]);
 
       await interaction.editReply({ embeds: [buildPlayerLookupEmbed(target, playerDoc, accessStatus)] });
@@ -769,8 +782,13 @@ async function handleInteraction(interaction) {
     }
 
     if (customId === 'select_language') {
-      await playerStore.upsertPlayer(guildId, user.id, { language: values[0] });
-      await interaction.editReply({ content: `✅ Language set to **${values[0]}**.` });
+      await playerStore.upsertPlayer(guildId, user.id, { languages: values });
+      await interaction.editReply({ content: `✅ Language(s) set to **${values.join(', ')}**.` });
+    }
+
+    if (customId === 'select_age_bracket') {
+      await playerStore.upsertPlayer(guildId, user.id, { ageBracket: values[0] });
+      await interaction.editReply({ content: `✅ Age bracket set to **${values[0]}**.` });
     }
 
     if (customId.startsWith('creative_mode_')) {
@@ -908,6 +926,7 @@ async function handleInteraction(interaction) {
 
       const tournamentAccess = await access.checkAccess(user.id);
       if (!tournamentAccess.allowed) {
+        await notifyCreditWindowStartedIfNeeded(client, user.id, tournamentAccess);
         return interaction.editReply({
           embeds: [buildNoAccessEmbed(tournamentAccess)],
           components: [buildAccessSubscribeButtons()],
@@ -937,7 +956,8 @@ async function handleInteraction(interaction) {
           platform,
           consoleOnly,
           ingameRoles: userData?.ingameRoles ?? [],
-          language: userData?.language ?? null,
+          languages: userData?.languages ?? [],
+          ageBracket: userData?.ageBracket ?? null,
           bio: userData?.bio ?? null,
         });
 
@@ -1021,6 +1041,7 @@ async function handleInteraction(interaction) {
       for (const member of partyMembers) {
         const memberAccess = await access.checkAccess(member.id);
         if (!memberAccess.allowed) {
+          await notifyCreditWindowStartedIfNeeded(client, member.id, memberAccess);
           return interaction.editReply({
             embeds: [buildNoAccessEmbed(memberAccess)],
             components: [buildAccessSubscribeButtons()],
@@ -1049,7 +1070,8 @@ async function handleInteraction(interaction) {
             platform: getPlatformFromMember(guild.id, member),
             consoleOnly,
             ingameRoles: userData?.ingameRoles ?? [],
-            language: userData?.language ?? null,
+            languages: userData?.languages ?? [],
+            ageBracket: userData?.ageBracket ?? null,
             bio: userData?.bio ?? null,
           });
         }));
@@ -1168,6 +1190,7 @@ async function handleInteraction(interaction) {
 
         const creativeAccess = await access.checkAccess(user.id);
         if (!creativeAccess.allowed) {
+          await notifyCreditWindowStartedIfNeeded(client, user.id, creativeAccess);
           return interaction.editReply({
             embeds: [buildNoAccessEmbed(creativeAccess)],
             components: [buildAccessSubscribeButtons()],
@@ -1273,6 +1296,7 @@ async function handleInteraction(interaction) {
         for (const member of members) {
           const memberAccess = await access.checkAccess(member.id);
           if (!memberAccess.allowed) {
+            await notifyCreditWindowStartedIfNeeded(client, member.id, memberAccess);
             return interaction.editReply({
               embeds: [buildNoAccessEmbed(memberAccess)],
               components: [buildAccessSubscribeButtons()],
@@ -1445,10 +1469,57 @@ async function handleInteraction(interaction) {
     if (customId === 'access_check') {
       await interaction.deferReply({ flags: 64 });
       const status = await access.getAccessStatus(user.id);
+      await notifyCreditWindowStartedIfNeeded(client, user.id, status);
+
+      const components = status.kind === 'credits_active_can_buy'
+        ? [buildUseCreditsButton(), buildAccessSubscribeButtons()]
+        : [buildAccessSubscribeButtons()];
+
       await interaction.editReply({
         embeds: [buildAccessStatusEmbed(status)],
-        components: [buildAccessSubscribeButtons()],
+        components,
       });
+    }
+
+    // ── USE CREDITS FOR TODAY ─────────────────────────────────────────────────
+    // The only way left to spend a credit-day — checkAccess no longer auto-spends (see
+    // access.js). Re-validates everything server-side rather than trusting the button was shown
+    // correctly, since the embed the player clicked from could be stale by the time they click.
+    if (customId === 'access_use_credits') {
+      await interaction.deferReply({ flags: 64 });
+      const result = await access.useCreditsForToday(user.id);
+
+      if (result.status === 'purchased') {
+        return interaction.editReply({
+          content: `✅ Access granted until midnight UTC tonight. **${result.creditsRemaining}** credits remaining. ` +
+            `**${result.daysLeftInWindow}** day(s) left in your credit window. Come back tomorrow to extend.`,
+        });
+      }
+      if (result.status === 'already_bought_today') {
+        return interaction.editReply({ content: '✅ You already have access today — it lasts until midnight UTC.' });
+      }
+      if (result.status === 'not_needed') {
+        return interaction.editReply({ content: '✅ You already have access (active trial or subscription) — no need to spend credits.' });
+      }
+      if (result.status === 'window_expired') {
+        return interaction.editReply({
+          content: '❌ Your credit window has expired and your credits have been forfeited. Subscribe below to continue.',
+          components: [buildAccessSubscribeButtons()],
+        });
+      }
+      if (result.status === 'insufficient_credits') {
+        return interaction.editReply({
+          content: `❌ You need **${result.needed}** credits for today's access (you have **${result.have}**). Subscribe below for unlimited access.`,
+          components: [buildAccessSubscribeButtons()],
+        });
+      }
+      if (result.status === 'ladder_exhausted') {
+        return interaction.editReply({
+          content: '❌ You\'ve used all 7 extra credit-days available in your window. Subscribe below for unlimited access.',
+          components: [buildAccessSubscribeButtons()],
+        });
+      }
+      return interaction.editReply({ content: '❌ Something went wrong checking your access. Try again, or check #access.' });
     }
 
     // ── SUBSCRIBE BUTTONS ─────────────────────────────────────────────────────

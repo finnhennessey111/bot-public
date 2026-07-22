@@ -1,39 +1,29 @@
-// notifications.js - Hourly sweep that DMs a player exactly once when they cross one of five
-// access boundaries: trial expiring soon, trial expired, credits running low, credits exhausted,
-// or subscription expired. (A sixth DM type, payment failed, is triggered directly by
-// webhook-server.js's invoice.payment_failed handler, not this sweep — each failed invoice is a
-// distinct real event, not a one-time lifetime boundary, so it doesn't fit the idempotency-flag
-// pattern used here.) Trial/credit/subscription boundaries are day-granularity, so hourly is
-// frequent enough without being wasteful. Models channel-manager.js's startScheduler (immediate
-// run + setInterval), minus the per-guild wrapper since access is global, not guild-scoped.
+// notifications.js - Hourly sweep that DMs a player when they cross an access boundary:
+// trial expiring soon, the daily "your credit-bought access expires at midnight" reminder (noon
+// UTC only), 24h before the credit window closes, the credit window closing (forfeits any
+// unused credits), or a subscription expiring. (A sixth DM type, payment failed, is triggered
+// directly by webhook-server.js's invoice.payment_failed handler, not this sweep — each failed
+// invoice is a distinct real event, not a one-time boundary.) The "your trial has ended, you have
+// X credits" DM is NOT sent from here — it fires synchronously from index.js the moment the
+// credit window actually starts (see access.js's ensureCreditWindowStarted), since that's a
+// player-triggered event, not something a periodic sweep should discover after the fact.
+//
+// Trial/window boundaries are day-granularity except the noon-UTC-gated midnight reminder, so
+// hourly is frequent enough without being wasteful — the noon gate just checks
+// `now.getUTCHours() === 12` rather than needing a separate precise scheduler.
 
 const SubscriptionModel = require('./models/Subscription');
 const billing = require('./billing');
 const { dmUser } = require('./discord-dm');
-const { LADDER, TRIAL_DAYS } = require('./access');
+const { TRIAL_DAYS } = require('./access');
 const {
-  buildTrialExpiringSoonDmEmbed, buildTrialExpiredDmEmbed,
-  buildCreditsLowDmEmbed, buildCreditsExhaustedDmEmbed,
+  buildTrialExpiringSoonDmEmbed, buildMidnightReminderDmEmbed,
+  buildCreditWindowExpiryWarningDmEmbed, buildCreditWindowExpiredDmEmbed,
   buildSubscriptionExpiredDmEmbed, buildDmSubscribeButtons,
 } = require('./embeds');
 
 const CHECK_INTERVAL_MS = 60 * 60 * 1000;
-const TRIAL_WARNING_MS = 24 * 60 * 60 * 1000;
-const CREDITS_LOW_THRESHOLD_DAYS = 2;
-
-// Simulates forward through the (non-linear) ladder from the player's current
-// creditsEarned/creditDaysUsed to estimate how many more days their banked credits actually
-// cover — a naive average-cost division would misrepresent this since rungs cost 2..23.
-function estimateDaysFromCredits(creditsEarned, creditDaysUsed) {
-  let remaining = creditsEarned;
-  let days = 0;
-  for (let rung = creditDaysUsed; rung < LADDER.length; rung++) {
-    if (remaining < LADDER[rung]) break;
-    remaining -= LADDER[rung];
-    days++;
-  }
-  return days;
-}
+const WARNING_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 // Generates both plan links so every DM can offer Monthly and Yearly, same as the #access embed.
 // Each is independently best-effort — one failing (Stripe unconfigured, transient API error)
@@ -61,10 +51,10 @@ async function checkAndNotifyOne(client, doc, now) {
     && (doc.status === 'active' || doc.status === 'cancelled');
   const trialEndsAt = doc.trialStartDate ? new Date(doc.trialStartDate.getTime() + TRIAL_DAYS * 24 * 60 * 60 * 1000) : null;
   const trialOver = trialEndsAt && now >= trialEndsAt;
-  const ladderExhausted = doc.creditDaysUsed >= LADDER.length;
+  const today = now.toISOString().slice(0, 10);
 
   // 1. Trial ending within 24h, not yet expired, not yet notified.
-  if (trialEndsAt && !trialOver && trialEndsAt.getTime() - now.getTime() <= TRIAL_WARNING_MS && !doc.trialExpiringSoonDmSent) {
+  if (trialEndsAt && !trialOver && trialEndsAt.getTime() - now.getTime() <= WARNING_WINDOW_MS && !doc.trialExpiringSoonDmSent) {
     const hoursRemaining = Math.max(1, Math.ceil((trialEndsAt.getTime() - now.getTime()) / (60 * 60 * 1000)));
     const components = await getSubscribeButtons(doc.discordId);
     await dmUser(client, doc.discordId, { embeds: [buildTrialExpiringSoonDmEmbed(hoursRemaining)], components });
@@ -72,44 +62,52 @@ async function checkAndNotifyOne(client, doc, now) {
     console.log(`[notifications] Sent trial-expiring-soon DM to ${doc.discordId}`);
   }
 
-  // 2. Trial just expired, never subscribed, not yet notified.
-  if (trialOver && !doc.subscriptionStart && !doc.trialExpiredDmSent) {
-    const estimatedDays = estimateDaysFromCredits(doc.creditsEarned, doc.creditDaysUsed);
-    const components = await getSubscribeButtons(doc.discordId);
-    await dmUser(client, doc.discordId, { embeds: [buildTrialExpiredDmEmbed(estimatedDays)], components });
-    await SubscriptionModel.updateOne({ discordId: doc.discordId }, { $set: { trialExpiredDmSent: true } });
-    console.log(`[notifications] Sent trial-expired DM to ${doc.discordId}`);
+  // The remaining checks are all about the post-trial credit window — none of them apply to an
+  // actively subscribed player (subscription bypasses the credit window entirely).
+  if (hasActiveSub) return;
+
+  // 2. Daily "your access expires at midnight tonight" reminder — noon UTC only, once per day,
+  // only for players who actually bought today's access with credits.
+  if (now.getUTCHours() === 12 && doc.creditDaySpentDate === today && doc.midnightReminderSentDate !== today) {
+    await dmUser(client, doc.discordId, { embeds: [buildMidnightReminderDmEmbed()] });
+    await SubscriptionModel.updateOne({ discordId: doc.discordId }, { $set: { midnightReminderSentDate: today } });
+    console.log(`[notifications] Sent midnight-reminder DM to ${doc.discordId}`);
   }
 
-  // 3. Credits running low (~2 days of banked access left), ladder not yet exhausted, no active
-  // subscription, not yet notified.
-  if (trialOver && !ladderExhausted && !hasActiveSub && !doc.creditsLowDmSent) {
-    const estimatedDays = estimateDaysFromCredits(doc.creditsEarned, doc.creditDaysUsed);
-    if (estimatedDays <= CREDITS_LOW_THRESHOLD_DAYS) {
+  // 3. 24h before the credit window closes, not yet expired, not yet notified.
+  if (doc.creditWindowExpiry) {
+    const msUntilWindowExpiry = new Date(doc.creditWindowExpiry).getTime() - now.getTime();
+    if (msUntilWindowExpiry > 0 && msUntilWindowExpiry <= WARNING_WINDOW_MS && !doc.creditWindowExpiryWarningDmSent) {
       const components = await getSubscribeButtons(doc.discordId);
-      await dmUser(client, doc.discordId, { embeds: [buildCreditsLowDmEmbed(estimatedDays)], components });
-      await SubscriptionModel.updateOne({ discordId: doc.discordId }, { $set: { creditsLowDmSent: true } });
-      console.log(`[notifications] Sent credits-low DM to ${doc.discordId} (${estimatedDays}d estimated remaining)`);
+      await dmUser(client, doc.discordId, { embeds: [buildCreditWindowExpiryWarningDmEmbed(doc.creditsEarned)], components });
+      await SubscriptionModel.updateOne({ discordId: doc.discordId }, { $set: { creditWindowExpiryWarningDmSent: true } });
+      console.log(`[notifications] Sent credit-window-expiry-warning DM to ${doc.discordId}`);
     }
   }
 
-  // 4. Ladder exhausted, no active subscription, not yet notified.
-  if (trialOver && ladderExhausted && !hasActiveSub && !doc.creditsExhaustedDmSent) {
+  // 4. Credit window has fully closed — forfeit any remaining credits (true zero, not just
+  // inaccessible) and notify once.
+  if (doc.creditWindowExpiry && now >= new Date(doc.creditWindowExpiry) && !doc.creditWindowExpiredDmSent) {
     const components = await getSubscribeButtons(doc.discordId);
-    await dmUser(client, doc.discordId, { embeds: [buildCreditsExhaustedDmEmbed()], components });
-    await SubscriptionModel.updateOne({ discordId: doc.discordId }, { $set: { creditsExhaustedDmSent: true } });
-    console.log(`[notifications] Sent credits-exhausted DM to ${doc.discordId}`);
+    await dmUser(client, doc.discordId, { embeds: [buildCreditWindowExpiredDmEmbed()], components });
+    await SubscriptionModel.updateOne(
+      { discordId: doc.discordId },
+      { $set: { creditWindowExpiredDmSent: true, creditsEarned: 0 } }
+    );
+    console.log(`[notifications] Sent credit-window-expired DM to ${doc.discordId} — credits forfeited`);
   }
 
-  // 5. Subscription just passed its expiry, not yet notified. Resettable — see webhook-server.js.
+  // 5. Subscription just passed its expiry — reset the credit-day ladder (a lapsed subscriber's
+  // next credit purchase starts back at the cheap end, not wherever they left off), notify once.
+  // Resettable — see webhook-server.js clearing this flag on every fresh checkout.
   if (doc.subscriptionExpiry && now >= doc.subscriptionExpiry && !doc.subscriptionExpiredDmSent) {
     const components = await getSubscribeButtons(doc.discordId);
     await dmUser(client, doc.discordId, { embeds: [buildSubscriptionExpiredDmEmbed()], components });
     await SubscriptionModel.updateOne(
       { discordId: doc.discordId },
-      { $set: { subscriptionExpiredDmSent: true, status: 'expired' } }
+      { $set: { subscriptionExpiredDmSent: true, status: 'expired', creditDaysUsed: 0, creditDaySpentDate: null } }
     );
-    console.log(`[notifications] Sent subscription-expired DM to ${doc.discordId}`);
+    console.log(`[notifications] Sent subscription-expired DM to ${doc.discordId} — credit ladder reset`);
   }
 }
 
@@ -118,10 +116,10 @@ async function sweepOnce(client) {
   const candidates = await SubscriptionModel.find({
     $or: [
       { trialExpiringSoonDmSent: false },
-      { trialExpiredDmSent: false },
-      { creditsLowDmSent: false },
-      { creditsExhaustedDmSent: false },
+      { creditWindowExpiryWarningDmSent: false },
+      { creditWindowExpiredDmSent: false },
       { subscriptionExpiredDmSent: false },
+      { creditWindowStart: { $ne: null } }, // needed every sweep for the daily midnight reminder
     ],
   });
 

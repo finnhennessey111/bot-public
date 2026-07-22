@@ -13,7 +13,7 @@ const { enforcePermissions } = require('./permissions');
 const { postCreativeQueueChannel } = require('./creative-channel');
 const { QUEUE_CHANNEL_CONFIGS } = require('./creative-channel-configs');
 const {
-  buildRolesEmbed, buildRolesComponents, buildRegisterEmbed,
+  buildRolesEmbed, buildRolesComponents, buildBioButtonRow, buildRegisterEmbed,
   buildHowtoEmbed, buildSetupInstructionsEmbed, buildFormPartyInstructionsEmbed,
   buildAccessChannelEmbed, buildAccessChannelButtons,
 } = require('./embeds');
@@ -176,6 +176,13 @@ async function runMatchmakerSetup(guild, yuniteToken, yuniteVerifiedRoleId = nul
     setupMessageIds.getRoles = await ensurePosted(
       guild.client, config.setupMessageIds, channelIds, 'getRoles',
       () => ({ embeds: [buildRolesEmbed()], components: buildRolesComponents() })
+    );
+    // Bio button posted as its own message right after — Discord caps a message at 5 action
+    // rows, and buildRolesComponents() already uses all 5 for select menus (a select can't share
+    // a row with a button either), so there's no room left in the same message.
+    setupMessageIds.getRolesBio = await ensurePosted(
+      guild.client, config.setupMessageIds, { ...channelIds, getRolesBio: channelIds.getRoles }, 'getRolesBio',
+      () => ({ components: [buildBioButtonRow()] })
     );
     setupMessageIds.howto = await ensurePosted(
       guild.client, config.setupMessageIds, channelIds, 'howto',

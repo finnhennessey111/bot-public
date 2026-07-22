@@ -18,6 +18,15 @@ const PLATFORM_ICONS = {
 
 const REGION_FLAGS = { EU: '🇪🇺', NAC: '🌎', ME: '🌍' };
 
+// Full language list for the #get-roles language select (multi-select, up to 4) — shared between
+// the menu builder and nowhere else, but kept as one list so the menu can't drift out of sync
+// with itself across edits.
+const LANGUAGE_OPTIONS = [
+  'English', 'Spanish', 'French', 'German', 'Polish', 'Dutch', 'Portuguese', 'Turkish',
+  'Arabic', 'Italian', 'Swedish', 'Norwegian', 'Danish', 'Finnish', 'Romanian', 'Greek',
+  'Russian', 'Other',
+];
+
 const COLOR_DEFAULT = 0x4A90D9;
 const COLOR_UPCOMING = 0x2ECC71; // green — before start
 const COLOR_LIVE = 0xE67E22; // orange — in progress
@@ -121,69 +130,104 @@ function formatPlacementLine(event) {
   return `${placementText} — ${event.prPoints.toFixed(2)} PR pts${dateText}`;
 }
 
-function buildMatchCard(player, tournamentName) {
-  const tournamentEvents = player.recentEvents.filter(e => e.name === tournamentName);
+// Epic username always shown; Discord tag always shown too (not just username) — a modern
+// no-discriminator account's tag equals its username, in which case there's nothing extra to
+// show, so this only appends the tag when it differs.
+function formatDiscordLine(player) {
+  const tag = player.discordTag ?? player.discordUsername;
+  return tag === player.discordUsername ? player.discordUsername : `${player.discordUsername} (${tag})`;
+}
 
-  // Last 3 placements for this specific tournament
-  const recentPlacements = tournamentEvents.slice(0, 3);
+// Shared field set for the tournament duo/trio match card — used by both buildMatchCard (same
+// server) and buildCrossServerPlayerCard (cross-server, which just appends a Server field on
+// top of this). A one-off tournament with no queue history for itself falls back to the
+// player's 3 most recent placements across any tournament, rather than showing nothing.
+function buildTournamentPlayerFields(player, tournamentName) {
+  const tournamentEvents = player.recentEvents.filter(e => e.name === tournamentName);
+  const isFallback = tournamentEvents.length === 0;
+  const events = isFallback ? player.recentEvents : tournamentEvents;
+
+  const recentPlacements = events.slice(0, 3);
+  const placementsLabel = isFallback
+    ? '📊 Last 3 Placements (recent — no history for this tournament yet)'
+    : `📊 Last 3 Placements (${tournamentName})`;
   const placementsText = recentPlacements.length > 0
     ? recentPlacements.map(formatPlacementLine).join('\n')
-    : 'No recent placements in this tournament';
+    : 'No recent placements';
 
-  // Best (lowest-numbered) placement across this player's full history in this tournament
-  const placedEvents = tournamentEvents.filter(e => e.placement != null);
-  const bestEvent = placedEvents.length > 0
-    ? placedEvents.reduce((best, e) => (e.placement < best.placement ? e : best))
-    : null;
-  const bestPlacementText = bestEvent ? formatPlacementLine(bestEvent) : 'No placements in this tournament';
+  const placedEvents = events.filter(e => e.placement != null);
+  const bestPlacements = [...placedEvents].sort((a, b) => a.placement - b.placement).slice(0, 3);
+  const bestLabel = isFallback
+    ? '🏆 Best 3 Placements (recent — no history for this tournament yet)'
+    : `🏆 Best 3 Placements (${tournamentName})`;
+  const bestText = bestPlacements.length > 0
+    ? bestPlacements.map(formatPlacementLine).join('\n')
+    : 'No placements recorded';
 
-  const platformIcon = PLATFORM_ICONS[player.platform] ?? '🎮';
-  const rolesText = player.ingameRoles?.length > 0
-    ? player.ingameRoles.join(', ')
-    : 'Not specified';
-  const languageText = player.language ?? 'Not specified';
-  const bioText = player.bio ?? 'No bio set';
+  const rolesText = player.ingameRoles?.length > 0 ? player.ingameRoles.join(', ') : 'Not specified';
+  const languagesText = player.languages?.length > 0 ? player.languages.join(', ') : 'Not specified';
 
   const slug = encodeURIComponent(player.epicUsername);
   const profileUrl = player.epicId
     ? `https://fortnitetracker.com/profile/all/${slug}/events?region=${player.homeRegion}&id=${player.epicId}`
     : `https://fortnitetracker.com/profile/all/${slug}/events`;
 
-  const embed = new EmbedBuilder()
+  const fields = [
+    { name: '⚡ Total PR', value: `**${player.totalPR}**`, inline: true },
+    { name: '🌍 Region', value: player.homeRegion, inline: true },
+    { name: '🎭 In-Game Role', value: rolesText, inline: true },
+    { name: placementsLabel, value: placementsText },
+    { name: bestLabel, value: bestText },
+    { name: '🗣️ Language', value: languagesText, inline: true },
+    { name: '🔗 Profile', value: `[View Profile](${profileUrl})` },
+  ];
+
+  if (player.ageBracket) {
+    fields.splice(3, 0, { name: '🔞 Age Bracket', value: player.ageBracket, inline: true });
+  }
+
+  return fields;
+}
+
+function buildMatchCard(player, tournamentName) {
+  const platformIcon = PLATFORM_ICONS[player.platform] ?? '🎮';
+
+  return new EmbedBuilder()
     .setTitle(`${platformIcon} ${player.epicUsername}`)
-    .setDescription(`**Discord:** ${player.discordUsername}`)
+    .setDescription(`**Discord:** ${formatDiscordLine(player)}`)
     .setColor(0x1E3A5F)
-    .addFields(
-      { name: '⚡ Total PR', value: `**${player.totalPR}**`, inline: true },
-      { name: '📅 This Season PR', value: `**${player.thisSeasonPR}**`, inline: true },
-      { name: `📊 Last 3 Placements (${tournamentName})`, value: placementsText },
-      { name: `🏆 Best Placement (${tournamentName})`, value: bestPlacementText },
-      { name: '🌍 Region', value: player.homeRegion, inline: true },
-      { name: '🎭 In-Game Role', value: rolesText, inline: true },
-      { name: '🗣️ Language', value: languageText, inline: true },
-      { name: '📝 Bio', value: bioText },
-      { name: '🔗 Profile', value: `[View Profile](${profileUrl})` },
-    )
+    .addFields(...buildTournamentPlayerFields(player, tournamentName))
     .setFooter({ text: `Queue type: ${player.queueType.toUpperCase()} • MatchMaker` })
     .setTimestamp();
-
-  return embed;
 }
 
 // Shown in place of buildMatchCard/buildCreativeMatchCard when the player being displayed is on
 // a *different* server than the channel's own guild — Discord permissions are guild-scoped, so a
-// cross-server opponent can't be added to the channel or pinged, just described in text.
-function buildCrossServerPlayerCard(player, kind = 'tournament') {
+// cross-server opponent can't be added to the channel or pinged, just described in text. For a
+// tournament match this carries the exact same fields as buildMatchCard plus a Server field —
+// only the creative (1v1/2v2/6s/8s) path keeps the old minimal card, since creative players don't
+// carry placement/role/language data at all.
+function buildCrossServerPlayerCard(player, kind = 'tournament', tournamentName = null) {
   const platformIcon = PLATFORM_ICONS[player.platform] ?? '🎮';
-  const discordLine = player.discordTag && player.discordTag !== player.discordUsername
-    ? `${player.discordUsername} (${player.discordTag})`
-    : player.discordUsername;
+
+  if (kind === 'creative') {
+    return new EmbedBuilder()
+      .setTitle(`${platformIcon} ${player.epicUsername}`)
+      .setColor(CREATIVE_COLOR)
+      .addFields(
+        { name: '💬 Discord', value: formatDiscordLine(player), inline: true },
+        { name: '🌐 Server', value: player.guildName ?? 'Unknown server', inline: true },
+      )
+      .setFooter({ text: 'Matched from another server — add them in-game to play together' })
+      .setTimestamp();
+  }
 
   return new EmbedBuilder()
     .setTitle(`${platformIcon} ${player.epicUsername}`)
-    .setColor(kind === 'creative' ? CREATIVE_COLOR : 0x1E3A5F)
+    .setDescription(`**Discord:** ${formatDiscordLine(player)}`)
+    .setColor(0x1E3A5F)
     .addFields(
-      { name: '💬 Discord', value: discordLine, inline: true },
+      ...buildTournamentPlayerFields(player, tournamentName),
       { name: '🌐 Server', value: player.guildName ?? 'Unknown server', inline: true },
     )
     .setFooter({ text: 'Matched from another server — add them in-game to play together' })
@@ -640,27 +684,37 @@ function buildRolesComponents() {
   const languageMenu = new ActionRowBuilder().addComponents(
     new StringSelectMenuBuilder()
       .setCustomId('select_language')
-      .setPlaceholder('🗣️ Language (optional)')
+      .setPlaceholder('🗣️ Language(s) (optional, pick up to 4)')
+      .setMinValues(0)
+      .setMaxValues(4)
+      .addOptions(LANGUAGE_OPTIONS.map(l => new StringSelectMenuOptionBuilder().setLabel(l).setValue(l)))
+  );
+
+  const ageBracketMenu = new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId('select_age_bracket')
+      .setPlaceholder('🔞 Age bracket (optional)')
+      .setMinValues(0)
+      .setMaxValues(1)
       .addOptions(
-        new StringSelectMenuOptionBuilder().setLabel('English').setValue('English'),
-        new StringSelectMenuOptionBuilder().setLabel('Spanish').setValue('Spanish'),
-        new StringSelectMenuOptionBuilder().setLabel('French').setValue('French'),
-        new StringSelectMenuOptionBuilder().setLabel('German').setValue('German'),
-        new StringSelectMenuOptionBuilder().setLabel('Portuguese').setValue('Portuguese'),
-        new StringSelectMenuOptionBuilder().setLabel('Turkish').setValue('Turkish'),
-        new StringSelectMenuOptionBuilder().setLabel('Arabic').setValue('Arabic'),
-        new StringSelectMenuOptionBuilder().setLabel('Other').setValue('Other'),
+        new StringSelectMenuOptionBuilder().setLabel('13-14').setValue('13-14'),
+        new StringSelectMenuOptionBuilder().setLabel('15-16').setValue('15-16'),
+        new StringSelectMenuOptionBuilder().setLabel('16+').setValue('16+'),
       )
   );
 
-  const bioButton = new ActionRowBuilder().addComponents(
+  // 5 select rows fills Discord's 5-action-row-per-message cap — the bio button (a button, which
+  // can't share a row with a select menu) has to go in a second message, see buildBioButtonRow().
+  return [regionMenu, extraRegionMenu, ingameRoleMenu, languageMenu, ageBracketMenu];
+}
+
+function buildBioButtonRow() {
+  return new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId('set_bio')
       .setLabel('✏️ Set Bio (optional)')
       .setStyle(ButtonStyle.Secondary)
   );
-
-  return [regionMenu, extraRegionMenu, ingameRoleMenu, languageMenu, bioButton];
 }
 
 // ── REGISTER ───────────────────────────────────────────────────────────────
@@ -712,7 +766,9 @@ function buildAccessChannelEmbed() {
   return new EmbedBuilder()
     .setTitle('🔐 MatchMaker Access')
     .setDescription(
-      '7 day free trial on signup. Complete creative matches to earn extra days. Subscribe for unlimited access.'
+      '7 day free trial on signup. Complete creative matches during your trial to earn credits — once the trial ' +
+      'ends, spend them here (one day at a time, use them within 7 days or lose them) to keep playing, or ' +
+      'subscribe for unlimited access.'
     )
     .setColor(ACCESS_COLOR)
     .setFooter({ text: 'MatchMaker' });
@@ -741,6 +797,19 @@ function buildAccessSubscribeButtons() {
       .setCustomId('access_subscribe_yearly')
       .setLabel('Subscribe Yearly — £29.99')
       .setStyle(ButtonStyle.Success),
+  );
+}
+
+// Shown alongside buildAccessSubscribeButtons whenever getAccessStatus().kind is
+// 'credits_active_can_buy' — the only way left to spend a credit-day (checkAccess no longer
+// auto-spends, see access.js).
+function buildUseCreditsButton() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId('access_use_credits')
+      .setLabel('Use Credits for Today')
+      .setStyle(ButtonStyle.Primary)
+      .setEmoji('💳'),
   );
 }
 
@@ -778,27 +847,36 @@ function buildAccessStatusEmbed(status) {
       .setDescription('Click Queue on any tournament or creative channel to start your 7-day free trial.');
   }
 
-  if (status.kind === 'credits_active') {
-    const nextDayLine = status.matchesNeededForNextDay > 0
-      ? `**To earn tomorrow's access:** ${status.matchesNeededForNextDay} more creative match(es) (costs ${status.nextRungCost} credits)`
-      : `✅ You already have enough credits banked for tomorrow's access (${status.nextRungCost} credits).`;
+  if (status.kind === 'credits_active_already_bought_today') {
     return embed
-      .setTitle('✅ Credits Active')
+      .setTitle('✅ Access Active Today')
       .setColor(ACCESS_ACTIVE_COLOR)
       .setDescription(
-        `**Extra days used:** ${status.creditDaysUsed}/7\n` +
-        `**Credits:** ${status.creditsEarned}\n` +
-        nextDayLine
+        `You already have access today (until **midnight UTC**).\n\n` +
+        `**Credits remaining:** ${status.creditsEarned}\n` +
+        `**Days left in your credit window:** ${status.daysLeftInWindow}\n\n` +
+        'Come back tomorrow to spend more credits and extend again.'
       );
   }
 
-  // 'no_access' — trial and all 7 extra credit-days spent, no subscription
+  if (status.kind === 'credits_active_can_buy') {
+    return embed
+      .setTitle('💳 Credits Available')
+      .setColor(ACCESS_ACTIVE_COLOR)
+      .setDescription(
+        `**Credits you have:** ${status.creditsEarned}\n` +
+        `**Cost for today's access:** ${status.nextRungCost}\n` +
+        `**Days left in your credit window:** ${status.daysLeftInWindow}\n\n` +
+        'Click **Use Credits for Today** below to spend them and unlock access until midnight UTC.'
+      );
+  }
+
+  // 'no_access' — credit window expired, or no credits usable (none left, or not enough for the
+  // next rung), no subscription.
   return embed
     .setTitle('❌ No Access')
     .setColor(ACCESS_DENIED_COLOR)
-    .setDescription(
-      'Your free trial and all 7 extra credit-earned days have been used.\n\nSubscribe below for unlimited access.'
-    );
+    .setDescription('Your credits have expired or run out — subscribe to continue.');
 }
 
 // accessResult comes from access.js's checkAccess() when allowed is false — shown at every
@@ -809,14 +887,12 @@ function buildNoAccessEmbed(accessResult) {
     .setColor(ACCESS_DENIED_COLOR)
     .setFooter({ text: 'MatchMaker • Check #access for your full status' });
 
-  if (accessResult.reason === 'insufficient_credits') {
+  if (accessResult.reason === 'post_trial_no_access') {
     embed.setDescription(
-      `You need **${accessResult.needed}** credits for today's access (you have **${accessResult.have}**). ` +
-      'Complete a creative match to earn more, or subscribe below for unlimited access.'
-    );
-  } else if (accessResult.reason === 'credits_exhausted') {
-    embed.setDescription(
-      'Your free trial and all 7 extra credit-earned days have been used. Subscribe below for unlimited access.'
+      accessResult.creditsAvailable > 0
+        ? `Your free trial has ended. You have **${accessResult.creditsAvailable}** credits available. ` +
+          'Visit #access to use them and extend your access.'
+        : 'Your free trial has ended and you have no credits. Visit #access to subscribe.'
     );
   } else {
     embed.setDescription('You need an active trial, credits, or subscription to queue. Subscribe below for unlimited access.');
@@ -825,23 +901,48 @@ function buildNoAccessEmbed(accessResult) {
   return embed;
 }
 
-function buildTrialExpiredDmEmbed(estimatedDaysFromCredits) {
+function buildCreditWindowStartedDmEmbed(creditsEarned, estimatedDays) {
   return new EmbedBuilder()
     .setTitle('⌛ Your Free Trial Has Ended')
     .setDescription(
-      `Your free trial has ended. You have credits banked for approximately **${estimatedDaysFromCredits}** more day(s). ` +
-      'Click below to subscribe for unlimited access, or check #access in your server for full details.'
+      `Your free trial has ended. You have **${creditsEarned}** credits, which can buy you up to **${estimatedDays}** ` +
+      'day(s) of access. Visit #access to use them. You have **7 days** before they expire.'
     )
     .setColor(ACCESS_DENIED_COLOR)
     .setFooter({ text: 'MatchMaker' })
     .setTimestamp();
 }
 
-function buildCreditsExhaustedDmEmbed() {
+// Sent at noon UTC to anyone whose credit-bought access expires at midnight that same night.
+function buildMidnightReminderDmEmbed() {
   return new EmbedBuilder()
-    .setTitle('⌛ You\'ve Run Out of Free Access')
+    .setTitle('⏰ Your Access Expires at Midnight')
     .setDescription(
-      'You have run out of free access. Subscribe at £2.99/month to continue, or check #access in your server for full details.'
+      'Your credit-bought access expires at **midnight UTC tonight**. Visit #access tomorrow to spend more credits ' +
+      'and extend it another day.'
+    )
+    .setColor(ACCESS_COLOR)
+    .setFooter({ text: 'MatchMaker' })
+    .setTimestamp();
+}
+
+function buildCreditWindowExpiryWarningDmEmbed(creditsEarned) {
+  return new EmbedBuilder()
+    .setTitle('⚠️ Your Credits Expire Soon')
+    .setDescription(
+      `You have **24 hours** left to use your remaining **${creditsEarned}** credits before they expire forever. ` +
+      'Visit #access now.'
+    )
+    .setColor(ACCESS_DENIED_COLOR)
+    .setFooter({ text: 'MatchMaker' })
+    .setTimestamp();
+}
+
+function buildCreditWindowExpiredDmEmbed() {
+  return new EmbedBuilder()
+    .setTitle('⌛ Your Credit Window Has Expired')
+    .setDescription(
+      'Your credit window has expired and your remaining credits have been forfeited. Subscribe at £2.99/month to continue.'
     )
     .setColor(ACCESS_DENIED_COLOR)
     .setFooter({ text: 'MatchMaker' })
@@ -867,18 +968,6 @@ function buildTrialExpiringSoonDmEmbed(hoursRemaining) {
       'for after it ends, or subscribe below for unlimited access.'
     )
     .setColor(ACCESS_COLOR)
-    .setFooter({ text: 'MatchMaker' })
-    .setTimestamp();
-}
-
-function buildCreditsLowDmEmbed(daysRemaining) {
-  return new EmbedBuilder()
-    .setTitle('⚠️ Your Credits Are Running Low')
-    .setDescription(
-      `You have roughly **${daysRemaining} day(s)** of access left on your banked credits. Play more creative matches ` +
-      'to keep earning, or subscribe below before you run out.'
-    )
-    .setColor(ACCESS_DENIED_COLOR)
     .setFooter({ text: 'MatchMaker' })
     .setTimestamp();
 }
@@ -1032,17 +1121,20 @@ module.exports = {
   buildSetupInstructionsEmbed,
   buildRolesEmbed,
   buildRolesComponents,
+  buildBioButtonRow,
   buildRegisterEmbed,
   buildWelcomeDmEmbed,
   buildAccessChannelEmbed,
   buildAccessChannelButtons,
   buildAccessSubscribeButtons,
+  buildUseCreditsButton,
   buildAccessStatusEmbed,
   buildNoAccessEmbed,
   buildTrialExpiringSoonDmEmbed,
-  buildTrialExpiredDmEmbed,
-  buildCreditsLowDmEmbed,
-  buildCreditsExhaustedDmEmbed,
+  buildCreditWindowStartedDmEmbed,
+  buildMidnightReminderDmEmbed,
+  buildCreditWindowExpiryWarningDmEmbed,
+  buildCreditWindowExpiredDmEmbed,
   buildPaymentFailedDmEmbed,
   buildSubscriptionExpiredDmEmbed,
   buildDmSubscribeButtons,

@@ -15,21 +15,10 @@ const CHANNEL_DELETE_BUFFER_MS = 2 * 60 * 60 * 1000;
 
 const managedChannels = {};
 
-// Broad catch-all patterns — anything that passes BLOCKED_KEYWORDS (see tournament-scraper.js)
-// and matches one of these gets a channel. Keeps new/renamed tournament variants (e.g. FNCS's
-// "Last Chance Qualifier" naming) from being silently skipped just because they weren't
-// hardcoded here.
-const KNOWN_TOURNAMENTS = [
-  'victory cup',
-  'cash cup',
-  'fncs',
-  'last chance qualifier',
-  'elite series',
-  'performance evaluation',
-  'clix cup',
-  'reload',
-  'division',
-];
+// No whitelist here — tournament-scraper.js's BLOCKED_KEYWORDS (mobile, solo, FNCS Major) is the
+// single source of truth for channel eligibility. Anything that survives that filter gets a
+// channel, including skin/creator cups that don't follow a standard naming pattern (Mongraal Cup,
+// Clix Cup, etc.) — a whitelist here used to silently drop those unless individually hardcoded.
 
 const PER_DAY_KEYWORDS = ['fncs'];
 
@@ -100,10 +89,6 @@ function isPerDayTournament(name) {
   return PER_DAY_KEYWORDS.some(k => name.toLowerCase().includes(k));
 }
 
-function matchKnownTournament(name) {
-  return KNOWN_TOURNAMENTS.find(k => name.toLowerCase().includes(k)) ?? null;
-}
-
 async function createTournamentChannel(guild, tournament, pinnedMessages) {
   const { name, region, beginTime, lastBeginTime, isTrios, consoleOnly } = tournament;
 
@@ -124,30 +109,8 @@ async function createTournamentChannel(guild, tournament, pinnedMessages) {
     return;
   }
 
-  const nameLower = name.toLowerCase();
-
-  if (nameLower.includes('mobile')) {
-    console.log(`  ⏭️ Skipped — mobile tournaments are excluded: "${name}"`);
-    return;
-  }
-
-  if (nameLower.includes('solo')) {
-    console.log(`  ⏭️ Skipped — solo tournaments are excluded: "${name}"`);
-    return;
-  }
-
-  if (nameLower.includes('fncs') && nameLower.includes('major')) {
-    console.log(`  ⏭️ Skipped — FNCS Major tournaments are excluded: "${name}"`);
-    return;
-  }
-
-  const matchedKeyword = matchKnownTournament(name);
-  if (!matchedKeyword) {
-    console.log(`  ❌ Skipped — "${name.toLowerCase()}" matched none of KNOWN_TOURNAMENTS: [${KNOWN_TOURNAMENTS.join(', ')}]`);
-    console.log(`  ⚠️ Unknown tournament: ${name}`);
-    return;
-  }
-  console.log(`  ✅ Matched KNOWN_TOURNAMENTS keyword: "${matchedKeyword}"`);
+  // No mobile/solo/FNCS-Major re-check here — tournament-scraper.js's BLOCKED_KEYWORDS already
+  // filtered those out before this tournament ever reached us.
 
   const regionRoleId = getRoleId(guild.id, region);
   const consoleRoleId = getRoleId(guild.id, 'Console');
