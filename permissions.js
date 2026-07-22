@@ -10,8 +10,11 @@
 //   1. #register only (ENTRY_CHANNEL_KEYS) — visible to @everyone, no role needed.
 //   2. Yunite links their Epic account and assigns its own verified-role (external to
 //      MatchMaker — configured in Yunite's own dashboard; we're only told the role's ID, via
-//      /matchmaker-setup's yunite-verified-role option, stored as roleIds.yuniteVerified) ->
-//      unlocks #get-roles and #how-to-use (YUNITE_VERIFIED_CHANNEL_KEYS).
+//      /matchmaker-setup's yunite-verified-role option, stored as roleIds.yuniteVerified), OR
+//      the Epic OAuth flow (epic-oauth.js / webhook-server.js's /epic-callback) grants that same
+//      role directly on a successful link, since it's an alternative to Yunite rather than a
+//      separate tier -> unlocks #get-roles, #how-to-use, #form-party and #access
+//      (YUNITE_VERIFIED_CHANNELS).
 //   3. They complete #get-roles and are granted the Registered role (index.js's select_region
 //      handler grants Registered and a region role together) -> unlocks their region's
 //      tournament channels (already gated per-channel by region role at creation time in
@@ -30,16 +33,17 @@ const { getChannelId, getRoleId, getCreativeChannelInfo } = require('./guild-con
 // Visible to a brand new member with no roles at all — the very first thing they see.
 const ENTRY_CHANNEL_KEYS = ['register'];
 
-// Unlocked once Yunite has assigned its verified-role to the member (see module doc above).
-const YUNITE_VERIFIED_CHANNEL_KEYS = ['getRoles', 'howto'];
-
-// Channels every registered member should be able to see and use — keys into guild-config's
-// channelIds map (populated by /matchmaker-setup).
-const PUBLIC_CHANNEL_KEYS = ['formParty'];
-
-// Channels everyone can see but nobody but the bot can post in — the #access channel's embed is
-// entirely button-driven, so member messages would just be clutter.
-const READ_ONLY_CHANNEL_KEYS = ['access'];
+// Unlocked once Yunite (or Epic OAuth, which mirrors the same role) has verified the member (see
+// module doc above). #access and #form-party used to be visible to @everyone unconditionally,
+// which broke the "only #register visible by default" rule for a brand-new, unverified member —
+// folded into this tier instead. `sendMessages: false` keeps #access read-only, since its embed
+// is entirely button-driven; every other channel here defaults to normal posting.
+const YUNITE_VERIFIED_CHANNELS = [
+  { key: 'getRoles' },
+  { key: 'howto' },
+  { key: 'formParty' },
+  { key: 'access', sendMessages: false },
+];
 
 // Visible only to the MatchMaker Mod role — admin/setup onboarding, never shown to regular
 // members (not even after they progress through the ladder above).
@@ -111,18 +115,18 @@ async function enforceEntryChannels(guild) {
 
 // If the admin hasn't told us which role Yunite assigns yet (roleIds.yuniteVerified unset), these
 // channels are left exactly as they currently are rather than locked out entirely — an upgrading
-// server shouldn't lose access to get-roles/how-to-use just because /matchmaker-setup hasn't been
-// re-run with the new option yet.
+// server shouldn't lose access to get-roles/how-to-use/form-party/access just because
+// /matchmaker-setup hasn't been re-run with the new option yet.
 async function enforceYuniteVerifiedChannels(guild) {
   const verifiedRoleId = getRoleId(guild.id, 'yuniteVerified');
   if (!verifiedRoleId) {
-    console.warn('  ⚠️ No Yunite verified role configured for this guild (set one via /matchmaker-setup) — skipping progressive-visibility enforcement for get-roles/how-to-use');
+    console.warn('  ⚠️ No Yunite verified role configured for this guild (set one via /matchmaker-setup) — skipping progressive-visibility enforcement for get-roles/how-to-use/form-party/access');
     return;
   }
 
   const modRoleId = getRoleId(guild.id, 'mod');
 
-  for (const key of YUNITE_VERIFIED_CHANNEL_KEYS) {
+  for (const { key, sendMessages = true } of YUNITE_VERIFIED_CHANNELS) {
     const channelId = getChannelId(guild.id, key);
     if (!channelId) {
       console.warn(`  ⚠️ No ${key} channel configured for this guild — skipping`);
@@ -136,8 +140,8 @@ async function enforceYuniteVerifiedChannels(guild) {
     }
 
     await editOverwrite(channel, guild.roles.everyone, { ViewChannel: false }, '@everyone');
-    await editOverwrite(channel, verifiedRoleId, { ViewChannel: true }, 'Yunite verified role');
-    if (modRoleId) await editOverwrite(channel, modRoleId, { ViewChannel: true }, 'mod role');
+    await editOverwrite(channel, verifiedRoleId, { ViewChannel: true, SendMessages: sendMessages }, 'Yunite verified role');
+    if (modRoleId) await editOverwrite(channel, modRoleId, { ViewChannel: true, SendMessages: true }, 'mod role');
     await grantBotAccess(guild, channel);
   }
 }
@@ -168,42 +172,6 @@ async function enforceModOnlyChannels(guild) {
     await editOverwrite(channel, guild.roles.everyone, { ViewChannel: false }, '@everyone');
     await editOverwrite(channel, modRoleId, { ViewChannel: true, SendMessages: true }, 'mod role');
     await grantBotAccess(guild, channel);
-  }
-}
-
-async function enforcePublicChannels(guild) {
-  for (const key of PUBLIC_CHANNEL_KEYS) {
-    const channelId = getChannelId(guild.id, key);
-    if (!channelId) {
-      console.warn(`  ⚠️ No ${key} channel configured for this guild — skipping public-visibility enforcement for it`);
-      continue;
-    }
-
-    const channel = await guild.channels.fetch(channelId).catch(() => null);
-    if (!channel) {
-      console.warn(`  ⚠️ ${key} channel (${channelId}) not found — skipping`);
-      continue;
-    }
-
-    await editOverwrite(channel, guild.roles.everyone, { ViewChannel: true, SendMessages: true }, '@everyone');
-  }
-}
-
-async function enforceReadOnlyChannels(guild) {
-  for (const key of READ_ONLY_CHANNEL_KEYS) {
-    const channelId = getChannelId(guild.id, key);
-    if (!channelId) {
-      console.warn(`  ⚠️ No ${key} channel configured for this guild — skipping read-only enforcement for it`);
-      continue;
-    }
-
-    const channel = await guild.channels.fetch(channelId).catch(() => null);
-    if (!channel) {
-      console.warn(`  ⚠️ ${key} channel (${channelId}) not found — skipping`);
-      continue;
-    }
-
-    await editOverwrite(channel, guild.roles.everyone, { ViewChannel: true, SendMessages: false }, '@everyone');
   }
 }
 
@@ -261,8 +229,6 @@ async function enforcePermissions(guild) {
   await enforceEntryChannels(guild);
   await enforceYuniteVerifiedChannels(guild);
   await enforceModOnlyChannels(guild);
-  await enforcePublicChannels(guild);
-  await enforceReadOnlyChannels(guild);
   await enforceQueueChannels(guild);
   console.log('🔐 Permission enforcement complete');
 }
