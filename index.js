@@ -10,7 +10,7 @@ const {
 
 const {
   buildPlayer, joinQueue, removeFromQueue, removeFromQueueAnywhere,
-  isInQueue, getQueueCount, startMatchSweep, matchEvents, findUnitByDiscordId,
+  getQueueCount, startMatchSweep, matchEvents, findUnitByDiscordId,
 } = require('./queue');
 const matching = require('./matching');
 const {
@@ -30,7 +30,8 @@ const {
   buildTournamentEmbed, buildQueueButtons, buildLeaveQueueButton,
   buildMatchConfirmedEmbed,
   buildPartyInviteEmbed, buildPartyInviteButtons, buildPartyStatusEmbed,
-  buildFormPartyInstructionsEmbed, buildPartyChannelInstructionsEmbed,
+  buildFormPartyInstructionsEmbed, buildPartyInviteOpenButtonRow, buildUserSelectRow,
+  buildPartyChannelInstructionsEmbed, buildPartyChannelButtonRow,
   buildCreativeMatchConfirmedEmbed, buildCloseChannelButton,
   buildHowtoEmbed, buildRolesEmbed, buildRolesComponents,
   buildAccessStatusEmbed, buildAccessSubscribeButtons, buildNoAccessEmbed,
@@ -70,6 +71,250 @@ function isModMember(guildId, interaction) {
 
 async function replyModOnly(interaction) {
   await interaction.editReply({ content: '❌ This command is restricted to the MatchMaker Mod role.' });
+}
+
+// Queue join/leave ephemeral replies auto-dismiss after 10s so repeat queue/leave clicks don't
+// leave a stack of dismiss-it-yourself messages in the channel. Fire-and-forget delete — errors
+// (e.g. the interaction token already expired) are swallowed, nothing depends on it succeeding.
+const EPHEMERAL_AUTO_DISMISS_MS = 10000;
+async function replyAndDismiss(interaction, payload, ms = EPHEMERAL_AUTO_DISMISS_MS) {
+  await interaction.editReply(payload);
+  setTimeout(() => interaction.deleteReply().catch(() => {}), ms);
+}
+
+// Shared by the /party-invite command and the ➕ Invite to Party button + user-select flow —
+// `interaction` just needs to already be deferred (deferReply for the command, deferUpdate for
+// the select menu) with editReply available; `invited` is the target User either way.
+async function handlePartyInviteRequest(interaction, invited) {
+  const guild = interaction.guild;
+  const leader = interaction.user;
+
+  if (interaction.channelId !== getChannelId(guild.id, 'formParty')) {
+    return interaction.editReply({
+      content: `❌ Use this in <#${getChannelId(guild.id, 'formParty')}>.`,
+    });
+  }
+
+  if (invited.id === leader.id) {
+    return interaction.editReply({ content: '❌ You cannot invite yourself.' });
+  }
+  if (invited.bot) {
+    return interaction.editReply({ content: '❌ You cannot invite a bot.' });
+  }
+  if (party.hasPendingInvite(guild.id, leader.id)) {
+    return interaction.editReply({ content: '❌ You already have a pending invite out. Wait for it to resolve first.' });
+  }
+  if (!party.canAddMember(guild.id, leader.id)) {
+    return interaction.editReply({ content: `❌ Your party is already at the ${party.MAX_PARTY_SIZE}-member cap.` });
+  }
+  if (party.isInParty(guild.id, invited.id) || party.hasPendingInvite(guild.id, invited.id)) {
+    return interaction.editReply({ content: `❌ **${invited.username}** is already in a party or has a pending invite.` });
+  }
+
+  const existingParty = party.getPartyByDiscordId(guild.id, leader.id);
+  const formPartyChannel = interaction.channel;
+
+  let privateChannel;
+  if (existingParty) {
+    // Growing an existing party — invite into the party's shared channel rather than
+    // spinning up a new one per invite.
+    try {
+      privateChannel = await client.channels.fetch(existingParty.channelId);
+      await privateChannel.permissionOverwrites.edit(invited.id, { ViewChannel: true });
+    } catch (err) {
+      console.error('Failed to add invitee to existing party channel:', err.message);
+      return interaction.editReply({ content: '❌ Failed to open the party channel to the invitee.' });
+    }
+  } else {
+    const channelName = `party-${leader.username}-${invited.username}`
+      .toLowerCase()
+      .replace(/[^a-z0-9-]/g, '-')
+      .slice(0, 90);
+
+    try {
+      privateChannel = await guild.channels.create({
+        name: channelName,
+        type: ChannelType.GuildText,
+        parent: formPartyChannel.parentId ?? null,
+        permissionOverwrites: [
+          { id: guild.roles.everyone, deny: [PermissionFlagsBits.ViewChannel] },
+          { id: leader.id, allow: [PermissionFlagsBits.ViewChannel] },
+          { id: invited.id, allow: [PermissionFlagsBits.ViewChannel] },
+          { id: client.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages] },
+        ],
+      });
+    } catch (err) {
+      console.error('Failed to create party channel:', err.message);
+      return interaction.editReply({ content: '❌ Failed to create private party channel.' });
+    }
+  }
+
+  const inviteId = party.createInvite({
+    leaderId: leader.id,
+    leaderUsername: leader.username,
+    invitedId: invited.id,
+    invitedUsername: invited.username,
+    channelId: privateChannel.id,
+    guildId: guild.id,
+  });
+
+  await privateChannel.send({
+    content: `<@${invited.id}>`,
+    embeds: [buildPartyInviteEmbed(leader.username, invited.username)],
+    components: [buildPartyInviteButtons(inviteId)],
+  });
+
+  setTimeout(async () => {
+    const expired = party.expireInvite(inviteId);
+    if (!expired) return;
+    try {
+      const ch = await client.channels.fetch(expired.channelId);
+      await ch.send('⌛ This party invite expired.');
+      setTimeout(() => ch.delete().catch(console.error), 10000);
+    } catch (err) {
+      console.error('Failed to clean up expired party invite channel:', err.message);
+    }
+  }, 5 * 60 * 1000);
+
+  await interaction.editReply({ content: `✅ Invite sent! Head to ${privateChannel} to continue.` });
+}
+
+// Shared by /party-leave and the 🚪 Leave Party button posted in the party's private channel —
+// looked up by discordId, not by channel, so it works from either place (or anywhere else).
+async function handlePartyLeaveRequest(interaction) {
+  const guild = interaction.guild;
+  const record = party.getPartyByDiscordId(guild.id, interaction.user.id);
+  if (!record) {
+    return interaction.editReply({ content: '❌ You are not in a party.' });
+  }
+
+  const memberIds = record.members.map(m => m.discordId);
+
+  // Reject any pending match first (requeues both units in that match, and tears down its
+  // channel cluster — the match channel now exists from the moment a match is found, not
+  // just after confirm, so this can't be skipped anymore).
+  for (const discordId of memberIds) {
+    const pending = getPendingMatchByDiscordId(guild.id, discordId);
+    if (pending) {
+      const result = rejectMatch(pending.matchId, discordId);
+      if (result.status === 'rejected') {
+        await closeMatchChannelCluster(result.channelsByGuildId, '❌ Match declined — a party member disbanded. This channel will close shortly.');
+      }
+    }
+  }
+  // ...then pull the disbanding unit back out again, wherever it ended up.
+  for (const discordId of memberIds) {
+    removeFromQueueAnywhere(guild.id, discordId);
+  }
+
+  try {
+    const ch = await client.channels.fetch(record.channelId);
+    if (ch) await ch.delete();
+  } catch (err) {
+    console.error('Failed to delete party channel:', err.message);
+  }
+
+  party.disbandParty(record.partyId);
+
+  await interaction.editReply({ content: '✅ Party disbanded.' });
+}
+
+// Shared by /party-status and the ℹ️ Party Status button posted in the party's private channel.
+async function handlePartyStatusRequest(interaction) {
+  const record = party.getPartyByDiscordId(interaction.guild.id, interaction.user.id);
+  if (!record) {
+    return interaction.editReply({ content: '❌ You are not in a party. Use /party-invite (or the button in #form-party) to form one.' });
+  }
+
+  await interaction.editReply({ embeds: [buildPartyStatusEmbed(record)] });
+}
+
+// Shared by /votekick and the 🗳️ Vote Kick button + user-select posted in the match channel
+// itself — only usable inside a private match channel (tournament "match-...", or a 6s/8s team
+// match "team-6s-.../team-8s-..." — see team-match-lifecycle.js's channel naming).
+// handleVoteKickCommand is the authoritative check (an active team match must actually exist for
+// this channel); the name check here is just a fast, clear rejection for anyone triggering it
+// somewhere obviously wrong.
+async function handleVoteKickRequest(interaction, target) {
+  const name = interaction.channel.name;
+  if (!(name.startsWith('match-') || name.includes('6s-') || name.includes('8s-'))) {
+    return interaction.editReply({ content: '❌ This only works inside a private match channel.' });
+  }
+
+  const result = teamMatchLifecycle.handleVoteKickCommand(interaction.channelId, interaction.user.id, target.id);
+
+  if (result.status === 'not_in_match') {
+    return interaction.editReply({ content: '❌ This only works inside an active 6s/8s match channel.' });
+  }
+  if (result.status === 'too_early') {
+    return interaction.editReply({ content: `❌ Vote-kick unlocks ${result.remaining}s after the channel was created.` });
+  }
+  if (result.status === 'not_participant') {
+    return interaction.editReply({ content: '❌ You are not part of this match.' });
+  }
+  if (result.status === 'self_target') {
+    return interaction.editReply({ content: '❌ You cannot vote-kick yourself.' });
+  }
+  if (result.status === 'target_not_in_match') {
+    return interaction.editReply({ content: `❌ **${target.username}** is not part of this match.` });
+  }
+  if (result.status === 'already_initiated') {
+    return interaction.editReply({ content: '❌ You have already started a vote-kick in this match — one per player per session.' });
+  }
+  if (result.status === 'vote_in_progress') {
+    return interaction.editReply({ content: '❌ A vote is already in progress in this match.' });
+  }
+  if (result.status === 'target_cooldown') {
+    return interaction.editReply({ content: `❌ A vote against **${target.username}** failed recently — try again in ${result.remaining}s.` });
+  }
+
+  await interaction.editReply({ content: `🗳️ Vote-kick started against **${target.username}**.` });
+
+  // Broadcast to every channel in the match's cluster, not just this one — anyone in any
+  // involved guild's channel should be able to vote.
+  await teamMatchLifecycle.broadcastVoteKickStart(
+    result.matchState, client, interaction.user.username, target.username, result.voteId, result.eligibleCount
+  );
+
+  teamMatchLifecycle.startVoteResolutionTimer(interaction.channelId, result.voteId, client);
+}
+
+// Shared by /refresh-stats and the 🔄 Refresh Stats button posted in #access.
+async function handleRefreshStatsRequest(interaction) {
+  const member = await interaction.guild.members.fetch(interaction.user.id);
+  if (!member.roles.cache.has(getRoleId(interaction.guild.id, 'Registered'))) {
+    return interaction.editReply({
+      content: `❌ Complete your profile in <#${getChannelId(interaction.guild.id, 'getRoles')}> first (set your region).`,
+    });
+  }
+
+  const userData = await playerStore.getPlayer(interaction.guild.id, interaction.user.id);
+  if (!userData?.region) {
+    return interaction.editReply({
+      content: `❌ Set your region in <#${getChannelId(interaction.guild.id, 'getRoles')}> first.`,
+    });
+  }
+
+  try {
+    const { epicUsername, epicId } = await resolveEpicIdentity(interaction.guild, member);
+    const result = await playerStore.refreshPlayerStats(
+      interaction.guild.id, interaction.user.id, epicUsername, epicId, userData.region
+    );
+
+    if (result.limited) {
+      const retryTimestamp = Math.floor(result.retryAt.getTime() / 1000);
+      return interaction.editReply({
+        content: `❌ You can only refresh your stats once per hour. Try again <t:${retryTimestamp}:R>.`,
+      });
+    }
+
+    await interaction.editReply({
+      content: `✅ Stats refreshed! Total PR: **${result.stats.totalPR}**, This Season PR: **${result.stats.thisSeasonPR}**.`,
+    });
+  } catch (err) {
+    console.error('refresh-stats error:', err);
+    await interaction.editReply({ content: `❌ Failed to refresh stats: ${err.message}` });
+  }
 }
 
 // Fires the one-time "your trial has ended" DM the moment a player's credit window actually
@@ -297,7 +542,10 @@ async function handleInteraction(interaction) {
     if (interaction.commandName === 'setup-party-channel') {
       await interaction.deferReply({ flags: 64 });
       if (!isModMember(interaction.guild.id, interaction)) return replyModOnly(interaction);
-      const msg = await interaction.channel.send({ embeds: [buildFormPartyInstructionsEmbed()] });
+      const msg = await interaction.channel.send({
+        embeds: [buildFormPartyInstructionsEmbed()],
+        components: [buildPartyInviteOpenButtonRow()],
+      });
       await msg.pin();
       await interaction.editReply({ content: '✅ Party instructions posted and pinned.' });
     }
@@ -327,97 +575,20 @@ async function handleInteraction(interaction) {
       await interaction.editReply({ content: '✅ How-to embed posted and pinned.' });
     }
 
-    // /votekick — only usable inside a private match channel (tournament "match-...", or a
-    // 6s/8s team match "team-6s-.../team-8s-..." — see team-match-lifecycle.js's channel
-    // naming). handleVoteKickCommand below is the authoritative check (an active team match
-    // must actually exist for this channel); this is just a fast, clear rejection for anyone
-    // running it somewhere obviously wrong.
+    // /votekick — fallback for handleVoteKickRequest below (the primary path is now the
+    // 🗳️ Vote Kick button + user-select posted in the match channel itself).
     if (interaction.commandName === 'votekick') {
       await interaction.deferReply({ flags: 64 });
-
-      const name = interaction.channel.name;
-      if (!(name.startsWith('match-') || name.includes('6s-') || name.includes('8s-'))) {
-        return interaction.editReply({ content: '❌ This command only works inside a private match channel.' });
-      }
-
-      const target = interaction.options.getUser('player');
-      const result = teamMatchLifecycle.handleVoteKickCommand(interaction.channelId, interaction.user.id, target.id);
-
-      if (result.status === 'not_in_match') {
-        return interaction.editReply({ content: '❌ This command only works inside an active 6s/8s match channel.' });
-      }
-      if (result.status === 'too_early') {
-        return interaction.editReply({ content: `❌ Vote-kick unlocks ${result.remaining}s after the channel was created.` });
-      }
-      if (result.status === 'not_participant') {
-        return interaction.editReply({ content: '❌ You are not part of this match.' });
-      }
-      if (result.status === 'self_target') {
-        return interaction.editReply({ content: '❌ You cannot vote-kick yourself.' });
-      }
-      if (result.status === 'target_not_in_match') {
-        return interaction.editReply({ content: `❌ **${target.username}** is not part of this match.` });
-      }
-      if (result.status === 'already_initiated') {
-        return interaction.editReply({ content: '❌ You have already started a vote-kick in this match — one per player per session.' });
-      }
-      if (result.status === 'vote_in_progress') {
-        return interaction.editReply({ content: '❌ A vote is already in progress in this match.' });
-      }
-      if (result.status === 'target_cooldown') {
-        return interaction.editReply({ content: `❌ A vote against **${target.username}** failed recently — try again in ${result.remaining}s.` });
-      }
-
-      await interaction.editReply({ content: `🗳️ Vote-kick started against **${target.username}**.` });
-
-      // Broadcast to every channel in the match's cluster, not just this one — anyone in any
-      // involved guild's channel should be able to vote.
-      await teamMatchLifecycle.broadcastVoteKickStart(
-        result.matchState, client, interaction.user.username, target.username, result.voteId, result.eligibleCount
-      );
-
-      teamMatchLifecycle.startVoteResolutionTimer(interaction.channelId, result.voteId, client);
+      await handleVoteKickRequest(interaction, interaction.options.getUser('player'));
     }
 
     // /refresh-stats — force a rescrape of the caller's own stats, rate-limited to once/hour
     // (players.js's refreshPlayerStats) so this can't be used to hammer FT Tracker.
+    // Fallback for handleRefreshStatsRequest below (the primary path is now the 🔄 Refresh Stats
+    // button posted in #access).
     if (interaction.commandName === 'refresh-stats') {
       await interaction.deferReply({ flags: 64 });
-
-      const member = await interaction.guild.members.fetch(interaction.user.id);
-      if (!member.roles.cache.has(getRoleId(interaction.guild.id, 'Registered'))) {
-        return interaction.editReply({
-          content: `❌ Complete your profile in <#${getChannelId(interaction.guild.id, 'getRoles')}> first (set your region).`,
-        });
-      }
-
-      const userData = await playerStore.getPlayer(interaction.guild.id, interaction.user.id);
-      if (!userData?.region) {
-        return interaction.editReply({
-          content: `❌ Set your region in <#${getChannelId(interaction.guild.id, 'getRoles')}> first.`,
-        });
-      }
-
-      try {
-        const { epicUsername, epicId } = await resolveEpicIdentity(interaction.guild, member);
-        const result = await playerStore.refreshPlayerStats(
-          interaction.guild.id, interaction.user.id, epicUsername, epicId, userData.region
-        );
-
-        if (result.limited) {
-          const retryTimestamp = Math.floor(result.retryAt.getTime() / 1000);
-          return interaction.editReply({
-            content: `❌ You can only refresh your stats once per hour. Try again <t:${retryTimestamp}:R>.`,
-          });
-        }
-
-        await interaction.editReply({
-          content: `✅ Stats refreshed! Total PR: **${result.stats.totalPR}**, This Season PR: **${result.stats.thisSeasonPR}**.`,
-        });
-      } catch (err) {
-        console.error('refresh-stats error:', err);
-        await interaction.editReply({ content: `❌ Failed to refresh stats: ${err.message}` });
-      }
+      await handleRefreshStatsRequest(interaction);
     }
 
     // /cancel-tournament
@@ -471,165 +642,25 @@ async function handleInteraction(interaction) {
       }
     }
 
-    // /party-invite
+    // /party-invite — fallback for handlePartyInviteRequest below (the primary path is now the
+    // ➕ Invite to Party button + user-select in #form-party).
     if (interaction.commandName === 'party-invite') {
       await interaction.deferReply({ flags: 64 });
-
-      if (interaction.channelId !== getChannelId(interaction.guild.id, 'formParty')) {
-        return interaction.editReply({
-          content: `❌ Use this command in <#${getChannelId(interaction.guild.id, 'formParty')}>.`,
-        });
-      }
-
-      const invited = interaction.options.getUser('user');
-      const leader = interaction.user;
-
-      if (invited.id === leader.id) {
-        return interaction.editReply({ content: '❌ You cannot invite yourself.' });
-      }
-      if (invited.bot) {
-        return interaction.editReply({ content: '❌ You cannot invite a bot.' });
-      }
-      if (party.hasPendingInvite(interaction.guild.id, leader.id)) {
-        return interaction.editReply({ content: '❌ You already have a pending invite out. Wait for it to resolve first.' });
-      }
-      if (!party.canAddMember(interaction.guild.id, leader.id)) {
-        return interaction.editReply({ content: `❌ Your party is already at the ${party.MAX_PARTY_SIZE}-member cap.` });
-      }
-      if (party.isInParty(interaction.guild.id, invited.id) || party.hasPendingInvite(interaction.guild.id, invited.id)) {
-        return interaction.editReply({ content: `❌ **${invited.username}** is already in a party or has a pending invite.` });
-      }
-
-      const existingParty = party.getPartyByDiscordId(interaction.guild.id, leader.id);
-      const formPartyChannel = interaction.channel;
-
-      let privateChannel;
-      if (existingParty) {
-        // Growing an existing party — invite into the party's shared channel rather than
-        // spinning up a new one per invite.
-        try {
-          privateChannel = await client.channels.fetch(existingParty.channelId);
-          await privateChannel.permissionOverwrites.edit(invited.id, { ViewChannel: true });
-        } catch (err) {
-          console.error('Failed to add invitee to existing party channel:', err.message);
-          return interaction.editReply({ content: '❌ Failed to open the party channel to the invitee.' });
-        }
-      } else {
-        const channelName = `party-${leader.username}-${invited.username}`
-          .toLowerCase()
-          .replace(/[^a-z0-9-]/g, '-')
-          .slice(0, 90);
-
-        try {
-          privateChannel = await interaction.guild.channels.create({
-            name: channelName,
-            type: ChannelType.GuildText,
-            parent: formPartyChannel.parentId ?? null,
-            permissionOverwrites: [
-              { id: interaction.guild.roles.everyone, deny: [PermissionFlagsBits.ViewChannel] },
-              { id: leader.id, allow: [PermissionFlagsBits.ViewChannel] },
-              { id: invited.id, allow: [PermissionFlagsBits.ViewChannel] },
-              { id: client.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages] },
-            ],
-          });
-        } catch (err) {
-          console.error('Failed to create party channel:', err.message);
-          return interaction.editReply({ content: '❌ Failed to create private party channel.' });
-        }
-      }
-
-      const inviteId = party.createInvite({
-        leaderId: leader.id,
-        leaderUsername: leader.username,
-        invitedId: invited.id,
-        invitedUsername: invited.username,
-        channelId: privateChannel.id,
-        guildId: interaction.guild.id,
-      });
-
-      await privateChannel.send({
-        content: `<@${invited.id}>`,
-        embeds: [buildPartyInviteEmbed(leader.username, invited.username)],
-        components: [buildPartyInviteButtons(inviteId)],
-      });
-
-      setTimeout(async () => {
-        const expired = party.expireInvite(inviteId);
-        if (!expired) return;
-        try {
-          const ch = await client.channels.fetch(expired.channelId);
-          await ch.send('⌛ This party invite expired.');
-          setTimeout(() => ch.delete().catch(console.error), 10000);
-        } catch (err) {
-          console.error('Failed to clean up expired party invite channel:', err.message);
-        }
-      }, 5 * 60 * 1000);
-
-      await interaction.editReply({ content: `✅ Invite sent! Head to ${privateChannel} to continue.` });
+      await handlePartyInviteRequest(interaction, interaction.options.getUser('user'));
     }
 
-    // /party-leave
+    // /party-leave — fallback for handlePartyLeaveRequest below (the primary path is now the
+    // 🚪 Leave Party button posted in the party's own private channel).
     if (interaction.commandName === 'party-leave') {
       await interaction.deferReply({ flags: 64 });
-
-      if (interaction.channelId !== getChannelId(interaction.guild.id, 'formParty')) {
-        return interaction.editReply({
-          content: `❌ Use this command in <#${getChannelId(interaction.guild.id, 'formParty')}>.`,
-        });
-      }
-
-      const record = party.getPartyByDiscordId(interaction.guild.id, interaction.user.id);
-      if (!record) {
-        return interaction.editReply({ content: '❌ You are not in a party.' });
-      }
-
-      const memberIds = record.members.map(m => m.discordId);
-
-      // Reject any pending match first (requeues both units in that match, and tears down its
-      // channel cluster — the match channel now exists from the moment a match is found, not
-      // just after confirm, so this can't be skipped anymore).
-      for (const discordId of memberIds) {
-        const pending = getPendingMatchByDiscordId(interaction.guild.id, discordId);
-        if (pending) {
-          const result = rejectMatch(pending.matchId, discordId);
-          if (result.status === 'rejected') {
-            await closeMatchChannelCluster(result.channelsByGuildId, '❌ Match declined — a party member disbanded. This channel will close shortly.');
-          }
-        }
-      }
-      // ...then pull the disbanding unit back out again, wherever it ended up.
-      for (const discordId of memberIds) {
-        removeFromQueueAnywhere(interaction.guild.id, discordId);
-      }
-
-      try {
-        const ch = await client.channels.fetch(record.channelId);
-        if (ch) await ch.delete();
-      } catch (err) {
-        console.error('Failed to delete party channel:', err.message);
-      }
-
-      party.disbandParty(record.partyId);
-
-      await interaction.editReply({ content: '✅ Party disbanded.' });
+      await handlePartyLeaveRequest(interaction);
     }
 
-    // /party-status
+    // /party-status — fallback for handlePartyStatusRequest below (the primary path is now the
+    // ℹ️ Party Status button posted in the party's own private channel).
     if (interaction.commandName === 'party-status') {
       await interaction.deferReply({ flags: 64 });
-
-      if (interaction.channelId !== getChannelId(interaction.guild.id, 'formParty')) {
-        return interaction.editReply({
-          content: `❌ Use this command in <#${getChannelId(interaction.guild.id, 'formParty')}>.`,
-        });
-      }
-
-      const record = party.getPartyByDiscordId(interaction.guild.id, interaction.user.id);
-      if (!record) {
-        return interaction.editReply({ content: '❌ You are not in a party. Use /party-invite to form one.' });
-      }
-
-      await interaction.editReply({ embeds: [buildPartyStatusEmbed(record)] });
+      await handlePartyStatusRequest(interaction);
     }
 
     // ── MOD DEBUG COMMANDS ────────────────────────────────────────────────────
@@ -806,6 +837,21 @@ async function handleInteraction(interaction) {
     }
   }
 
+  // ── USER SELECT MENUS ─────────────────────────────────────────────────────────
+  if (interaction.isUserSelectMenu()) {
+    if (interaction.customId === 'party_invite_select') {
+      await interaction.deferUpdate();
+      const invited = interaction.users.first();
+      await handlePartyInviteRequest(interaction, invited);
+    }
+
+    if (interaction.customId === 'votekick_select') {
+      await interaction.deferUpdate();
+      const target = interaction.users.first();
+      await handleVoteKickRequest(interaction, target);
+    }
+  }
+
   // ── BUTTON INTERACTIONS ──────────────────────────────────────────────────────
   if (interaction.isButton()) {
     const { customId, user, channelId, guild } = interaction;
@@ -828,6 +874,51 @@ async function handleInteraction(interaction) {
       await interaction.showModal(modal);
     }
 
+    // ── PARTY INVITE OPEN (button + user-select, primary path for /party-invite) ─────────────
+    if (customId === 'party_invite_open') {
+      if (channelId !== getChannelId(guild.id, 'formParty')) {
+        return interaction.reply({
+          content: `❌ Use this in <#${getChannelId(guild.id, 'formParty')}>.`,
+          flags: 64,
+        });
+      }
+      await interaction.reply({
+        content: 'Select a player to invite to your party:',
+        components: [buildUserSelectRow('party_invite_select', 'Choose a player to invite')],
+        flags: 64,
+      });
+    }
+
+    // ── PARTY LEAVE / STATUS BUTTONS (posted in the party's own private channel) ──────────────
+    if (customId === 'party_leave_btn') {
+      await interaction.deferReply({ flags: 64 });
+      await handlePartyLeaveRequest(interaction);
+    }
+
+    if (customId === 'party_status_btn') {
+      await interaction.deferReply({ flags: 64 });
+      await handlePartyStatusRequest(interaction);
+    }
+
+    // ── REFRESH STATS BUTTON (posted in #access) ──────────────────────────────────────────────
+    if (customId === 'access_refresh_stats') {
+      await interaction.deferReply({ flags: 64 });
+      await handleRefreshStatsRequest(interaction);
+    }
+
+    // ── VOTE KICK OPEN (button + user-select, primary path for /votekick) ────────────────────
+    if (customId === 'votekick_open') {
+      const name = interaction.channel.name;
+      if (!(name.startsWith('match-') || name.includes('6s-') || name.includes('8s-'))) {
+        return interaction.reply({ content: '❌ This only works inside a private match channel.', flags: 64 });
+      }
+      await interaction.reply({
+        content: 'Select a player to vote-kick:',
+        components: [buildUserSelectRow('votekick_select', 'Choose a player to vote-kick')],
+        flags: 64,
+      });
+    }
+
     // ── PARTY INVITE BUTTONS ─────────────────────────────────────────────────
     if (customId.startsWith('party_accept_')) {
       const inviteId = customId.replace('party_accept_', '');
@@ -848,7 +939,10 @@ async function handleInteraction(interaction) {
         components: [],
       });
 
-      const instructionsMsg = await interaction.channel.send({ embeds: [buildPartyChannelInstructionsEmbed()] });
+      const instructionsMsg = await interaction.channel.send({
+        embeds: [buildPartyChannelInstructionsEmbed()],
+        components: [buildPartyChannelButtonRow()],
+      });
       await instructionsMsg.pin().catch(err => console.error('Failed to pin party instructions:', err.message));
     }
 
@@ -880,7 +974,7 @@ async function handleInteraction(interaction) {
 
       const pinned = pinnedMessages[channelId];
       if (!pinned) {
-        return interaction.editReply({ content: '❌ Could not find tournament info for this channel.' });
+        return replyAndDismiss(interaction, { content: '❌ Could not find tournament info for this channel.' });
       }
 
       const { tournamentName, region, isTrios, consoleOnly } = pinned;
@@ -889,7 +983,7 @@ async function handleInteraction(interaction) {
       const member = await guild.members.fetch(user.id);
 
       if (!member.roles.cache.has(getRoleId(guild.id, 'Registered'))) {
-        return interaction.editReply({
+        return replyAndDismiss(interaction, {
           content: `❌ Complete your profile in <#${getChannelId(guild.id, 'getRoles')}> first (set your region).`,
         });
       }
@@ -897,43 +991,49 @@ async function handleInteraction(interaction) {
       const platform = getPlatformFromMember(guild.id, member);
 
       if (consoleOnly && isPCPlayer(guild.id, member)) {
-        return interaction.editReply({
+        return replyAndDismiss(interaction, {
           content: '❌ This is a console-only tournament. PC players cannot queue here.',
         });
       }
       if (consoleOnly && !isConsolePlayer(guild.id, member)) {
-        return interaction.editReply({
+        return replyAndDismiss(interaction, {
           content: '❌ This is a console-only tournament. You must have the Console role to queue.',
         });
       }
 
       if (queueType === 'lf2' && party.isInParty(guild.id, user.id)) {
-        return interaction.editReply({
+        return replyAndDismiss(interaction, {
           content: '❌ You are in a party — ask your party leader to click "Looking for 1", or run /party-leave to queue solo.',
         });
       }
 
-      if (isInQueue(guild.id, user.id, tournamentName, region)) {
-        return interaction.editReply({
-          content: '🔍 You are currently in queue. Click to leave.',
-          components: [buildLeaveQueueButton()],
+      const existingTournamentUnit = findUnitByDiscordId(guild.id, user.id);
+      if (existingTournamentUnit) {
+        if (existingTournamentUnit.tournamentName === tournamentName && existingTournamentUnit.region === region) {
+          return replyAndDismiss(interaction, {
+            content: '🔍 You are currently in queue. Click to leave.',
+            components: [buildLeaveQueueButton()],
+          });
+        }
+        return replyAndDismiss(interaction, {
+          content: `❌ You are already queued for **${existingTournamentUnit.tournamentName}** (${existingTournamentUnit.region}) — leave that queue before joining another.`,
         });
       }
 
       if (isInCreativeActivity(guild.id, user.id)) {
-        return interaction.editReply({ content: '❌ You are already in a creative queue or match. Leave it before queueing for a tournament.' });
+        return replyAndDismiss(interaction, { content: '❌ You are already in a creative queue or match. Leave it before queueing for a tournament.' });
       }
 
       const tournamentAccess = await access.checkAccess(user.id);
       if (!tournamentAccess.allowed) {
         await notifyCreditWindowStartedIfNeeded(client, user.id, tournamentAccess);
-        return interaction.editReply({
+        return replyAndDismiss(interaction, {
           embeds: [buildNoAccessEmbed(tournamentAccess)],
           components: [buildAccessSubscribeButtons()],
         });
       }
 
-      await interaction.editReply({ content: '⏳ Fetching your stats...' });
+      await replyAndDismiss(interaction, { content: '⏳ Fetching your stats...' });
 
       try {
         const { epicUsername, epicId } = await resolveEpicIdentity(guild, member);
@@ -965,13 +1065,14 @@ async function handleInteraction(interaction) {
 
         await updateQueueEmbed(guild.id, channelId, tournamentName, region, isTrios);
 
-        await interaction.editReply({
+        await replyAndDismiss(interaction, {
           content: `✅ You are now in queue for **${tournamentName}**! A match channel will be created here the moment one is found.`,
+          components: [buildLeaveQueueButton()],
         });
 
       } catch (err) {
         console.error('Queue error:', err);
-        await interaction.editReply({ content: `❌ Error joining queue: ${err.message}` });
+        await replyAndDismiss(interaction, { content: `❌ Error joining queue: ${err.message}` });
       }
     }
 
@@ -981,24 +1082,24 @@ async function handleInteraction(interaction) {
 
       const pinned = pinnedMessages[channelId];
       if (!pinned) {
-        return interaction.editReply({ content: '❌ Could not find tournament info for this channel.' });
+        return replyAndDismiss(interaction, { content: '❌ Could not find tournament info for this channel.' });
       }
 
       const { tournamentName, region, isTrios, consoleOnly } = pinned;
 
       const partyRecord = party.getPartyByDiscordId(guild.id, user.id);
       if (!partyRecord) {
-        return interaction.editReply({
+        return replyAndDismiss(interaction, {
           content: '❌ You need an active party to queue here. Use /party-invite in #form-party, or click "Looking for 2" to queue solo.',
         });
       }
       if (partyRecord.leaderId !== user.id) {
-        return interaction.editReply({
+        return replyAndDismiss(interaction, {
           content: '❌ Only your party leader can queue the party. Ask them to click "Looking for 1".',
         });
       }
       if (partyRecord.members.length !== 2) {
-        return interaction.editReply({
+        return replyAndDismiss(interaction, {
           content: `❌ Trios queueing needs a party of exactly 2 (yours has ${partyRecord.members.length}) — trios teams are fixed at 3 players total.`,
         });
       }
@@ -1007,7 +1108,7 @@ async function handleInteraction(interaction) {
 
       const unregistered = partyMembers.find(m => !m.roles.cache.has(getRoleId(guild.id, 'Registered')));
       if (unregistered) {
-        return interaction.editReply({
+        return replyAndDismiss(interaction, {
           content: `❌ **${unregistered.user.username}** needs to complete their profile in <#${getChannelId(guild.id, 'getRoles')}> first (set their region).`,
         });
       }
@@ -1015,26 +1116,27 @@ async function handleInteraction(interaction) {
       for (const member of partyMembers) {
         const platform = getPlatformFromMember(guild.id, member);
         if (consoleOnly && platform === 'PC') {
-          return interaction.editReply({
+          return replyAndDismiss(interaction, {
             content: `❌ This is a console-only tournament. **${member.user.username}** is registered as PC and cannot queue here.`,
           });
         }
         if (consoleOnly && platform !== 'Console') {
-          return interaction.editReply({
+          return replyAndDismiss(interaction, {
             content: `❌ This is a console-only tournament. **${member.user.username}** must have the Console role to queue.`,
           });
         }
       }
 
       for (const member of partyMembers) {
-        if (isInQueue(guild.id, member.id, tournamentName, region)) {
-          return interaction.editReply({ content: `❌ **${member.user.username}** is already in queue for this tournament.` });
+        const memberUnit = findUnitByDiscordId(guild.id, member.id);
+        if (memberUnit) {
+          return replyAndDismiss(interaction, { content: `❌ **${member.user.username}** is already queued for **${memberUnit.tournamentName}** (${memberUnit.region}) — leave that queue first.` });
         }
         if (getPendingMatchByDiscordId(guild.id, member.id)) {
-          return interaction.editReply({ content: `❌ **${member.user.username}** already has a pending match to resolve first.` });
+          return replyAndDismiss(interaction, { content: `❌ **${member.user.username}** already has a pending match to resolve first.` });
         }
         if (isInCreativeActivity(guild.id, member.id)) {
-          return interaction.editReply({ content: `❌ **${member.user.username}** is already in a creative queue or match — leave it before queueing for a tournament.` });
+          return replyAndDismiss(interaction, { content: `❌ **${member.user.username}** is already in a creative queue or match — leave it before queueing for a tournament.` });
         }
       }
 
@@ -1042,14 +1144,14 @@ async function handleInteraction(interaction) {
         const memberAccess = await access.checkAccess(member.id);
         if (!memberAccess.allowed) {
           await notifyCreditWindowStartedIfNeeded(client, member.id, memberAccess);
-          return interaction.editReply({
+          return replyAndDismiss(interaction, {
             embeds: [buildNoAccessEmbed(memberAccess)],
             components: [buildAccessSubscribeButtons()],
           });
         }
       }
 
-      await interaction.editReply({ content: '⏳ Fetching stats for both party members...' });
+      await replyAndDismiss(interaction, { content: '⏳ Fetching stats for both party members...' });
 
       try {
         const players = await Promise.all(partyMembers.map(async member => {
@@ -1087,13 +1189,14 @@ async function handleInteraction(interaction) {
 
         await updateQueueEmbed(guild.id, channelId, tournamentName, region, isTrios);
 
-        await interaction.editReply({
+        await replyAndDismiss(interaction, {
           content: `✅ Your party is now in queue for **${tournamentName}**! A match channel will be created here the moment a third player is found.`,
+          components: [buildLeaveQueueButton()],
         });
 
       } catch (err) {
         console.error('Party queue error:', err);
-        await interaction.editReply({ content: `❌ Error joining queue: ${err.message}` });
+        await replyAndDismiss(interaction, { content: `❌ Error joining queue: ${err.message}` });
       }
     }
 
@@ -1102,7 +1205,7 @@ async function handleInteraction(interaction) {
       await interaction.deferReply({ flags: 64 });
 
       const pinned = pinnedMessages[channelId];
-      if (!pinned) return interaction.editReply({ content: '❌ Could not find tournament info.' });
+      if (!pinned) return replyAndDismiss(interaction, { content: '❌ Could not find tournament info.' });
 
       const { tournamentName, region, isTrios } = pinned;
       const removed = removeFromQueue(guild.id, user.id, tournamentName, region);
@@ -1110,13 +1213,13 @@ async function handleInteraction(interaction) {
       if (removed) {
         await updateQueueEmbed(guild.id, channelId, tournamentName, region, isTrios);
         const inParty = party.isInParty(guild.id, user.id);
-        await interaction.editReply({
+        await replyAndDismiss(interaction, {
           content: inParty
             ? '✅ You have left the queue. Your party is still active — queue again anytime.'
             : '✅ You have left the queue.',
         });
       } else {
-        await interaction.editReply({ content: '❌ You were not in the queue.' });
+        await replyAndDismiss(interaction, { content: '❌ You were not in the queue.' });
       }
     }
 
@@ -1161,29 +1264,48 @@ async function handleInteraction(interaction) {
       const selection = creativeSelections.get(`${guild.id}:${user.id}:${category}`);
 
       if (!selection?.mode || !selection?.region) {
-        return interaction.editReply({ content: '❌ Select a mode and region from the menus above first.' });
+        return replyAndDismiss(interaction, { content: '❌ Select a mode and region from the menus above first.' });
       }
 
       const joinKey = `${guild.id}:${user.id}`;
 
-      if (isInCreativeQueue(guild.id, user.id) || creativeJoinInProgress.has(joinKey)) {
-        return interaction.editReply({
+      if (isInCreativeQueue(guild.id, user.id)) {
+        return replyAndDismiss(interaction, {
           content: '🔍 You are already in the creative queue. Click "Leave Queue" first if you want to change your selection.',
+          components: [buildLeaveQueueButton('creative_leave_queue')],
+        });
+      }
+
+      if (creativeTeamQueue.isInTeamQueue(guild.id, user.id)) {
+        return replyAndDismiss(interaction, {
+          content: '🔍 You are already in the 6s/8s queue. Click "Leave Queue" first if you want to queue for 1v1/2v2 instead.',
+          components: [buildLeaveQueueButton('team_leave_queue')],
+        });
+      }
+
+      const pendingCreativeMatch = getPendingMatchByDiscordId(guild.id, user.id);
+      if (
+        (pendingCreativeMatch && pendingCreativeMatch.match.kind === 'creative')
+        || teamMatchLifecycle.isPlayerInActiveTeamMatch(guild.id, user.id)
+        || creativeJoinInProgress.has(joinKey)
+      ) {
+        return replyAndDismiss(interaction, {
+          content: '❌ You are already in an active creative match or mid-join. Try again once it resolves.',
         });
       }
 
       if (isInTournamentActivity(guild.id, user.id)) {
-        return interaction.editReply({ content: '❌ You are already in a tournament queue or match. Leave it before queueing for creative.' });
+        return replyAndDismiss(interaction, { content: '❌ You are already in a tournament queue or match. Leave it before queueing for creative.' });
       }
 
       creativeJoinInProgress.add(joinKey);
-      await interaction.editReply({ content: '⏳ Fetching your stats...' });
+      await replyAndDismiss(interaction, { content: '⏳ Fetching your stats...' });
 
       try {
         const member = await guild.members.fetch(user.id);
 
         if (!member.roles.cache.has(getRoleId(guild.id, 'Registered'))) {
-          return interaction.editReply({
+          return replyAndDismiss(interaction, {
             content: `❌ Complete your profile in <#${getChannelId(guild.id, 'getRoles')}> first (set your region).`,
           });
         }
@@ -1191,7 +1313,7 @@ async function handleInteraction(interaction) {
         const creativeAccess = await access.checkAccess(user.id);
         if (!creativeAccess.allowed) {
           await notifyCreditWindowStartedIfNeeded(client, user.id, creativeAccess);
-          return interaction.editReply({
+          return replyAndDismiss(interaction, {
             embeds: [buildNoAccessEmbed(creativeAccess)],
             components: [buildAccessSubscribeButtons()],
           });
@@ -1217,12 +1339,13 @@ async function handleInteraction(interaction) {
 
         await updateCreativeQueueEmbed(guild.id, client, category, QUEUE_CHANNEL_CONFIGS[category]);
 
-        await interaction.editReply({
+        await replyAndDismiss(interaction, {
           content: `✅ You are now in the creative queue for **${selection.mode}** (${selection.region})! We'll ping you here the moment an opponent is found.`,
+          components: [buildLeaveQueueButton('creative_leave_queue')],
         });
       } catch (err) {
         console.error('Creative queue error:', err);
-        await interaction.editReply({ content: `❌ Error joining queue: ${err.message}` });
+        await replyAndDismiss(interaction, { content: `❌ Error joining queue: ${err.message}` });
       } finally {
         creativeJoinInProgress.delete(joinKey);
       }
@@ -1234,7 +1357,7 @@ async function handleInteraction(interaction) {
 
       const found = findCreativeUnitByDiscordId(guild.id, user.id);
       if (!found) {
-        return interaction.editReply({ content: '❌ You are not in the creative queue.' });
+        return replyAndDismiss(interaction, { content: '❌ You are not in the creative queue.' });
       }
 
       removeFromCreativeQueueAnywhere(guild.id, user.id);
@@ -1242,7 +1365,7 @@ async function handleInteraction(interaction) {
       const category = categoryForAnyMode(found.mode);
       if (category) await updateCreativeQueueEmbed(guild.id, client, category, QUEUE_CHANNEL_CONFIGS[category]);
 
-      await interaction.editReply({ content: '✅ You have left the creative queue.' });
+      await replyAndDismiss(interaction, { content: '✅ You have left the creative queue.' });
     }
 
     // ── TEAM QUEUE BUTTON (6s/8s) ────────────────────────────────────────────
@@ -1253,12 +1376,12 @@ async function handleInteraction(interaction) {
       const selection = creativeSelections.get(`${guild.id}:${user.id}:${category}`);
 
       if (!selection?.mode || !selection?.region) {
-        return interaction.editReply({ content: '❌ Select a mode and region from the menus above first.' });
+        return replyAndDismiss(interaction, { content: '❌ Select a mode and region from the menus above first.' });
       }
 
       const existingParty = party.getPartyByDiscordId(guild.id, user.id);
       if (existingParty && existingParty.leaderId !== user.id) {
-        return interaction.editReply({ content: '❌ Only your party leader can queue the party.' });
+        return replyAndDismiss(interaction, { content: '❌ Only your party leader can queue the party.' });
       }
 
       const partyMembersRaw = existingParty ? existingParty.members : [{ discordId: user.id, username: user.username }];
@@ -1270,25 +1393,25 @@ async function handleInteraction(interaction) {
         || teamMatchLifecycle.isPlayerInActiveTeamMatch(guild.id, m.discordId)
       );
       if (alreadyBusy) {
-        return interaction.editReply({ content: '❌ One or more of your party members is already queued or in an active match.' });
+        return replyAndDismiss(interaction, { content: '❌ One or more of your party members is already queued or in an active match.' });
       }
 
       const busyWithTournament = partyMembersRaw.find(m => isInTournamentActivity(guild.id, m.discordId));
       if (busyWithTournament) {
-        return interaction.editReply({
+        return replyAndDismiss(interaction, {
           content: `❌ **${busyWithTournament.username}** is already in a tournament queue or match — leave it before queueing for creative.`,
         });
       }
 
       for (const m of partyMembersRaw) teamJoinInProgress.add(`${guild.id}:${m.discordId}`);
-      await interaction.editReply({ content: `⏳ Fetching stats for ${partyMembersRaw.length} player(s)...` });
+      await replyAndDismiss(interaction, { content: `⏳ Fetching stats for ${partyMembersRaw.length} player(s)...` });
 
       try {
         const members = await Promise.all(partyMembersRaw.map(m => guild.members.fetch(m.discordId)));
 
         const unregistered = members.find(m => !m.roles.cache.has(getRoleId(guild.id, 'Registered')));
         if (unregistered) {
-          return interaction.editReply({
+          return replyAndDismiss(interaction, {
             content: `❌ **${unregistered.user.username}** needs to complete their profile in <#${getChannelId(guild.id, 'getRoles')}> first (set their region).`,
           });
         }
@@ -1297,7 +1420,7 @@ async function handleInteraction(interaction) {
           const memberAccess = await access.checkAccess(member.id);
           if (!memberAccess.allowed) {
             await notifyCreditWindowStartedIfNeeded(client, member.id, memberAccess);
-            return interaction.editReply({
+            return replyAndDismiss(interaction, {
               embeds: [buildNoAccessEmbed(memberAccess)],
               components: [buildAccessSubscribeButtons()],
             });
@@ -1327,14 +1450,15 @@ async function handleInteraction(interaction) {
 
         const targetSize = creativeTeamQueue.targetSizeForMode(selection.mode);
         const needed = targetSize - players.length;
-        await interaction.editReply({
+        await replyAndDismiss(interaction, {
           content: needed > 0
             ? `✅ Queued for **${selection.mode}** (${selection.region}) — LF${needed}. We'll ping the match channel once it fills.`
             : `✅ Queued for **${selection.mode}** (${selection.region})! We'll ping the match channel shortly.`,
+          components: [buildLeaveQueueButton('team_leave_queue')],
         });
       } catch (err) {
         console.error('Team queue error:', err);
-        await interaction.editReply({ content: `❌ Error joining queue: ${err.message}` });
+        await replyAndDismiss(interaction, { content: `❌ Error joining queue: ${err.message}` });
       } finally {
         for (const m of partyMembersRaw) teamJoinInProgress.delete(`${guild.id}:${m.discordId}`);
       }
@@ -1346,7 +1470,7 @@ async function handleInteraction(interaction) {
 
       const found = creativeTeamQueue.findUnitByDiscordId(guild.id, user.id);
       if (!found) {
-        return interaction.editReply({ content: '❌ You are not in the 6s/8s queue.' });
+        return replyAndDismiss(interaction, { content: '❌ You are not in the 6s/8s queue.' });
       }
 
       creativeTeamQueue.removeFromTeamQueueAnywhere(guild.id, user.id);
@@ -1354,7 +1478,7 @@ async function handleInteraction(interaction) {
       const category = categoryForAnyMode(found.mode);
       if (category) await updateCreativeQueueEmbed(guild.id, client, category, QUEUE_CHANNEL_CONFIGS[category]);
 
-      await interaction.editReply({ content: '✅ You (and your party) have left the 6s/8s queue.' });
+      await replyAndDismiss(interaction, { content: '✅ You (and your party) have left the 6s/8s queue.' });
     }
 
     // ── TEAM METHOD VOTE BUTTONS ──────────────────────────────────────────────

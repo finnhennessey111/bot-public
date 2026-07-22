@@ -20,7 +20,6 @@
 // Ranking among eligible candidates is just closest logPR — no match-score weighting.
 
 const { EventEmitter } = require('events');
-const playerStore = require('./players');
 const { creativeQueues, save } = require('./store');
 const config = require('./config');
 
@@ -203,6 +202,10 @@ function startCreativeMatchSweep() {
 }
 
 async function buildCreativePlayer({ guildId, guildName, discordId, discordUsername, discordTag, epicUsername, epicId, mode, region, platform }) {
+  // Required lazily (not at module load) — players.js sits behind a circular require chain
+  // (players -> yunite -> guild-config -> embeds -> creative-queue -> players) that leaves a
+  // top-level `require('./players')` here bound to players.js's stale pre-export object.
+  const playerStore = require('./players');
   const { totalPR } = await playerStore.getPlayerStats(guildId, discordId, epicUsername, epicId, region);
 
   return {

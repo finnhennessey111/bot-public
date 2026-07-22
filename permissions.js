@@ -53,6 +53,17 @@ async function editOverwrite(channel, targetId, permissions, label) {
   }
 }
 
+// Explicit member-level allow for the bot itself. Every function below that denies @everyone
+// ViewChannel on a channel relies on the bot separately holding Administrator (or some other
+// guild-wide allow) to still see in — never guaranteed on a freshly-invited "new server", where
+// the invite may not have granted Administrator. Without this, the bot can end up unable to see
+// its own creative-queue/setup channels the moment enforcePermissions denies @everyone there.
+async function grantBotAccess(guild, channel) {
+  const botMember = guild.members.me;
+  if (!botMember) return;
+  await editOverwrite(channel, botMember, { ViewChannel: true, SendMessages: true }, 'bot');
+}
+
 async function lockGuildBasePermissions(guild) {
   const everyone = guild.roles.everyone;
   const next = everyone.permissions.remove([
@@ -117,6 +128,7 @@ async function enforceYuniteVerifiedChannels(guild) {
     await editOverwrite(channel, guild.roles.everyone, { ViewChannel: false }, '@everyone');
     await editOverwrite(channel, verifiedRoleId, { ViewChannel: true }, 'Yunite verified role');
     if (modRoleId) await editOverwrite(channel, modRoleId, { ViewChannel: true }, 'mod role');
+    await grantBotAccess(guild, channel);
   }
 }
 
@@ -145,6 +157,7 @@ async function enforceModOnlyChannels(guild) {
 
     await editOverwrite(channel, guild.roles.everyone, { ViewChannel: false }, '@everyone');
     await editOverwrite(channel, modRoleId, { ViewChannel: true, SendMessages: true }, 'mod role');
+    await grantBotAccess(guild, channel);
   }
 }
 
@@ -202,6 +215,9 @@ async function lockQueueChannelAttachments(guild, channelId, { registeredRoleId 
 
   if (registeredRoleId) {
     await editOverwrite(channel, registeredRoleId, { ViewChannel: true }, 'Registered role');
+    // @everyone's ViewChannel:false above would otherwise take the bot's own visibility down
+    // with it on a guild where the bot doesn't hold Administrator — see grantBotAccess doc.
+    await grantBotAccess(guild, channel);
   }
 
   const modRoleId = getRoleId(guild.id, 'mod');

@@ -2,7 +2,7 @@
 
 const {
   EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle,
-  StringSelectMenuBuilder, StringSelectMenuOptionBuilder,
+  StringSelectMenuBuilder, StringSelectMenuOptionBuilder, UserSelectMenuBuilder,
 } = require('discord.js');
 const config = require('./config');
 const { MODES, REGIONS } = require('./creative-queue');
@@ -114,10 +114,10 @@ function buildQueueButtons(isTrios = false) {
   return row;
 }
 
-function buildLeaveQueueButton() {
+function buildLeaveQueueButton(customId = 'leave_queue') {
   return new ActionRowBuilder().addComponents(
     new ButtonBuilder()
-      .setCustomId('leave_queue')
+      .setCustomId(customId)
       .setLabel('Leave Queue')
       .setStyle(ButtonStyle.Danger)
       .setEmoji('❌'),
@@ -323,12 +323,35 @@ function buildFormPartyInstructionsEmbed() {
   return new EmbedBuilder()
     .setTitle('🤝 How to Form a Party')
     .setDescription(
-      '• Use `/party-invite @user` to invite a teammate — repeat to grow your party up to **5** members\n' +
+      '• Click **➕ Invite to Party** below and pick a teammate — repeat to grow your party up to **5** members\n' +
       '• 🔒 Accept/Decline buttons appear in a **private channel** shared by the party\n' +
-      '• 👤 One party at a time — `/party-leave` to disband before forming a new one'
+      '• 👤 One party at a time — use **🚪 Leave Party** in your party channel to disband before forming a new one\n' +
+      '• (Fallback: `/party-invite @user` also works)'
     )
     .setColor(0x4A90D9)
     .setFooter({ text: 'MatchMaker' });
+}
+
+function buildPartyInviteOpenButtonRow() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId('party_invite_open')
+      .setLabel('➕ Invite to Party')
+      .setStyle(ButtonStyle.Primary),
+  );
+}
+
+// Single-user picker shared by any button flow that used to be a `/command @user` slash option
+// (party invite, vote-kick) — a Discord-native user select needs no autocomplete or validation
+// UI of its own.
+function buildUserSelectRow(customId, placeholder) {
+  return new ActionRowBuilder().addComponents(
+    new UserSelectMenuBuilder()
+      .setCustomId(customId)
+      .setPlaceholder(placeholder)
+      .setMinValues(1)
+      .setMaxValues(1),
+  );
 }
 
 function buildPartyChannelInstructionsEmbed() {
@@ -337,11 +360,24 @@ function buildPartyChannelInstructionsEmbed() {
     .setDescription(
       '• 🎮 Trios: leader goes to a **trios** tournament channel and clicks **Looking for 1** (party of exactly 2 required)\n' +
       '• 🎮 6s/8s: leader clicks **Queue** in the creative 6s/8s channel — the bot fills any remaining slots automatically\n' +
-      '• 🚪 `/party-leave` — disband the party\n' +
-      '• ℹ️ `/party-status` — check your party info'
+      '• 🚪 **Leave Party** / ℹ️ **Party Status** — use the buttons below\n' +
+      '• (Fallback: `/party-leave` and `/party-status` also work)'
     )
     .setColor(0x2E7D32)
     .setFooter({ text: 'MatchMaker' });
+}
+
+function buildPartyChannelButtonRow() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId('party_leave_btn')
+      .setLabel('🚪 Leave Party')
+      .setStyle(ButtonStyle.Danger),
+    new ButtonBuilder()
+      .setCustomId('party_status_btn')
+      .setLabel('ℹ️ Party Status')
+      .setStyle(ButtonStyle.Secondary),
+  );
 }
 
 // ── CREATIVE QUEUE ────────────────────────────────────────────────────────────
@@ -448,6 +484,17 @@ function buildCloseChannelButton() {
       .setLabel('Close Channel')
       .setStyle(ButtonStyle.Danger)
       .setEmoji('🔒'),
+  );
+}
+
+// Posted alongside buildCloseChannelButton in a confirmed 6s/8s team match channel — primary
+// path for what used to be the /votekick command's target-player option.
+function buildVoteKickOpenButtonRow() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId('votekick_open')
+      .setLabel('🗳️ Vote Kick')
+      .setStyle(ButtonStyle.Secondary),
   );
 }
 
@@ -781,6 +828,11 @@ function buildAccessChannelButtons() {
       .setLabel('Check My Access')
       .setStyle(ButtonStyle.Primary)
       .setEmoji('🔍'),
+    new ButtonBuilder()
+      .setCustomId('access_refresh_stats')
+      .setLabel('Refresh Stats')
+      .setStyle(ButtonStyle.Secondary)
+      .setEmoji('🔄'),
   );
 }
 
@@ -1102,12 +1154,16 @@ module.exports = {
   buildPartyInviteButtons,
   buildPartyStatusEmbed,
   buildFormPartyInstructionsEmbed,
+  buildPartyInviteOpenButtonRow,
+  buildUserSelectRow,
   buildPartyChannelInstructionsEmbed,
+  buildPartyChannelButtonRow,
   buildCreativeQueueEmbed,
   buildCreativeQueueComponents,
   buildCreativeMatchCard,
   buildCreativeMatchConfirmedEmbed,
   buildCloseChannelButton,
+  buildVoteKickOpenButtonRow,
   buildReadyCheckEmbed,
   buildReadyButton,
   buildTeamMethodVoteEmbed,

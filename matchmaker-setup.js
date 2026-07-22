@@ -15,7 +15,7 @@ const { QUEUE_CHANNEL_CONFIGS } = require('./creative-channel-configs');
 const {
   buildRolesEmbed, buildRolesComponents, buildBioButtonRow, buildRegisterEmbed,
   buildHowtoEmbed, buildSetupInstructionsEmbed, buildFormPartyInstructionsEmbed,
-  buildAccessChannelEmbed, buildAccessChannelButtons,
+  buildPartyInviteOpenButtonRow, buildAccessChannelEmbed, buildAccessChannelButtons,
 } = require('./embeds');
 
 const ROLE_SPECS = [
@@ -114,8 +114,11 @@ async function ensureCreativeChannel(guild, category, spec, existingCreativeChan
   return channel.id;
 }
 
-// Posts (or reuses, if already posted and still present) the starter embed for one channel,
-// pinning it on first post. Returns the message ID either way, for setupMessageIds.
+// Posts (or refreshes in place, if already posted and still present) the starter embed for one
+// channel, pinning it on first post. Editing an already-posted message on every re-run (rather
+// than leaving it untouched) is what lets a re-run of /matchmaker-setup roll out embed/button
+// wording changes to servers that were set up before those changes shipped. Returns the message
+// ID either way, for setupMessageIds.
 async function ensurePosted(client, existingMessageIds, channelIds, key, buildPayload) {
   const channelId = channelIds[key];
   const existingMessageId = existingMessageIds[key];
@@ -124,7 +127,10 @@ async function ensurePosted(client, existingMessageIds, channelIds, key, buildPa
     try {
       const channel = await client.channels.fetch(channelId);
       const existing = await channel.messages.fetch(existingMessageId);
-      if (existing) return existingMessageId;
+      if (existing) {
+        await existing.edit(buildPayload());
+        return existingMessageId;
+      }
     } catch {
       // fall through — message (or channel) is gone, post fresh below
     }
@@ -190,7 +196,7 @@ async function runMatchmakerSetup(guild, yuniteToken, yuniteVerifiedRoleId = nul
     );
     setupMessageIds.formParty = await ensurePosted(
       guild.client, config.setupMessageIds, channelIds, 'formParty',
-      () => ({ embeds: [buildFormPartyInstructionsEmbed()] })
+      () => ({ embeds: [buildFormPartyInstructionsEmbed()], components: [buildPartyInviteOpenButtonRow()] })
     );
     setupMessageIds.register = await ensurePosted(
       guild.client, config.setupMessageIds, channelIds, 'register',

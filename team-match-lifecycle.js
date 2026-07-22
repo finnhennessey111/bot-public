@@ -24,7 +24,7 @@ const channelLifecycle = require('./channel-lifecycle');
 const credits = require('./credits');
 const { getRoleId } = require('./guild-config');
 const {
-  buildCreativeMatchConfirmedEmbed, buildCloseChannelButton,
+  buildCreativeMatchConfirmedEmbed, buildCloseChannelButton, buildVoteKickOpenButtonRow,
   buildReadyCheckEmbed, buildReadyButton,
   buildTeamMethodVoteEmbed, buildTeamMethodVoteButtons,
   buildTeamChoiceEmbed, buildTeamChoiceButtons,
@@ -208,7 +208,7 @@ async function startTeamMatch(units, mode, region, completingGuildId, client) {
       await channel.send({
         content: mentionLine,
         embeds: [buildCreativeMatchConfirmedEmbed(players, mode)],
-        components: [buildCloseChannelButton()],
+        components: [buildCloseChannelButton(), buildVoteKickOpenButtonRow()],
       });
 
       const deletionPinMsg = await channel.send('⏰ This channel and voice channel will automatically delete in 2 hours.');
