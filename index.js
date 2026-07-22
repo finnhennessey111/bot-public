@@ -439,9 +439,10 @@ async function handleInteraction(interaction) {
       await interaction.deferReply({ flags: 64 });
 
       const yuniteToken = interaction.options.getString('yunite-token');
+      const yuniteVerifiedRole = interaction.options.getRole('yunite-verified-role');
 
       try {
-        const result = await runMatchmakerSetup(interaction.guild, yuniteToken);
+        const result = await runMatchmakerSetup(interaction.guild, yuniteToken, yuniteVerifiedRole?.id ?? null);
         await interaction.editReply({ content: result.summary });
       } catch (err) {
         console.error('matchmaker-setup failed:', err.message);

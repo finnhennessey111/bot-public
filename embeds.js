@@ -538,6 +538,25 @@ function buildHowtoEmbed() {
     .setFooter({ text: 'MatchMaker' });
 }
 
+// ── ADMIN SETUP ────────────────────────────────────────────────────────────
+// #setup is mod-role-only (see permissions.js's enforceModOnlyChannels) — this is admin/mod
+// onboarding, never shown to regular members.
+
+function buildSetupInstructionsEmbed() {
+  return new EmbedBuilder()
+    .setTitle('🛠️ Admin Setup')
+    .setDescription(
+      '• Run `/matchmaker-setup` and enter your Yunite API token\n' +
+      '• Go to Yunite dashboard → Fortnite Registration → Post verification message → select #register\n' +
+      '• Assign **MatchMaker Mod** role to your mod team in Server Settings → Roles\n' +
+      '• That\'s it — everything else is automatic\n' +
+      '• Tournament channels appear automatically 48hrs before each tournament\n' +
+      '• For help: personalediting2@gmail.com'
+    )
+    .setColor(0x4A90D9)
+    .setFooter({ text: 'MatchMaker' });
+}
+
 // ── ROLES ──────────────────────────────────────────────────────────────────
 // Extracted from index.js's former postRolesEmbed — content unchanged, just split into an
 // embed builder and a components builder so /matchmaker-setup can post them without depending
@@ -639,8 +658,12 @@ function buildWelcomeDmEmbed(guildName) {
       '**1.** Install Yunite (yunite.xyz) in your server, if you haven\'t already.\n' +
       '**2.** Authorize the MatchMaker app on Yunite for your server — this lets MatchMaker look up ' +
       'linked Epic accounts.\n' +
-      '**3.** Run `/matchmaker-setup` as a server admin — this creates all the roles, categories, ' +
-      'channels, and starter embeds MatchMaker needs, and asks for your Yunite API token as part of the command.\n\n' +
+      '**3.** (Optional but recommended) In Yunite\'s own dashboard, set it to auto-assign a role ' +
+      'when a member links their Epic account — new members only see #register until they have it, ' +
+      'then #get-roles/#how-to-use unlock automatically.\n' +
+      '**4.** Run `/matchmaker-setup` as a server admin — this creates all the roles, categories, ' +
+      'channels, and starter embeds MatchMaker needs, asks for your Yunite API token, and (if you did ' +
+      'step 3) which role Yunite assigns on verification.\n\n' +
       'That\'s it — MatchMaker will be fully live for your server after that.'
     )
     .setColor(0x4A90D9)
@@ -975,6 +998,7 @@ module.exports = {
   buildVoteKickEmbed,
   buildVoteKickButtons,
   buildHowtoEmbed,
+  buildSetupInstructionsEmbed,
   buildRolesEmbed,
   buildRolesComponents,
   buildRegisterEmbed,

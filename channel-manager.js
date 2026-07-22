@@ -350,28 +350,32 @@ async function forEachGuild(client, action) {
 }
 
 function startScheduler(client, pinnedMessages) {
+  // Runs immediately on every startup (not just at the next hourly tick) so a tournament that
+  // entered the 48h window while the bot was offline gets its channel created right away.
+  console.log('📅 Running initial tournament check on startup...');
   forEachGuild(client, guild => checkAndCreateChannels(guild, pinnedMessages));
   // Also run immediately (not just on the 60s interval below) so deletion timers lost to a
   // restart — managedChannels is in-memory only — get re-armed right away instead of after
   // up to a minute's delay.
   forEachGuild(client, guild => updateActiveTournamentEmbeds(guild, pinnedMessages));
 
+  // Every hour, not just once a day — a tournament can enter the 48h creation window at any
+  // point between ticks, and the previous "only at 12:00 UTC" gate meant a tournament entering
+  // the window just after that daily check could sit unnoticed for up to ~24h. This log fires
+  // unconditionally on every tick (independent of whether checkAndCreateChannels itself finds
+  // anything to do) so a live deployment's logs make it obvious the interval is still alive
+  // hour to hour, rather than only ever seeing evidence when a channel actually gets created.
   setInterval(async () => {
     const now = new Date();
-    console.log(`⏰ Scheduler tick — UTC hour ${now.getUTCHours()} (${now.toISOString()})`);
-    if (now.getUTCHours() === 12) {
-      console.log('  → 12:00 UTC — running tournament check');
-      await forEachGuild(client, guild => checkAndCreateChannels(guild, pinnedMessages));
-    } else {
-      console.log('  → not 12:00 UTC — skipping until next tick');
-    }
+    console.log(`⏰ Scheduler tick fired — UTC hour ${now.getUTCHours()} (${now.toISOString()}) — running tournament check`);
+    await forEachGuild(client, guild => checkAndCreateChannels(guild, pinnedMessages));
   }, 60 * 60 * 1000);
 
   setInterval(() => {
     forEachGuild(client, guild => updateActiveTournamentEmbeds(guild, pinnedMessages)).catch(console.error);
   }, EMBED_REFRESH_INTERVAL_MS);
 
-  console.log('📅 Tournament scheduler started');
+  console.log('📅 Tournament scheduler started — hourly tournament check + 60s embed refresh armed');
 }
 
 module.exports = { startScheduler, checkAndCreateChannels, managedChannels };

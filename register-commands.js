@@ -6,7 +6,10 @@ const commands = [
     .setName('matchmaker-setup')
     .setDescription('Set up all roles, categories, channels and starter embeds MatchMaker needs (admin-only)')
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
-    .addStringOption(o => o.setName('yunite-token').setDescription('Your Yunite API token').setRequired(true)),
+    .addStringOption(o => o.setName('yunite-token').setDescription('Your Yunite API token').setRequired(true))
+    .addRoleOption(o => o.setName('yunite-verified-role')
+      .setDescription('The role Yunite auto-assigns when a member links their Epic account (unlocks get-roles/how-to-use)')
+      .setRequired(false)),
 
   new SlashCommandBuilder()
     .setName('setup-tournament')

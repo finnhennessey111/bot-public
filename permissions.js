@@ -4,18 +4,46 @@
 // per-target merge) rather than replacing each channel's overwrite array outright, so it never
 // clobbers overwrites this module doesn't know about (e.g. per-player allows on a private match
 // channel).
+//
+// Progressive visibility ladder for a brand new member, each rung gated behind a Discord role
+// via per-channel ViewChannel overwrites (default deny for @everyone, allow per role):
+//   1. #register only (ENTRY_CHANNEL_KEYS) — visible to @everyone, no role needed.
+//   2. Yunite links their Epic account and assigns its own verified-role (external to
+//      MatchMaker — configured in Yunite's own dashboard; we're only told the role's ID, via
+//      /matchmaker-setup's yunite-verified-role option, stored as roleIds.yuniteVerified) ->
+//      unlocks #get-roles and #how-to-use (YUNITE_VERIFIED_CHANNEL_KEYS).
+//   3. They complete #get-roles and are granted the Registered role (index.js's select_region
+//      handler grants Registered and a region role together) -> unlocks their region's
+//      tournament channels (already gated per-channel by region role at creation time in
+//      channel-manager.js — nothing more to do here) and the creative queue channels (gated by
+//      the Registered role in enforceQueueChannels below).
+// Because this is pure role-based channel overwrites, unlocking is automatic and instantaneous
+// the moment a member gains the relevant role — no event listener needed, Discord applies it.
+//
+// Separately, #setup (MOD_ONLY_CHANNEL_KEYS) sits outside this member-facing ladder entirely —
+// visible only to the mod role, holding admin onboarding instructions regular members never see.
 
 const { PermissionFlagsBits } = require('discord.js');
 const { pinnedMessages } = require('./store');
 const { getChannelId, getRoleId, getCreativeChannelInfo } = require('./guild-config');
 
+// Visible to a brand new member with no roles at all — the very first thing they see.
+const ENTRY_CHANNEL_KEYS = ['register'];
+
+// Unlocked once Yunite has assigned its verified-role to the member (see module doc above).
+const YUNITE_VERIFIED_CHANNEL_KEYS = ['getRoles', 'howto'];
+
 // Channels every registered member should be able to see and use — keys into guild-config's
 // channelIds map (populated by /matchmaker-setup).
-const PUBLIC_CHANNEL_KEYS = ['getRoles', 'howto', 'formParty'];
+const PUBLIC_CHANNEL_KEYS = ['formParty'];
 
 // Channels everyone can see but nobody but the bot can post in — the #access channel's embed is
 // entirely button-driven, so member messages would just be clutter.
 const READ_ONLY_CHANNEL_KEYS = ['access'];
+
+// Visible only to the MatchMaker Mod role — admin/setup onboarding, never shown to regular
+// members (not even after they progress through the ladder above).
+const MOD_ONLY_CHANNEL_KEYS = ['setup'];
 
 async function editOverwrite(channel, targetId, permissions, label) {
   try {
@@ -39,6 +67,84 @@ async function lockGuildBasePermissions(guild) {
     console.log('  🔒 @everyone: removed Manage Messages + Mention Everyone/Here');
   } catch (err) {
     console.error('  ⚠️ Failed to update @everyone base permissions:', err.message);
+  }
+}
+
+async function enforceEntryChannels(guild) {
+  for (const key of ENTRY_CHANNEL_KEYS) {
+    const channelId = getChannelId(guild.id, key);
+    if (!channelId) {
+      console.warn(`  ⚠️ No ${key} channel configured for this guild — skipping entry-visibility enforcement for it`);
+      continue;
+    }
+
+    const channel = await guild.channels.fetch(channelId).catch(() => null);
+    if (!channel) {
+      console.warn(`  ⚠️ ${key} channel (${channelId}) not found — skipping`);
+      continue;
+    }
+
+    await editOverwrite(channel, guild.roles.everyone, { ViewChannel: true, SendMessages: true }, '@everyone');
+  }
+}
+
+// If the admin hasn't told us which role Yunite assigns yet (roleIds.yuniteVerified unset), these
+// channels are left exactly as they currently are rather than locked out entirely — an upgrading
+// server shouldn't lose access to get-roles/how-to-use just because /matchmaker-setup hasn't been
+// re-run with the new option yet.
+async function enforceYuniteVerifiedChannels(guild) {
+  const verifiedRoleId = getRoleId(guild.id, 'yuniteVerified');
+  if (!verifiedRoleId) {
+    console.warn('  ⚠️ No Yunite verified role configured for this guild (set one via /matchmaker-setup) — skipping progressive-visibility enforcement for get-roles/how-to-use');
+    return;
+  }
+
+  const modRoleId = getRoleId(guild.id, 'mod');
+
+  for (const key of YUNITE_VERIFIED_CHANNEL_KEYS) {
+    const channelId = getChannelId(guild.id, key);
+    if (!channelId) {
+      console.warn(`  ⚠️ No ${key} channel configured for this guild — skipping`);
+      continue;
+    }
+
+    const channel = await guild.channels.fetch(channelId).catch(() => null);
+    if (!channel) {
+      console.warn(`  ⚠️ ${key} channel (${channelId}) not found — skipping`);
+      continue;
+    }
+
+    await editOverwrite(channel, guild.roles.everyone, { ViewChannel: false }, '@everyone');
+    await editOverwrite(channel, verifiedRoleId, { ViewChannel: true }, 'Yunite verified role');
+    if (modRoleId) await editOverwrite(channel, modRoleId, { ViewChannel: true }, 'mod role');
+  }
+}
+
+// If the guild has no mod role configured yet, the channel is left exactly as it currently is
+// (same graceful-skip precedent as enforceYuniteVerifiedChannels) rather than denying everyone
+// including mods — that would strand admins out of their own setup instructions.
+async function enforceModOnlyChannels(guild) {
+  const modRoleId = getRoleId(guild.id, 'mod');
+  if (!modRoleId) {
+    console.warn('  ⚠️ No mod role configured for this guild — skipping mod-only-visibility enforcement for setup');
+    return;
+  }
+
+  for (const key of MOD_ONLY_CHANNEL_KEYS) {
+    const channelId = getChannelId(guild.id, key);
+    if (!channelId) {
+      console.warn(`  ⚠️ No ${key} channel configured for this guild — skipping`);
+      continue;
+    }
+
+    const channel = await guild.channels.fetch(channelId).catch(() => null);
+    if (!channel) {
+      console.warn(`  ⚠️ ${key} channel (${channelId}) not found — skipping`);
+      continue;
+    }
+
+    await editOverwrite(channel, guild.roles.everyone, { ViewChannel: false }, '@everyone');
+    await editOverwrite(channel, modRoleId, { ViewChannel: true, SendMessages: true }, 'mod role');
   }
 }
 
@@ -78,19 +184,25 @@ async function enforceReadOnlyChannels(guild) {
   }
 }
 
-// Tournament + creative queue channels: visible to whoever's already allowed in (region role,
-// console role, or everyone for creative), but nobody can post files/images, and mods can
-// always see in even though they don't hold the region/console role.
-async function lockQueueChannelAttachments(guild, channelId, { everyoneVisible }) {
+// Tournament + creative queue channels: nobody can post files/images regardless of who can see
+// the channel, and mods can always see in even though they don't hold the region role. Tournament
+// channels don't touch ViewChannel here at all — channel-manager.js already grants it per-channel
+// to that tournament's region (or console) role at creation time, and this only needs to layer
+// the attachment lock + mod visibility on top. Creative channels DO need ViewChannel touched here
+// — unlike tournament channels they're static and region-agnostic, so there's no per-creation
+// overwrite; registeredRoleId gates them behind the Registered role as part of the progressive-
+// unlock system (step 3 — see module doc comment), replacing what used to be "visible to everyone".
+async function lockQueueChannelAttachments(guild, channelId, { registeredRoleId = null } = {}) {
   const channel = await guild.channels.fetch(channelId).catch(() => null);
   if (!channel) return;
 
   const everyonePerms = { AttachFiles: false, EmbedLinks: false };
-  if (everyoneVisible) {
-    everyonePerms.ViewChannel = true;
-    everyonePerms.SendMessages = true;
-  }
+  if (registeredRoleId) everyonePerms.ViewChannel = false;
   await editOverwrite(channel, guild.roles.everyone, everyonePerms, '@everyone');
+
+  if (registeredRoleId) {
+    await editOverwrite(channel, registeredRoleId, { ViewChannel: true }, 'Registered role');
+  }
 
   const modRoleId = getRoleId(guild.id, 'mod');
   if (modRoleId) {
@@ -104,21 +216,25 @@ async function enforceQueueChannels(guild) {
     .map(([channelId]) => channelId);
 
   for (const channelId of guildPinnedChannelIds) {
-    await lockQueueChannelAttachments(guild, channelId, { everyoneVisible: false });
+    await lockQueueChannelAttachments(guild, channelId);
   }
 
+  const registeredRoleId = getRoleId(guild.id, 'Registered');
   const creativeChannelIds = ['1v1', '2v2', '6s', '8s']
     .map(category => getCreativeChannelInfo(guild.id, category)?.channelId)
     .filter(Boolean);
 
   for (const channelId of creativeChannelIds) {
-    await lockQueueChannelAttachments(guild, channelId, { everyoneVisible: true });
+    await lockQueueChannelAttachments(guild, channelId, { registeredRoleId });
   }
 }
 
 async function enforcePermissions(guild) {
   console.log(`🔐 Enforcing server permissions for guild ${guild.id}...`);
   await lockGuildBasePermissions(guild);
+  await enforceEntryChannels(guild);
+  await enforceYuniteVerifiedChannels(guild);
+  await enforceModOnlyChannels(guild);
   await enforcePublicChannels(guild);
   await enforceReadOnlyChannels(guild);
   await enforceQueueChannels(guild);

@@ -14,7 +14,7 @@ const { postCreativeQueueChannel } = require('./creative-channel');
 const { QUEUE_CHANNEL_CONFIGS } = require('./creative-channel-configs');
 const {
   buildRolesEmbed, buildRolesComponents, buildRegisterEmbed,
-  buildHowtoEmbed, buildFormPartyInstructionsEmbed,
+  buildHowtoEmbed, buildSetupInstructionsEmbed, buildFormPartyInstructionsEmbed,
   buildAccessChannelEmbed, buildAccessChannelButtons,
 } = require('./embeds');
 
@@ -38,6 +38,7 @@ const CATEGORY_SPECS = [
 ];
 
 const CHANNEL_SPECS = [
+  { key: 'setup', name: 'setup' },
   { key: 'register', name: 'register' },
   { key: 'getRoles', name: 'get-roles' },
   { key: 'howto', name: 'how-to-use' },
@@ -135,7 +136,7 @@ async function ensurePosted(client, existingMessageIds, channelIds, key, buildPa
   return msg.id;
 }
 
-async function runMatchmakerSetup(guild, yuniteToken) {
+async function runMatchmakerSetup(guild, yuniteToken, yuniteVerifiedRoleId = null) {
   if (runningGuilds.has(guild.id)) {
     throw new Error('Setup is already running for this server — wait for it to finish before running it again.');
   }
@@ -146,6 +147,12 @@ async function runMatchmakerSetup(guild, yuniteToken) {
 
     const roleIds = {};
     for (const spec of ROLE_SPECS) roleIds[spec.key] = await ensureRole(guild, config.roleIds, spec);
+    // Not created by us — Yunite assigns this role itself (via its own dashboard config) when a
+    // member successfully links their Epic account. We just need to know its ID to gate
+    // get-roles/how-to-use behind it (permissions.js). Omitting the option on a re-run keeps
+    // whatever was already configured rather than clearing it.
+    if (yuniteVerifiedRoleId) roleIds.yuniteVerified = yuniteVerifiedRoleId;
+    else if (config.roleIds.yuniteVerified) roleIds.yuniteVerified = config.roleIds.yuniteVerified;
 
     const categoryIds = { ...config.categoryIds };
     for (const spec of CATEGORY_SPECS) categoryIds[spec.key] = await ensureCategory(guild, config.categoryIds, spec);
@@ -162,6 +169,10 @@ async function runMatchmakerSetup(guild, yuniteToken) {
     // (already have them locally) but buildRegisterEmbed needs the *final* getRoles channel ID,
     // which is already known at this point regardless.
     const setupMessageIds = { ...config.setupMessageIds };
+    setupMessageIds.setup = await ensurePosted(
+      guild.client, config.setupMessageIds, channelIds, 'setup',
+      () => ({ embeds: [buildSetupInstructionsEmbed()] })
+    );
     setupMessageIds.getRoles = await ensurePosted(
       guild.client, config.setupMessageIds, channelIds, 'getRoles',
       () => ({ embeds: [buildRolesEmbed()], components: buildRolesComponents() })
@@ -190,13 +201,19 @@ async function runMatchmakerSetup(guild, yuniteToken) {
 
     await enforcePermissions(guild);
 
+    const verifiedRoleLine = roleIds.yuniteVerified
+      ? `Yunite verified role: <@&${roleIds.yuniteVerified}> — get-roles/how-to-use unlock once a member has it.`
+      : '⚠️ No Yunite verified role set — get-roles/how-to-use won\'t progressively unlock until you re-run ' +
+        '/matchmaker-setup with that option set to the role Yunite assigns on verification.';
+
     return {
       summary:
         '✅ MatchMaker setup complete!\n' +
         `Roles: ${ROLE_SPECS.map(s => s.name).join(', ')}\n` +
         `Categories: ${CATEGORY_SPECS.map(s => s.name).join(', ')}\n` +
         `Channels: ${CHANNEL_SPECS.map(s => `<#${channelIds[s.key]}>`).join(', ')}\n` +
-        `Creative channels: ${CREATIVE_CHANNEL_SPECS.map(s => `<#${creativeChannelIds[s.key]}>`).join(', ')}`,
+        `Creative channels: ${CREATIVE_CHANNEL_SPECS.map(s => `<#${creativeChannelIds[s.key]}>`).join(', ')}\n` +
+        verifiedRoleLine,
     };
   } finally {
     runningGuilds.delete(guild.id);
