@@ -1172,7 +1172,7 @@ async function handleInteraction(interaction) {
         });
       }
 
-      await replyAndDismiss(interaction, { content: '⏳ Fetching your stats...' });
+      await interaction.editReply({ content: '⏳ Fetching your stats...' });
 
       try {
         const { epicUsername, epicId } = await resolveEpicIdentity(guild, member);
@@ -1290,7 +1290,7 @@ async function handleInteraction(interaction) {
         }
       }
 
-      await replyAndDismiss(interaction, { content: '⏳ Fetching stats for both party members...' });
+      await interaction.editReply({ content: '⏳ Fetching stats for both party members...' });
 
       try {
         const players = await Promise.all(partyMembers.map(async member => {
@@ -1436,7 +1436,7 @@ async function handleInteraction(interaction) {
       }
 
       creativeJoinInProgress.add(joinKey);
-      await replyAndDismiss(interaction, { content: '⏳ Fetching your stats...' });
+      await interaction.editReply({ content: '⏳ Fetching your stats...' });
 
       try {
         const member = await guild.members.fetch(user.id);
@@ -1548,7 +1548,7 @@ async function handleInteraction(interaction) {
       }
 
       for (const m of partyMembersRaw) teamJoinInProgress.add(`${guild.id}:${m.discordId}`);
-      await replyAndDismiss(interaction, { content: `⏳ Fetching stats for ${partyMembersRaw.length} player(s)...` });
+      await interaction.editReply({ content: `⏳ Fetching stats for ${partyMembersRaw.length} player(s)...` });
 
       try {
         const members = await Promise.all(partyMembersRaw.map(m => guild.members.fetch(m.discordId)));
