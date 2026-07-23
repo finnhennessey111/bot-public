@@ -251,7 +251,12 @@ function startWebhookServer(client) {
       console.log(
         `[webhook] Received /stripe/webhook — body is Buffer: ${Buffer.isBuffer(req.body)}, ` +
         `length: ${Buffer.isBuffer(req.body) ? req.body.length : 'n/a'}, ` +
-        `stripe-signature: ${req.headers['stripe-signature'] ?? '(missing)'}`
+        `sha256: ${Buffer.isBuffer(req.body) ? require('crypto').createHash('sha256').update(req.body).digest('hex') : 'n/a'}, ` +
+        `stripe-signature: ${req.headers['stripe-signature'] ?? '(missing)'}, ` +
+        `content-encoding: ${req.headers['content-encoding'] ?? '(none)'}, ` +
+        `transfer-encoding: ${req.headers['transfer-encoding'] ?? '(none)'}, ` +
+        `content-length header: ${req.headers['content-length'] ?? '(none)'}, ` +
+        `all headers: ${JSON.stringify(req.headers)}`
       );
 
       let event;
