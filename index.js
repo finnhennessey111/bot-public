@@ -3,7 +3,7 @@
 require('dotenv').config();
 const {
   Client, GatewayIntentBits, ChannelType, PermissionFlagsBits, AuditLogEvent,
-  EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle,
+  EmbedBuilder, ActionRowBuilder,
   StringSelectMenuBuilder, StringSelectMenuOptionBuilder,
   ModalBuilder, TextInputBuilder, TextInputStyle
 } = require('discord.js');
@@ -1800,15 +1800,12 @@ async function handleInteraction(interaction) {
         await interaction.deferReply({ flags: 64 });
 
         const checkoutUrl = await billing.createCheckoutSession(user.id, plan);
-        const linkButton = new ActionRowBuilder().addComponents(
-          new ButtonBuilder()
-            .setStyle(ButtonStyle.Link)
-            .setURL(checkoutUrl)
-            .setLabel(`Complete ${plan === 'monthly' ? 'Monthly' : 'Yearly'} Checkout ↗`),
-        );
+        // Plain text, not a Link-style button — Stripe Checkout URLs carry a long encoded
+        // fragment (session state) that can exceed the length Discord allows on a button's url
+        // field, where it silently fails. Message content has a much higher limit and Discord
+        // auto-links a raw http(s):// URL in content, so this is both simpler and more robust.
         await interaction.editReply({
-          content: 'Click below to complete checkout (opens Stripe):',
-          components: [linkButton],
+          content: `Click here to subscribe: ${checkoutUrl}`,
         });
       } catch (err) {
         // Full error (not just .message) so a Stripe API failure — bad price ID, account issue,
