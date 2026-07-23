@@ -10,10 +10,15 @@ const BLOCKED_KEYWORDS = [
   'solo',
 ];
 
-// These are multi-session — keep one channel alive until last session ends
+// These are multi-session — keep one channel alive until last session ends. Only genuinely
+// multi-day single-run events belong here (FNCS's Fri/Sat/Sun qualifying weekend). "Fortnite
+// Performance Evaluation" used to be listed here too, but it recurs weekly under this exact same
+// title with no distinguishing round/date text — since grouping is by title+region only, a scrape
+// taken while this week's session is still upcoming also picks up next week's (and beyond) under
+// the same group, pushing lastBeginTime weeks out and arming the deletion timer accordingly. It's
+// a single-session-per-week event, so it belongs on the default (per-occurrence beginTime) path.
 const MULTI_SESSION_KEYWORDS = [
   'fncs',
-  'fortnite performance evaluation',
 ];
 
 // Regions we support
