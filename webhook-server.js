@@ -344,6 +344,7 @@ function startWebhookServer(client) {
   }
 
   const port = process.env.PORT || 3000;
+  console.log('[webhook] Express server starting on port', port);
   const server = app.listen(port, () => {
     const routes = [stripeEnabled && 'POST /stripe/webhook', epicEnabled && 'GET /epic-callback'].filter(Boolean);
     console.log(`[webhook] Server listening on port ${port} (${routes.join(', ')})`);
