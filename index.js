@@ -84,6 +84,53 @@ async function replyAndDismiss(interaction, payload, ms = EPHEMERAL_AUTO_DISMISS
   setTimeout(() => interaction.deleteReply().catch(() => {}), ms);
 }
 
+// Persistent "you are in queue" ephemeral status, shared by the tournament, creative 1v1/2v2,
+// and 6s/8s team queues. Unlike replyAndDismiss, this message stays up and re-renders its wait
+// time every minute (via the same interaction's editReply — interaction tokens are only good for
+// ~15 minutes, so a tick that fails past that point just stops quietly rather than erroring).
+// Keyed by `${guildId}:${discordId}` so a repeat Queue click (or the player re-clicking after
+// switching channels) replaces rather than doubles up the running timer.
+const queueStatusTimers = new Map();
+
+function stopQueueStatusMessage(guildId, discordId) {
+  const key = `${guildId}:${discordId}`;
+  const timer = queueStatusTimers.get(key);
+  if (timer) {
+    clearInterval(timer);
+    queueStatusTimers.delete(key);
+  }
+}
+
+function formatWaitTime(joinedAt) {
+  const elapsedSec = Math.max(0, Math.floor((Date.now() - new Date(joinedAt).getTime()) / 1000));
+  const mm = String(Math.floor(elapsedSec / 60)).padStart(2, '0');
+  const ss = String(elapsedSec % 60).padStart(2, '0');
+  return `${mm}:${ss}`;
+}
+
+async function sendQueueStatusMessage(interaction, guildId, discordId, label, joinedAt, leaveCustomId) {
+  stopQueueStatusMessage(guildId, discordId);
+
+  const render = () => ({
+    content: `🔍 You are in queue for **${label}** — waiting ${formatWaitTime(joinedAt)}`,
+    components: [buildLeaveQueueButton(leaveCustomId)],
+  });
+
+  await interaction.editReply(render());
+
+  const key = `${guildId}:${discordId}`;
+  const timer = setInterval(async () => {
+    try {
+      await interaction.editReply(render());
+    } catch (err) {
+      clearInterval(timer);
+      queueStatusTimers.delete(key);
+    }
+  }, 60 * 1000);
+
+  queueStatusTimers.set(key, timer);
+}
+
 // Shared by the /party-invite command and the ➕ Invite to Party button + user-select flow —
 // `interaction` just needs to already be deferred (deferReply for the command, deferUpdate for
 // the select menu) with editReply available; `invited` is the target User either way.
@@ -207,6 +254,7 @@ async function handlePartyLeaveRequest(interaction) {
   // ...then pull the disbanding unit back out again, wherever it ended up.
   for (const discordId of memberIds) {
     removeFromQueueAnywhere(guild.id, discordId);
+    stopQueueStatusMessage(guild.id, discordId);
   }
 
   try {
@@ -423,16 +471,19 @@ client.once('clientReady', async () => {
   // `client` and let notifyMatchFound/notifyCreativeMatchFound/startTeamMatch resolve guilds
   // per-player via match-channels.js / team-match-lifecycle.js.
   matchEvents.on('matchFound', ({ unitA, unitB, tournamentName, region }) => {
+    for (const p of [...unitA.members, ...unitB.members]) stopQueueStatusMessage(p.guildId, p.discordId);
     notifyMatchFound(unitA, unitB, tournamentName, region, client).catch(console.error);
   });
 
   startCreativeMatchSweep();
   creativeMatchEvents.on('matchFound', ({ unitA, unitB, mode, region }) => {
+    for (const p of [...unitA.members, ...unitB.members]) stopQueueStatusMessage(p.guildId, p.discordId);
     notifyCreativeMatchFound(unitA, unitB, mode, region, client).catch(console.error);
   });
 
   creativeTeamQueue.startCreativeTeamMatchSweep();
-  creativeTeamQueue.creativeTeamMatchEvents.on('matchFormed', ({ units, mode, region, completingGuildId }) => {
+  creativeTeamQueue.creativeTeamMatchEvents.on('matchFormed', ({ units, players, mode, region, completingGuildId }) => {
+    for (const p of players) stopQueueStatusMessage(p.guildId, p.discordId);
     teamMatchLifecycle.startTeamMatch(units, mode, region, completingGuildId, client).catch(console.error);
   });
 
@@ -1140,10 +1191,9 @@ async function handleInteraction(interaction) {
       const existingTournamentUnit = findUnitByDiscordId(guild.id, user.id);
       if (existingTournamentUnit) {
         if (existingTournamentUnit.tournamentName === tournamentName && existingTournamentUnit.region === region) {
-          return replyAndDismiss(interaction, {
-            content: '🔍 You are currently in queue. Click to leave.',
-            components: [buildLeaveQueueButton()],
-          });
+          return sendQueueStatusMessage(
+            interaction, guild.id, user.id, tournamentName, existingTournamentUnit.unit.joinedAt, 'leave_queue'
+          );
         }
         return replyAndDismiss(interaction, {
           content: `❌ You are already queued for **${existingTournamentUnit.tournamentName}** (${existingTournamentUnit.region}) — leave that queue before joining another.`,
@@ -1191,14 +1241,11 @@ async function handleInteraction(interaction) {
           bio: userData?.bio ?? null,
         });
 
-        await joinQueue({ guildId: guild.id, players: [player], tournamentName, region, queueType });
+        const { unit } = await joinQueue({ guildId: guild.id, players: [player], tournamentName, region, queueType });
 
         await updateQueueEmbed(guild.id, channelId, tournamentName, region, isTrios);
 
-        await replyAndDismiss(interaction, {
-          content: `✅ You are now in queue for **${tournamentName}**! A match channel will be created here the moment one is found.`,
-          components: [buildLeaveQueueButton()],
-        });
+        await sendQueueStatusMessage(interaction, guild.id, user.id, tournamentName, unit.joinedAt, 'leave_queue');
 
       } catch (err) {
         console.error('Queue error:', err);
@@ -1260,6 +1307,11 @@ async function handleInteraction(interaction) {
       for (const member of partyMembers) {
         const memberUnit = findUnitByDiscordId(guild.id, member.id);
         if (memberUnit) {
+          if (member.id === user.id && memberUnit.tournamentName === tournamentName && memberUnit.region === region) {
+            return sendQueueStatusMessage(
+              interaction, guild.id, user.id, tournamentName, memberUnit.unit.joinedAt, 'leave_queue'
+            );
+          }
           return replyAndDismiss(interaction, { content: `❌ **${member.user.username}** is already queued for **${memberUnit.tournamentName}** (${memberUnit.region}) — leave that queue first.` });
         }
         if (getPendingMatchByDiscordId(guild.id, member.id)) {
@@ -1308,7 +1360,7 @@ async function handleInteraction(interaction) {
           });
         }));
 
-        await joinQueue({
+        const { unit } = await joinQueue({
           guildId: guild.id,
           players,
           tournamentName,
@@ -1319,10 +1371,7 @@ async function handleInteraction(interaction) {
 
         await updateQueueEmbed(guild.id, channelId, tournamentName, region, isTrios);
 
-        await replyAndDismiss(interaction, {
-          content: `✅ Your party is now in queue for **${tournamentName}**! A match channel will be created here the moment a third player is found.`,
-          components: [buildLeaveQueueButton()],
-        });
+        await sendQueueStatusMessage(interaction, guild.id, user.id, tournamentName, unit.joinedAt, 'leave_queue');
 
       } catch (err) {
         console.error('Party queue error:', err);
@@ -1341,6 +1390,7 @@ async function handleInteraction(interaction) {
       const removed = removeFromQueue(guild.id, user.id, tournamentName, region);
 
       if (removed) {
+        stopQueueStatusMessage(guild.id, user.id);
         await updateQueueEmbed(guild.id, channelId, tournamentName, region, isTrios);
         const inParty = party.isInParty(guild.id, user.id);
         await replyAndDismiss(interaction, {
@@ -1400,10 +1450,12 @@ async function handleInteraction(interaction) {
       const joinKey = `${guild.id}:${user.id}`;
 
       if (isInCreativeQueue(guild.id, user.id)) {
-        return replyAndDismiss(interaction, {
-          content: '🔍 You are already in the creative queue. Click "Leave Queue" first if you want to change your selection.',
-          components: [buildLeaveQueueButton('creative_leave_queue')],
-        });
+        const existingCreativeUnit = findCreativeUnitByDiscordId(guild.id, user.id);
+        return sendQueueStatusMessage(
+          interaction, guild.id, user.id,
+          `${existingCreativeUnit.mode} (${existingCreativeUnit.region})`,
+          existingCreativeUnit.unit.joinedAt, 'creative_leave_queue'
+        );
       }
 
       if (creativeTeamQueue.isInTeamQueue(guild.id, user.id)) {
@@ -1465,14 +1517,13 @@ async function handleInteraction(interaction) {
           platform,
         });
 
-        joinCreativeQueue({ guildId: guild.id, player, mode: selection.mode, region: selection.region });
+        const { unit } = joinCreativeQueue({ guildId: guild.id, player, mode: selection.mode, region: selection.region });
 
         await updateCreativeQueueEmbed(guild.id, client, category, QUEUE_CHANNEL_CONFIGS[category]);
 
-        await replyAndDismiss(interaction, {
-          content: `✅ You are now in the creative queue for **${selection.mode}** (${selection.region})! We'll ping you here the moment an opponent is found.`,
-          components: [buildLeaveQueueButton('creative_leave_queue')],
-        });
+        await sendQueueStatusMessage(
+          interaction, guild.id, user.id, `${selection.mode} (${selection.region})`, unit.joinedAt, 'creative_leave_queue'
+        );
       } catch (err) {
         console.error('Creative queue error:', err);
         await replyAndDismiss(interaction, { content: `❌ Error joining queue: ${err.message}` });
@@ -1491,6 +1542,7 @@ async function handleInteraction(interaction) {
       }
 
       removeFromCreativeQueueAnywhere(guild.id, user.id);
+      stopQueueStatusMessage(guild.id, user.id);
 
       const category = categoryForAnyMode(found.mode);
       if (category) await updateCreativeQueueEmbed(guild.id, client, category, QUEUE_CHANNEL_CONFIGS[category]);
@@ -1515,6 +1567,15 @@ async function handleInteraction(interaction) {
       }
 
       const partyMembersRaw = existingParty ? existingParty.members : [{ discordId: user.id, username: user.username }];
+
+      const existingTeamUnit = creativeTeamQueue.findUnitByDiscordId(guild.id, user.id);
+      if (existingTeamUnit && existingTeamUnit.mode === selection.mode && existingTeamUnit.region === selection.region) {
+        return sendQueueStatusMessage(
+          interaction, guild.id, user.id,
+          `${existingTeamUnit.mode} (${existingTeamUnit.region})`,
+          existingTeamUnit.unit.joinedAt, 'team_leave_queue'
+        );
+      }
 
       const alreadyBusy = partyMembersRaw.some(m =>
         isInCreativeQueue(guild.id, m.discordId)
@@ -1574,18 +1635,14 @@ async function handleInteraction(interaction) {
           });
         }));
 
-        creativeTeamQueue.queueUnit(guild.id, players, selection.mode, selection.region);
+        const { unit } = creativeTeamQueue.queueUnit(guild.id, players, selection.mode, selection.region);
 
         await updateCreativeQueueEmbed(guild.id, client, category, QUEUE_CHANNEL_CONFIGS[category]);
 
         const targetSize = creativeTeamQueue.targetSizeForMode(selection.mode);
         const needed = targetSize - players.length;
-        await replyAndDismiss(interaction, {
-          content: needed > 0
-            ? `✅ Queued for **${selection.mode}** (${selection.region}) — LF${needed}. We'll ping the match channel once it fills.`
-            : `✅ Queued for **${selection.mode}** (${selection.region})! We'll ping the match channel shortly.`,
-          components: [buildLeaveQueueButton('team_leave_queue')],
-        });
+        const teamLabel = `${selection.mode} (${selection.region})` + (needed > 0 ? ` — LF${needed}` : '');
+        await sendQueueStatusMessage(interaction, guild.id, user.id, teamLabel, unit.joinedAt, 'team_leave_queue');
       } catch (err) {
         console.error('Team queue error:', err);
         await replyAndDismiss(interaction, { content: `❌ Error joining queue: ${err.message}` });
@@ -1604,6 +1661,7 @@ async function handleInteraction(interaction) {
       }
 
       creativeTeamQueue.removeFromTeamQueueAnywhere(guild.id, user.id);
+      stopQueueStatusMessage(guild.id, user.id);
 
       const category = categoryForAnyMode(found.mode);
       if (category) await updateCreativeQueueEmbed(guild.id, client, category, QUEUE_CHANNEL_CONFIGS[category]);
