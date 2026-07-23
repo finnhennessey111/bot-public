@@ -1,14 +1,19 @@
-// webhook-server.js - Standalone Express app receiving Stripe webhook events and the Epic OAuth
-// callback. Each route is only registered if its own env vars are present, and the server only
-// listens at all if at least one of them is — no dangling unauthenticated port, and it never
-// blocks the bot's own startup. This is the only HTTP surface this bot exposes.
+// webhook-server.js - Standalone Express app receiving Stripe webhook events, the Epic OAuth
+// callback, and the GitHub auto-deploy webhook. Each route is only registered if its own env vars
+// are present, and the server only listens at all if at least one of them is — no dangling
+// unauthenticated port, and it never blocks the bot's own startup. This is the only HTTP surface
+// this bot exposes.
 //
 // Deployment note: registering https://<your-domain>/stripe/webhook in the Stripe Dashboard,
 // registering https://<your-domain>/epic-callback as the OAuth redirect URI on the Epic
-// Games developer portal, and exposing this port publicly (reverse proxy, or a tunnel like
-// ngrok/Cloudflare Tunnel for local dev), are manual one-time steps this code cannot automate.
+// Games developer portal, registering https://<your-domain>/deploy as a GitHub webhook (content
+// type application/json, "Just the push event", secret = DEPLOY_WEBHOOK_SECRET) on the bot-public
+// repo, and exposing this port publicly (reverse proxy, or a tunnel like ngrok/Cloudflare Tunnel
+// for local dev), are manual one-time steps this code cannot automate.
 
 const express = require('express');
+const crypto = require('crypto');
+const { exec } = require('child_process');
 const SubscriptionModel = require('./models/Subscription');
 const access = require('./access');
 const { dmUser } = require('./discord-dm');
@@ -207,9 +212,10 @@ async function notifyEpicLinkResult(client, discordId, guildId, content) {
 function startWebhookServer(client) {
   const stripeEnabled = !!(process.env.STRIPE_SECRET_KEY && process.env.STRIPE_WEBHOOK_SECRET);
   const epicEnabled = epicOAuth.isConfigured();
+  const deployEnabled = !!process.env.DEPLOY_WEBHOOK_SECRET;
 
-  if (!stripeEnabled && !epicEnabled) {
-    console.warn('[webhook] Neither Stripe nor Epic OAuth env vars are set — webhook server not started.');
+  if (!stripeEnabled && !epicEnabled && !deployEnabled) {
+    console.warn('[webhook] Neither Stripe, Epic OAuth, nor deploy webhook env vars are set — webhook server not started.');
     return null;
   }
 
@@ -228,6 +234,9 @@ function startWebhookServer(client) {
   }
   if (!epicEnabled) {
     console.warn('[webhook] EPIC_CLIENT_ID/EPIC_CLIENT_SECRET/EPIC_REDIRECT_URI not set — /epic-callback disabled. Epic linking falls back to Yunite only.');
+  }
+  if (!deployEnabled) {
+    console.warn('[webhook] DEPLOY_WEBHOOK_SECRET not set — /deploy auto-deploy endpoint disabled.');
   }
 
   if (stripeEnabled) {
@@ -348,10 +357,70 @@ function startWebhookServer(client) {
     });
   }
 
+  if (deployEnabled) {
+    // GitHub signs the raw JSON body with HMAC-SHA256 using the webhook's configured secret, sent
+    // as `X-Hub-Signature-256: sha256=<hex>` — same shape as Stripe's signature check above, and
+    // for the same reason needs the exact raw bytes (express.raw, not express.json).
+    app.post('/deploy', express.raw({ type: '*/*' }), (req, res) => {
+      const signature = req.headers['x-hub-signature-256'];
+      const expected = 'sha256=' + crypto
+        .createHmac('sha256', process.env.DEPLOY_WEBHOOK_SECRET)
+        .update(req.body)
+        .digest('hex');
+
+      const signatureBuffer = Buffer.from(signature ?? '');
+      const expectedBuffer = Buffer.from(expected);
+      const signatureValid = signatureBuffer.length === expectedBuffer.length
+        && crypto.timingSafeEqual(signatureBuffer, expectedBuffer);
+
+      if (!signatureValid) {
+        console.warn('[deploy] Rejected — missing or invalid X-Hub-Signature-256');
+        return res.status(401).send('Invalid signature');
+      }
+
+      if (req.headers['x-github-event'] !== 'push') {
+        return res.status(200).send('Ignored — not a push event');
+      }
+
+      let payload;
+      try {
+        payload = JSON.parse(req.body.toString('utf8'));
+      } catch (err) {
+        console.error('[deploy] Failed to parse push payload:', err.message);
+        return res.status(400).send('Invalid JSON payload');
+      }
+
+      if (payload.ref !== 'refs/heads/main') {
+        console.log(`[deploy] Ignored push to ${payload.ref} — only main triggers a deploy`);
+        return res.status(200).send('Ignored — not main branch');
+      }
+
+      console.log(`[deploy] Verified push to main (${payload.after ?? 'unknown commit'}) — deploying`);
+      res.status(200).send('Deploying');
+
+      // Respond before restarting — pm2 restarting this exact process (matchmaker-beta runs this
+      // same webhook server) would otherwise race the HTTP response back to GitHub.
+      setTimeout(() => {
+        exec('git pull && pm2 restart matchmaker-beta', { cwd: __dirname }, (err, stdout, stderr) => {
+          if (err) {
+            console.error('[deploy] Deploy command failed:', err.message);
+            if (stderr) console.error('[deploy] stderr:', stderr);
+            return;
+          }
+          console.log('[deploy] Deploy output:', stdout);
+        });
+      }, 500);
+    });
+  }
+
   const port = process.env.PORT || 3000;
   console.log('[webhook] Express server starting on port', port);
   const server = app.listen(port, () => {
-    const routes = [stripeEnabled && 'POST /stripe/webhook', epicEnabled && 'GET /epic-callback'].filter(Boolean);
+    const routes = [
+      stripeEnabled && 'POST /stripe/webhook',
+      epicEnabled && 'GET /epic-callback',
+      deployEnabled && 'POST /deploy',
+    ].filter(Boolean);
     console.log(`[webhook] Server listening on port ${port} (${routes.join(', ')})`);
   });
 
