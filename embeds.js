@@ -872,7 +872,7 @@ function buildAccessSubscribeButtons() {
       .setStyle(ButtonStyle.Success),
     new ButtonBuilder()
       .setCustomId('access_subscribe_yearly')
-      .setLabel('Subscribe Yearly — £29.99')
+      .setLabel('Subscribe Yearly — £28.99')
       .setStyle(ButtonStyle.Success),
   );
 }
@@ -1078,7 +1078,7 @@ function buildDmSubscribeButtons(monthlyUrl, yearlyUrl) {
     buttons.push(new ButtonBuilder().setStyle(ButtonStyle.Link).setURL(monthlyUrl).setLabel('Subscribe Monthly — £2.99'));
   }
   if (yearlyUrl) {
-    buttons.push(new ButtonBuilder().setStyle(ButtonStyle.Link).setURL(yearlyUrl).setLabel('Subscribe Yearly — £29.99'));
+    buttons.push(new ButtonBuilder().setStyle(ButtonStyle.Link).setURL(yearlyUrl).setLabel('Subscribe Yearly — £28.99'));
   }
   if (buttons.length === 0) return null;
   return new ActionRowBuilder().addComponents(...buttons);
