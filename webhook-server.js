@@ -1,15 +1,17 @@
 // webhook-server.js - Standalone Express app receiving Stripe webhook events, the Epic OAuth
-// callback, and the GitHub auto-deploy webhook. Each route is only registered if its own env vars
-// are present, and the server only listens at all if at least one of them is — no dangling
-// unauthenticated port, and it never blocks the bot's own startup. This is the only HTTP surface
-// this bot exposes.
+// callback, the Discord OAuth "pay through the website" hand-off, and the GitHub auto-deploy
+// webhook. Each route is only registered if its own env vars are present, and the server only
+// listens at all if at least one of them is — no dangling unauthenticated port, and it never
+// blocks the bot's own startup. This is the only HTTP surface this bot exposes.
 //
 // Deployment note: registering https://<your-domain>/stripe/webhook in the Stripe Dashboard,
 // registering https://<your-domain>/epic-callback as the OAuth redirect URI on the Epic
-// Games developer portal, registering https://<your-domain>/deploy as a GitHub webhook (content
-// type application/json, "Just the push event", secret = DEPLOY_WEBHOOK_SECRET) on the bot-public
-// repo, and exposing this port publicly (reverse proxy, or a tunnel like ngrok/Cloudflare Tunnel
-// for local dev), are manual one-time steps this code cannot automate.
+// Games developer portal, registering https://<your-domain>/discord-checkout-callback as an
+// OAuth2 redirect on the Discord Developer Portal (same app as CLIENT_ID), registering
+// https://<your-domain>/deploy as a GitHub webhook (content type application/json, "Just the push
+// event", secret = DEPLOY_WEBHOOK_SECRET) on the bot-public repo, and exposing this port publicly
+// (reverse proxy, or a tunnel like ngrok/Cloudflare Tunnel for local dev), are manual one-time
+// steps this code cannot automate.
 
 const express = require('express');
 const crypto = require('crypto');
@@ -19,6 +21,8 @@ const access = require('./access');
 const { dmUser } = require('./discord-dm');
 const { buildPaymentFailedDmEmbed } = require('./embeds');
 const epicOAuth = require('./epic-oauth');
+const discordOAuth = require('./discord-oauth');
+const billing = require('./billing');
 const playerStore = require('./players');
 const { getRoleId, getChannelId } = require('./guild-config');
 
@@ -187,6 +191,18 @@ function renderEpicResultPage(success, message) {
 </body></html>`;
 }
 
+// Same style/pattern as renderEpicResultPage above, for the website checkout hand-off — this one
+// only ever renders the failure case, since success redirects straight on to Stripe Checkout
+// instead of rendering a page of its own.
+function renderCheckoutErrorPage(message) {
+  return `<!doctype html>
+<html><head><meta charset="utf-8"><title>Checkout Failed</title></head>
+<body style="font-family: sans-serif; text-align: center; padding: 60px 20px;">
+  <h2>❌ Something went wrong</h2>
+  <p>${message}</p>
+</body></html>`;
+}
+
 // DM first; if the player has DMs closed, fall back to posting in #register (tagging them) so the
 // result isn't silently lost. Deliberately separate from discord-dm.js's dmUser, which swallows
 // failures — this needs to know whether the DM actually landed to decide whether to fall back.
@@ -212,10 +228,11 @@ async function notifyEpicLinkResult(client, discordId, guildId, content) {
 function startWebhookServer(client) {
   const stripeEnabled = !!(process.env.STRIPE_SECRET_KEY && process.env.STRIPE_WEBHOOK_SECRET);
   const epicEnabled = epicOAuth.isConfigured();
+  const discordOAuthEnabled = discordOAuth.isConfigured();
   const deployEnabled = !!process.env.DEPLOY_WEBHOOK_SECRET;
 
-  if (!stripeEnabled && !epicEnabled && !deployEnabled) {
-    console.warn('[webhook] Neither Stripe, Epic OAuth, nor deploy webhook env vars are set — webhook server not started.');
+  if (!stripeEnabled && !epicEnabled && !discordOAuthEnabled && !deployEnabled) {
+    console.warn('[webhook] Neither Stripe, Epic OAuth, Discord OAuth, nor deploy webhook env vars are set — webhook server not started.');
     return null;
   }
 
@@ -234,6 +251,9 @@ function startWebhookServer(client) {
   }
   if (!epicEnabled) {
     console.warn('[webhook] EPIC_CLIENT_ID/EPIC_CLIENT_SECRET/EPIC_REDIRECT_URI not set — /epic-callback disabled. Epic linking falls back to Yunite only.');
+  }
+  if (!discordOAuthEnabled) {
+    console.warn('[webhook] CLIENT_ID/DISCORD_CLIENT_SECRET/DISCORD_OAUTH_REDIRECT_URI not set — /premium and /discord-checkout-callback disabled. Website checkout is unavailable; /premium (Discord command) is unaffected.');
   }
   if (!deployEnabled) {
     console.warn('[webhook] DEPLOY_WEBHOOK_SECRET not set — /deploy auto-deploy endpoint disabled.');
@@ -357,6 +377,50 @@ function startWebhookServer(client) {
     });
   }
 
+  if (discordOAuthEnabled) {
+    const VALID_PLANS = ['monthly', 'yearly'];
+
+    // Entry point linked from the website's "Subscribe" buttons — kicks off Discord OAuth so the
+    // callback below can learn who's paying without the website ever needing its own Discord
+    // session/identity of its own.
+    app.get('/premium/:plan', (req, res) => {
+      const { plan } = req.params;
+      if (!VALID_PLANS.includes(plan)) {
+        return res.status(400).send(renderCheckoutErrorPage('Unknown plan. Please go back to the website and try again.'));
+      }
+      res.redirect(discordOAuth.buildAuthUrl(plan));
+    });
+
+    // GET, not POST — this is a browser redirect from Discord's own authorize page, carrying
+    // `code` and `state` (the plan from /premium/:plan above) as query params.
+    app.get('/discord-checkout-callback', async (req, res) => {
+      const { code, state: plan, error: discordError } = req.query;
+
+      if (discordError) {
+        return res.status(400).send(renderCheckoutErrorPage('Discord declined the request.'));
+      }
+      if (!code || !VALID_PLANS.includes(plan)) {
+        return res.status(400).send(renderCheckoutErrorPage('This link is invalid or has expired. Please go back to the website and try again.'));
+      }
+
+      let discordId;
+      try {
+        ({ discordId } = await discordOAuth.exchangeCodeForUser(code));
+      } catch (err) {
+        console.error('[discord-oauth] Token exchange failed:', err.message);
+        return res.status(502).send(renderCheckoutErrorPage('Failed to complete sign-in with Discord. Please try again.'));
+      }
+
+      try {
+        const checkoutUrl = await billing.createCheckoutSession(discordId, plan);
+        res.redirect(checkoutUrl);
+      } catch (err) {
+        console.error(`[discord-oauth] Failed to create Stripe checkout session for Discord ${discordId} (${plan}):`, err.message);
+        res.status(502).send(renderCheckoutErrorPage(escapeHtml(err.message)));
+      }
+    });
+  }
+
   if (deployEnabled) {
     // GitHub signs the raw JSON body with HMAC-SHA256 using the webhook's configured secret, sent
     // as `X-Hub-Signature-256: sha256=<hex>` — same shape as Stripe's signature check above, and
@@ -419,6 +483,7 @@ function startWebhookServer(client) {
     const routes = [
       stripeEnabled && 'POST /stripe/webhook',
       epicEnabled && 'GET /epic-callback',
+      discordOAuthEnabled && 'GET /premium/:plan, GET /discord-checkout-callback',
       deployEnabled && 'POST /deploy',
     ].filter(Boolean);
     console.log(`[webhook] Server listening on port ${port} (${routes.join(', ')})`);
