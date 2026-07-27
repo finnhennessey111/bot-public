@@ -14,10 +14,13 @@
 // player count hits the mode's target size.
 //
 // Reuses creative-queue.js's logPR math and widening schedule (config.creativeWideningSchedule)
-// — no separate PR-widening config for team queue. Compatibility for a candidate unit is judged
-// against the *average* logPR of every player already assembled in the forming match, using the
-// forming match's own age (not any individual player's wait) as the widening-tier clock, since a
-// forming match can have several different join times once it has 2+ units in it.
+// — no separate PR-widening config for team queue. Compatibility (eligibility) for a candidate
+// unit is judged against the *average* logPR of every player already assembled in the forming
+// match, using the forming match's own age (not any individual player's wait) as the
+// widening-tier clock, since a forming match can have several different join times once it has
+// 2+ units in it. Which of several eligible forming matches a unit actually joins is ranked by
+// average matchScore instead (evaluateJoin/queueUnit) — same matchScore-over-logPR ranking switch
+// as creative-queue.js's pairwise matcher, eligibility itself is unaffected.
 //
 // In-memory only (not persisted) — same ephemeral-state precedent as matching.js's
 // pendingMatches and party.js's pendingInvites. A restart loses in-progress forming matches.
@@ -71,6 +74,18 @@ function unitAvgLogPR(unit) {
   return unit.players.reduce((sum, p) => sum + toLogPR(p.totalPR), 0) / unit.players.length;
 }
 
+// matchScore averages — used only for ranking which forming match a new unit should join
+// (evaluateJoin/queueUnit below), never for eligibility. Eligibility stays logPR-gated via
+// groupAvgLogPR/unitAvgLogPR above, unchanged — see creative-queue.js's header comment for why.
+function groupAvgMatchScore(match) {
+  const players = match.units.flatMap(u => u.players);
+  return players.reduce((sum, p) => sum + p.matchScore, 0) / players.length;
+}
+
+function unitAvgMatchScore(unit) {
+  return unit.players.reduce((sum, p) => sum + p.matchScore, 0) / unit.players.length;
+}
+
 function groupPlatforms(match) {
   return new Set(match.units.flatMap(u => u.players.map(p => p.platform)));
 }
@@ -102,12 +117,16 @@ function evaluateJoin(unit, match, now) {
     }
   }
 
-  const diff = Math.abs(groupAvgLogPR(match) - unitAvgLogPR(unit));
-  if (diff > tier.maxLogPRDiff) {
-    return { fits: false, reason: `avg logPR diff ${diff.toFixed(1)} exceeds current cap ${tier.maxLogPRDiff} (waited ${wait.toFixed(0)}s)` };
+  const logPRDiff = Math.abs(groupAvgLogPR(match) - unitAvgLogPR(unit));
+  if (logPRDiff > tier.maxLogPRDiff) {
+    return { fits: false, reason: `avg logPR diff ${logPRDiff.toFixed(1)} exceeds current cap ${tier.maxLogPRDiff} (waited ${wait.toFixed(0)}s)` };
   }
 
-  return { fits: true, reason: null, diff };
+  // Eligibility above is still logPR-gated (unchanged) — ranking among eligible forming matches
+  // uses matchScore instead, same principle as creative-queue.js's pairwise ranking switch. No
+  // equivalent of queue.js's prDistancePenalties here — kept simple, just the raw diff.
+  const scoreDiff = Math.abs(groupAvgMatchScore(match) - unitAvgMatchScore(unit));
+  return { fits: true, reason: null, scoreDiff };
 }
 
 // completingUnit is whichever unit's join/merge pushed the match to full size — its guildId
@@ -143,8 +162,8 @@ function queueUnit(guildId, players, mode, region) {
       console.log(`[creative-team-queue]   cannot join ${match.formingId} (${groupPlayerCount(match)}/${targetSize}): ${result.reason}`);
       continue;
     }
-    if (result.diff < bestDiff) {
-      bestDiff = result.diff;
+    if (result.scoreDiff < bestDiff) {
+      bestDiff = result.scoreDiff;
       bestMatch = match;
     }
   }

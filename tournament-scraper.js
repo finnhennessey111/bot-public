@@ -22,14 +22,21 @@ const MULTI_SESSION_KEYWORDS = [
   'fncs',
 ];
 
-// Narrower than MULTI_SESSION_KEYWORDS' broad 'fncs' match, which would also catch FNCS Majors
-// and the Last Chance Qualifier — this specifically identifies FNCS Divisional Cups, which get a
-// permanent, always-open channel per division+region (channel-manager.js's
+// Tournaments that get a permanent, always-open channel per title+region (channel-manager.js's
 // checkAndCreateChannels/createTournamentChannel) instead of the normal 48hr-window/auto-delete
-// path, since players want to find teammates early to prep. Majors and the Last Chance Qualifier
-// stay on the normal path.
+// path, since players want to find teammates early to prep:
+//   - 'fncs division' — narrower than MULTI_SESSION_KEYWORDS' broad 'fncs' match, which would
+//     also catch FNCS Majors and the Last Chance Qualifier; those stay on the normal path.
+//   - 'console duos victory cup' — a full-phrase match specifically to avoid also catching
+//     "Console Duos ZB Cash Cup", a different (non-permanent) tournament that also starts with
+//     "Console Duos". Not independently verified against a live scrape (this dev environment hits
+//     the same Cloudflare block described in scrapeUpcomingTournaments' doc comment above) — if
+//     the real scraped title differs from this exact phrase, this entry silently never matches
+//     rather than erroring; confirm against production logs (channel-manager.js's
+//     checkAndCreateChannels logs every surviving tournament's raw `name`) after this ships.
 const PERMANENT_KEYWORDS = [
   'fncs division',
+  'console duos victory cup',
 ];
 
 // Regions we support

@@ -22,6 +22,7 @@ const { toLogPR, getCreativeWideningTier } = require('./creative-queue');
 const creativeTeamQueue = require('./creative-team-queue');
 const channelLifecycle = require('./channel-lifecycle');
 const credits = require('./credits');
+const feedback = require('./feedback');
 const { getRoleId } = require('./guild-config');
 const {
   buildCreativeMatchConfirmedEmbed, buildCloseChannelButton, buildVoteKickOpenButtonRow,
@@ -179,6 +180,11 @@ async function startTeamMatch(units, mode, region, completingGuildId, client) {
     removedPlayerIds: new Set(),
     messageIds: { teamMethodVote: new Map(), teamChoice: new Map(), readyCheck: new Map() },
   };
+
+  // Data capture only (feedback.js) — snapshots every player in the match (up to 8 for 6s/8s, not
+  // just 2), regardless of what happens in the lock/ready-check/vote-kick lifecycle afterward.
+  // Never blocks match creation.
+  feedback.recordCreativeMatch({ matchId: matchState.matchId, mode, region, players }).catch(console.error);
 
   const channelClusterForDeletion = [];
 

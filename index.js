@@ -60,6 +60,10 @@ const { startWebhookServer, simulateCheckoutCompleted } = require('./webhook-ser
 const { startAccessScheduler } = require('./notifications');
 const { QUEUE_CHANNEL_CONFIGS, categoryForAnyMode } = require('./creative-channel-configs');
 const db = require('./db');
+const feedback = require('./feedback');
+const {
+  buildFeedbackRatingButtons, buildFeedbackNotGreatReasonButtons, buildRejectReasonButtons,
+} = require('./embeds');
 
 const botStartTime = Date.now();
 
@@ -94,6 +98,22 @@ async function sendQueueStatusMessage(interaction, label, joinedAt, leaveCustomI
     content: `🔍 You are in queue for **${label}** — joined <t:${unixSeconds}:R>`,
     components: [buildLeaveQueueButton(leaveCustomId)],
   });
+}
+
+// Checked on every creative (1v1/2v2/6s/8s) queue join — only ever for the clicking user
+// themselves (`discordId`/interaction.user), never their party: an ephemeral message is only
+// visible to whoever the interaction belongs to, so there's no way to prompt a teammate who
+// didn't click the button. Sent as a separate followUp (not folded into the queue-status
+// editReply above) so it can be dismissed/answered independently.
+async function maybeSendFeedbackPrompt(interaction, discordId, mode) {
+  const matchId = await feedback.getPendingCreativeFeedback(discordId, mode);
+  if (!matchId) return;
+
+  await interaction.followUp({
+    content: `👋 How was your last **${mode}** match?`,
+    components: [buildFeedbackRatingButtons(matchId)],
+    flags: 64,
+  }).catch(err => console.error('Failed to send feedback prompt:', err.message));
 }
 
 // Shared by the /party-invite command and the ➕ Invite to Party button + user-select flow —
@@ -1476,6 +1496,7 @@ async function handleInteraction(interaction) {
         await sendQueueStatusMessage(
           interaction, `${selection.mode} (${selection.region})`, unit.joinedAt, 'creative_leave_queue'
         );
+        await maybeSendFeedbackPrompt(interaction, user.id, selection.mode);
       } catch (err) {
         console.error('Creative queue error:', err);
         await replyAndDismiss(interaction, { content: `❌ Error joining queue: ${err.message}` });
@@ -1593,6 +1614,7 @@ async function handleInteraction(interaction) {
         const needed = targetSize - players.length;
         const teamLabel = `${selection.mode} (${selection.region})` + (needed > 0 ? ` — LF${needed}` : '');
         await sendQueueStatusMessage(interaction, teamLabel, unit.joinedAt, 'team_leave_queue');
+        await maybeSendFeedbackPrompt(interaction, user.id, selection.mode);
       } catch (err) {
         console.error('Team queue error:', err);
         await replyAndDismiss(interaction, { content: `❌ Error joining queue: ${err.message}` });
@@ -1722,8 +1744,86 @@ async function handleInteraction(interaction) {
           result.channelsByGuildId,
           '❌ Match declined — both units have been re-queued. This channel will close shortly.'
         );
+
+        // Data capture only (feedback.js), tournament rejects specifically — creative rejects
+        // don't get this prompt, they instead get the post-hoc great/okay/not-great rating the
+        // next time the rejecting player queues for that mode (see notifyCreativeMatchFound).
+        // Never blocks the reject flow itself.
+        if (result.kind === 'tournament') {
+          const snapshotPlayers = [...result.unitA.members, ...result.unitB.members];
+          feedback.recordTournamentReject({
+            matchId, mode: result.tournamentName, region: result.region, players: snapshotPlayers,
+          }).catch(console.error);
+
+          return interaction.editReply({
+            content: '❌ Match declined. You have been re-queued automatically.\n\nMind telling us why? (optional)',
+            components: [buildRejectReasonButtons(matchId)],
+          });
+        }
+
         return interaction.editReply({ content: '❌ Match declined. You have been re-queued automatically.' });
       }
+    }
+
+    // ── REJECT REASON (data capture only — feedback.js) ──────────────────────
+    if (customId.startsWith('rejectreason_pr_') || customId.startsWith('rejectreason_placements_') || customId.startsWith('rejectreason_other_')) {
+      let reasonLabel, matchId;
+      if (customId.startsWith('rejectreason_pr_')) {
+        reasonLabel = 'PR felt mismatched';
+        matchId = customId.replace('rejectreason_pr_', '');
+      } else if (customId.startsWith('rejectreason_placements_')) {
+        reasonLabel = 'Recent placements didn\'t match up';
+        matchId = customId.replace('rejectreason_placements_', '');
+      } else {
+        reasonLabel = 'Not interested / other';
+        matchId = customId.replace('rejectreason_other_', '');
+      }
+
+      feedback.submitTournamentRejectReason(matchId, user.id, reasonLabel).catch(console.error);
+      await interaction.update({ content: '🙏 Thanks for the feedback!', components: [] });
+    }
+
+    // ── CREATIVE MATCH FEEDBACK — rating (data capture only — feedback.js) ───
+    if (customId.startsWith('feedback_great_') || customId.startsWith('feedback_okay_') || customId.startsWith('feedback_notgreat_')) {
+      if (customId.startsWith('feedback_notgreat_')) {
+        const matchId = customId.replace('feedback_notgreat_', '');
+        // Not recorded yet — wait for the specific reason below, so this player ends up with
+        // exactly one feedback entry per match instead of a rating-only one that a reason
+        // click would then need to find-and-update.
+        await interaction.update({
+          content: 'Sorry to hear that — what went wrong?',
+          components: [buildFeedbackNotGreatReasonButtons(matchId)],
+        });
+      } else {
+        const rating = customId.startsWith('feedback_great_') ? 'great' : 'okay';
+        const matchId = customId.replace(`feedback_${rating}_`, '');
+        feedback.submitCreativeRating(matchId, user.id, rating).catch(console.error);
+        await interaction.update({ content: '🙏 Thanks for the feedback!', components: [] });
+      }
+    }
+
+    // ── CREATIVE MATCH FEEDBACK — not-great reason (data capture only) ───────
+    if (
+      customId.startsWith('feedback_reason_tooeasy_') || customId.startsWith('feedback_reason_toohard_')
+      || customId.startsWith('feedback_reason_comms_') || customId.startsWith('feedback_reason_other_')
+    ) {
+      let reasonLabel, matchId;
+      if (customId.startsWith('feedback_reason_tooeasy_')) {
+        reasonLabel = 'Too easy';
+        matchId = customId.replace('feedback_reason_tooeasy_', '');
+      } else if (customId.startsWith('feedback_reason_toohard_')) {
+        reasonLabel = 'Too hard';
+        matchId = customId.replace('feedback_reason_toohard_', '');
+      } else if (customId.startsWith('feedback_reason_comms_')) {
+        reasonLabel = 'Bad communication';
+        matchId = customId.replace('feedback_reason_comms_', '');
+      } else {
+        reasonLabel = 'Other';
+        matchId = customId.replace('feedback_reason_other_', '');
+      }
+
+      feedback.submitCreativeNotGreatReason(matchId, user.id, reasonLabel).catch(console.error);
+      await interaction.update({ content: '🙏 Thanks for the feedback!', components: [] });
     }
 
     // ── CHECK MY ACCESS ──────────────────────────────────────────────────────
@@ -1909,6 +2009,10 @@ async function notifyCreativeMatchFound(unitA, unitB, mode, region, client) {
   });
   const allPlayers = [...unitA.members, ...unitB.members];
   await createMatchChannelsForMatch(matchId, allPlayers, { client, kind: 'creative', label: mode });
+
+  // Data capture only (feedback.js) — snapshotted here regardless of whether this proposal is
+  // later accepted or rejected/expires, per "whenever a match forms." Never blocks match creation.
+  feedback.recordCreativeMatch({ matchId, mode, region, players: allPlayers }).catch(console.error);
 
   const category = categoryForAnyMode(mode);
   if (category) {

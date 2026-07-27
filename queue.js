@@ -24,7 +24,7 @@
 // and survives a bot restart with no extra state to reconstruct.
 
 const { EventEmitter } = require('events');
-const { calculateMatchScore } = require('./scraper');
+const { computeMatchScoreBreakdown } = require('./scraper');
 const { queues, save } = require('./store');
 const config = require('./config');
 const playerStore = require('./players');
@@ -247,7 +247,7 @@ async function buildPlayer({
   bio,
 }) {
   const playerData = await playerStore.getPlayerStats(guildId, discordId, epicUsername, epicId, homeRegion);
-  const matchScore = calculateMatchScore(playerData, tournamentName, homeRegion, queueRegion);
+  const { matchScore, soloModifier } = computeMatchScoreBreakdown(playerData, tournamentName, homeRegion, queueRegion);
 
   return {
     guildId,
@@ -270,6 +270,10 @@ async function buildPlayer({
     totalPR: playerData.totalPR,
     thisSeasonPR: playerData.thisSeasonPR,
     matchScore,
+    // Snapshotted here (not just the final matchScore) so feedback.js can persist the exact
+    // scoring inputs at match time without re-deriving them later — see scraper.js's
+    // computeMatchScoreBreakdown doc comment.
+    soloModifier,
     recentEvents: playerData.recentEvents,
     joinedAt: new Date(),
   };

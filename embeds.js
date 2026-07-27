@@ -43,9 +43,11 @@ function formatDuration(ms) {
 
 // beginTime/endTime are only known for scheduler-created tournament channels — when omitted
 // (e.g. the manual /setup-tournament command has no scraped schedule) the embed falls back to
-// its plain, timer-less appearance. isPermanent (FNCS Divisional Cups — see tournament-scraper.js's
-// PERMANENT_KEYWORDS) always wins over beginTime/endTime — a channel that never auto-deletes has
-// no countdown/"in progress"/"ending soon" state that makes sense to show.
+// its plain, timer-less appearance. isPermanent (FNCS Divisional Cups, Console Duos Victory Cup —
+// see tournament-scraper.js's PERMANENT_KEYWORDS) always wins over the countdown/"in
+// progress"/"ending soon" states below — a channel that never auto-deletes has no "ending" state
+// that makes sense to show — but still uses beginTime for an informational "Next event" line, if
+// one is known and still in the future (channel-manager.js keeps this fresh every hourly tick).
 function buildTournamentEmbed(tournamentName, region, queueCount, isTrios = false, beginTime = null, endTime = null, isPermanent = false) {
   let color = COLOR_DEFAULT;
   let statusText = null;
@@ -53,6 +55,11 @@ function buildTournamentEmbed(tournamentName, region, queueCount, isTrios = fals
   if (isPermanent) {
     color = COLOR_UPCOMING;
     statusText = '🟢 Ongoing — queue anytime';
+
+    const nextStartMs = beginTime ? new Date(beginTime).getTime() : null;
+    if (nextStartMs && nextStartMs > Date.now()) {
+      statusText += `\nNext event: <t:${Math.floor(nextStartMs / 1000)}:R>`;
+    }
   } else if (beginTime) {
     const now = Date.now();
     const startMs = new Date(beginTime).getTime();
@@ -638,6 +645,68 @@ function buildVoteKickButtons(voteId) {
   );
 }
 
+// ── MATCH FEEDBACK (data capture only — see feedback.js) ────────────────────
+// matchId is embedded in every customId here (not looked up by channel, unlike vote-kick) since
+// the feedback prompt is a standalone ephemeral message with no channel of its own to key off.
+
+function buildFeedbackRatingButtons(matchId) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`feedback_great_${matchId}`)
+      .setLabel('Great match')
+      .setStyle(ButtonStyle.Success)
+      .setEmoji('👍'),
+    new ButtonBuilder()
+      .setCustomId(`feedback_okay_${matchId}`)
+      .setLabel('Okay')
+      .setStyle(ButtonStyle.Secondary)
+      .setEmoji('😐'),
+    new ButtonBuilder()
+      .setCustomId(`feedback_notgreat_${matchId}`)
+      .setLabel('Not great')
+      .setStyle(ButtonStyle.Danger)
+      .setEmoji('👎'),
+  );
+}
+
+function buildFeedbackNotGreatReasonButtons(matchId) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`feedback_reason_tooeasy_${matchId}`)
+      .setLabel('Too easy')
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(`feedback_reason_toohard_${matchId}`)
+      .setLabel('Too hard')
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(`feedback_reason_comms_${matchId}`)
+      .setLabel('Bad communication')
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(`feedback_reason_other_${matchId}`)
+      .setLabel('Other')
+      .setStyle(ButtonStyle.Secondary),
+  );
+}
+
+function buildRejectReasonButtons(matchId) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`rejectreason_pr_${matchId}`)
+      .setLabel('PR felt mismatched')
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(`rejectreason_placements_${matchId}`)
+      .setLabel('Recent placements didn\'t match up')
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(`rejectreason_other_${matchId}`)
+      .setLabel('Not interested / other')
+      .setStyle(ButtonStyle.Secondary),
+  );
+}
+
 // ── HOWTO ──────────────────────────────────────────────────────────────────
 
 function buildHowtoEmbed() {
@@ -1207,6 +1276,9 @@ module.exports = {
   buildTeamsAnnouncementEmbed,
   buildVoteKickEmbed,
   buildVoteKickButtons,
+  buildFeedbackRatingButtons,
+  buildFeedbackNotGreatReasonButtons,
+  buildRejectReasonButtons,
   buildHowtoEmbed,
   buildSetupInstructionsEmbed,
   buildRolesEmbed,

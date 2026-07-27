@@ -113,7 +113,14 @@ function getPlacementScore(placement) {
 // This exclusion is specific to soloModifier's use of results as a GENERAL skill signal — it
 // does NOT apply to ownTournamentModifier below, where self-referential history for the exact
 // same tournament (even if that tournament is a ranked cup) is always a fair signal.
-function calculateMatchScore(playerData, tournamentName, homeRegion, queueRegion) {
+//
+// Returns the individual modifiers alongside the final matchScore — used by queue.js's
+// buildPlayer and creative-queue.js's buildCreativePlayer, both of which stamp soloModifier (not
+// just the final score) onto the built player object so feedback.js can snapshot it verbatim at
+// match time rather than re-deriving it later from a possibly-since-changed recentEvents history.
+// calculateMatchScore below is unchanged for every existing caller — just now implemented in
+// terms of this.
+function computeMatchScoreBreakdown(playerData, tournamentName, homeRegion, queueRegion) {
   const base = (playerData.totalPR * 10) + (playerData.thisSeasonPR * 5);
 
   const ownTournamentEvents = playerData.recentEvents
@@ -139,7 +146,13 @@ function calculateMatchScore(playerData, tournamentName, homeRegion, queueRegion
     ? (config.regionPenalties[homeRegion]?.[queueRegion] ?? 0)
     : 0;
 
-  return Math.round(base * (1 + soloModifier + ownTournamentModifier - regionPenalty));
+  const matchScore = Math.round(base * (1 + soloModifier + ownTournamentModifier - regionPenalty));
+
+  return { matchScore, base, ownTournamentModifier, soloModifier, regionPenalty };
 }
 
-module.exports = { scrapePlayer, calculateMatchScore };
+function calculateMatchScore(playerData, tournamentName, homeRegion, queueRegion) {
+  return computeMatchScoreBreakdown(playerData, tournamentName, homeRegion, queueRegion).matchScore;
+}
+
+module.exports = { scrapePlayer, calculateMatchScore, computeMatchScoreBreakdown };

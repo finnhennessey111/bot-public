@@ -17,12 +17,15 @@
 //     players with huge totals.
 //   - Platform restriction is tied to the same tiers as the logPR band: same-platform-only
 //     while the band is tight, opening to any platform once it widens.
-// Ranking among eligible candidates is just closest logPR — no match-score weighting.
+// Ranking among already-eligible candidates uses matchScore (scraper.js's calculateMatchScore,
+// same formula tournaments use — see buildCreativePlayer), not logPR — logPR stays the
+// eligibility gate, matchScore just decides which eligible candidate is the closest match.
 
 const { EventEmitter } = require('events');
 const { creativeQueues, save } = require('./store');
 const config = require('./config');
 const playerStore = require('./players');
+const { computeMatchScoreBreakdown } = require('./scraper');
 
 const MODES = {
   '1v1': ['1v1 Realistics', '1v1 Zone Wars'],
@@ -90,8 +93,15 @@ function getCreativeWideningTier(waitSeconds) {
   return tier;
 }
 
-function rankingDiff(unitA, unitB) {
+// Eligibility-gating distance — unchanged by the matchScore ranking switch below.
+function logPRDistance(unitA, unitB) {
   return Math.abs(toLogPR(unitA.totalPR) - toLogPR(unitB.totalPR));
+}
+
+// Ranking-only distance, used to pick the closest among already-eligible candidates. No
+// equivalent of queue.js's prDistancePenalties here — kept simple, just the raw diff.
+function scoreDistance(unitA, unitB) {
+  return Math.abs(unitA.matchScore - unitB.matchScore);
 }
 
 // Single source of truth for both the matching decision and its debug explanation, so the
@@ -102,7 +112,7 @@ function evaluateMatch(unitA, unitB, now) {
   const waitB = (now - new Date(unitB.joinedAt).getTime()) / 1000;
   const stricterWait = Math.min(waitA, waitB);
   const tier = getCreativeWideningTier(stricterWait);
-  const logPRDiff = rankingDiff(unitA, unitB);
+  const logPRDiff = logPRDistance(unitA, unitB);
 
   if (tier.samePlatformOnly && unitA.members[0].platform !== unitB.members[0].platform) {
     return {
@@ -122,7 +132,7 @@ function evaluateMatch(unitA, unitB, now) {
     };
   }
 
-  return { eligible: true, logPRDiff, reason: null };
+  return { eligible: true, logPRDiff, scoreDiff: scoreDistance(unitA, unitB), reason: null };
 }
 
 function describeUnit(unit) {
@@ -143,7 +153,7 @@ function attemptMatchingForQueue(mode, region) {
     const wait = (now - new Date(unit.joinedAt).getTime()) / 1000;
     console.log(
       `[creative-queue]   waiting: ${describeUnit(unit)} totalPR=${unit.totalPR} `
-      + `logPR=${toLogPR(unit.totalPR).toFixed(1)} platform=${unit.members[0].platform} waited=${wait.toFixed(0)}s`
+      + `logPR=${toLogPR(unit.totalPR).toFixed(1)} matchScore=${unit.matchScore} platform=${unit.members[0].platform} waited=${wait.toFixed(0)}s`
     );
   }
 
@@ -167,8 +177,8 @@ function attemptMatchingForQueue(mode, region) {
           continue;
         }
 
-        if (result.logPRDiff < bestDiff) {
-          bestDiff = result.logPRDiff;
+        if (result.scoreDiff < bestDiff) {
+          bestDiff = result.scoreDiff;
           bestJ = j;
         }
       }
@@ -176,7 +186,7 @@ function attemptMatchingForQueue(mode, region) {
       if (bestJ !== -1) {
         const unitA = pool[i];
         const unitB = pool[bestJ];
-        console.log(`[creative-queue] MATCH: ${describeUnit(unitA)} <-> ${describeUnit(unitB)} (logPR diff ${bestDiff.toFixed(1)})`);
+        console.log(`[creative-queue] MATCH: ${describeUnit(unitA)} <-> ${describeUnit(unitB)} (matchScore diff ${bestDiff.toFixed(1)}, logPR diff ${logPRDistance(unitA, unitB).toFixed(1)})`);
         pool.splice(Math.max(i, bestJ), 1);
         pool.splice(Math.min(i, bestJ), 1);
         save(unitA.guildId);
@@ -203,7 +213,19 @@ function startCreativeMatchSweep() {
 }
 
 async function buildCreativePlayer({ guildId, guildName, discordId, discordUsername, discordTag, epicUsername, epicId, mode, region, platform }) {
-  const { totalPR } = await playerStore.getPlayerStats(guildId, discordId, epicUsername, epicId, region);
+  const playerData = await playerStore.getPlayerStats(guildId, discordId, epicUsername, epicId, region);
+
+  // homeRegion (the player's registered region) vs region (the region they're queueing this
+  // creative match in) — same distinction queue.js's buildPlayer draws for tournaments, needed
+  // so calculateMatchScore's cross-region penalty applies here too, not just in tournaments.
+  const registered = await playerStore.getPlayer(guildId, discordId);
+  const homeRegion = registered?.region ?? region;
+
+  // tournamentName is deliberately the creative mode string (e.g. "1v1 Realistics"), not a real
+  // scraped tournament — no scraped event will ever have this name, so ownTournamentModifier
+  // correctly comes out to 0 with no special-casing needed. The solo-cup performance modifier and
+  // season-PR weighting still apply normally, since neither depends on tournamentName.
+  const { matchScore, soloModifier } = computeMatchScoreBreakdown(playerData, mode, homeRegion, region);
 
   return {
     guildId,
@@ -216,7 +238,13 @@ async function buildCreativePlayer({ guildId, guildName, discordId, discordUsern
     mode,
     region,
     platform: platform ?? 'PC',
-    totalPR,
+    totalPR: playerData.totalPR,
+    thisSeasonPR: playerData.thisSeasonPR,
+    matchScore,
+    // Snapshotted here (not just the final matchScore) so feedback.js can persist the exact
+    // scoring inputs at match time without re-deriving them later — see scraper.js's
+    // computeMatchScoreBreakdown doc comment.
+    soloModifier,
     joinedAt: new Date(),
   };
 }
@@ -229,6 +257,7 @@ function joinCreativeQueue({ guildId, player, mode, region }) {
     mode,
     region,
     totalPR: player.totalPR,
+    matchScore: player.matchScore,
     joinedAt: new Date(),
   };
 

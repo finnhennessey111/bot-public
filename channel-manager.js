@@ -106,6 +106,19 @@ function isPerDayTournament(name) {
   return PER_DAY_KEYWORDS.some(k => name.toLowerCase().includes(k));
 }
 
+// Permanent tournament channels are never recreated or deleted, so their stored beginTime would
+// otherwise freeze at creation time — called every hourly tick (even when createTournamentChannel
+// is otherwise a no-op because the channel already exists) so the embed's "Next event" countdown
+// (buildTournamentEmbed's isPermanent branch) stays accurate as occurrences pass, using the
+// latest scrape's earliest-future-occurrence beginTime for this tournament+region.
+function refreshPermanentBeginTime(channelId, latestBeginTime, pinnedMessages, guildId) {
+  const pinned = pinnedMessages[channelId];
+  if (!pinned || pinned.beginTime === latestBeginTime) return;
+  pinned.beginTime = latestBeginTime;
+  saveStore(guildId);
+  console.log(`  🔄 Refreshed next-event beginTime for permanent channel ${channelId} (${pinned.tournamentName}): ${latestBeginTime}`);
+}
+
 async function createTournamentChannel(guild, tournament, pinnedMessages) {
   const { name, region, beginTime, lastBeginTime, isTrios, consoleOnly, isPermanent } = tournament;
 
@@ -128,6 +141,7 @@ async function createTournamentChannel(guild, tournament, pinnedMessages) {
   const existing = guild.channels.cache.find(c => c.name === channelName && c.parentId === (categoryId ?? null));
   if (existing) {
     console.log(`  ⏭️ Skipped — channel already exists in this region's category: ${channelName}`);
+    if (isPermanent) refreshPermanentBeginTime(existing.id, beginTime, pinnedMessages, guild.id);
     return;
   }
 

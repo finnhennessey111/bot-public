@@ -99,6 +99,10 @@ function rejectMatch(matchId, discordId) {
   return {
     status: 'rejected', rejector, others, unitA: match.unitA, unitB: match.unitB,
     channelsByGuildId: match.channelsByGuildId,
+    // kind/tournamentName/region: lets a caller distinguish a tournament reject from a creative
+    // one (feedback.js's reject-reason capture is tournament-only — see index.js's reject_
+    // handler) without needing to separately track the pending match's shape itself.
+    kind: match.kind, tournamentName: match.tournamentName, region: match.region,
   };
 }
 
