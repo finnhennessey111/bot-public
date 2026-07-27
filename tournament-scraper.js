@@ -93,12 +93,14 @@ async function scrapeUpcomingTournaments() {
 
   console.log(`📡 Scraper fetched ${rawCalendar.length} raw calendar entries`);
 
-  // Group by name + region to handle multi-session tournaments
-  // groups[name-region] = { ...tournament, allBeginTimes: [] }
-  const groups = {};
+  // Stage 1: flatten every entry/window/region combination into one raw session record each,
+  // applying only the blocked-keyword filter (title-only, doesn't depend on timing). Deliberately
+  // NOT yet filtering past sessions or unsupported regions — Stage 2's same-day collapse needs to
+  // see a day's full raw session set, including an already-past session, to correctly identify
+  // and discard that day's later duplicate regardless of whether the earlier one is itself still
+  // upcoming (see Stage 2's comment for why this ordering matters).
   let blockedCount = 0;
-  let pastCount = 0;
-  let unsupportedRegionCount = 0;
+  const rawSessions = [];
 
   for (const entry of rawCalendar) {
     const title = entry.customData?.title?.trim() ?? '';
@@ -118,50 +120,97 @@ async function scrapeUpcomingTournaments() {
     for (const window of windows) {
       const regions = window.regions ?? [];
       const platforms = window.platformGroups ?? [];
-      const beginTime = new Date(window.beginTime);
-      const now = new Date();
-
-      // Skip past tournaments
-      if (beginTime < now) {
-        pastCount++;
-        continue;
-      }
 
       for (const region of regions) {
-        if (!SUPPORTED_REGIONS.includes(region)) {
-          unsupportedRegionCount++;
-          continue;
-        }
-
-        const key = `${title}-${region}`;
-        const consoleOnly = platforms.length === 1 && platforms[0] === 'Console';
-        const isTrios = titleLower.includes('trio');
-        const isMultiSession = MULTI_SESSION_KEYWORDS.some(k => titleLower.includes(k));
-        const isPermanent = PERMANENT_KEYWORDS.some(k => titleLower.includes(k));
-
-        if (!groups[key]) {
-          groups[key] = {
-            name: title,
-            region,
-            beginTime: window.beginTime,
-            lastBeginTime: window.beginTime,
-            consoleOnly,
-            isTrios,
-            isMultiSession,
-            isPermanent,
-            platforms,
-          };
-        } else {
-          // Track earliest start time (for channel creation)
-          if (beginTime < new Date(groups[key].beginTime)) {
-            groups[key].beginTime = window.beginTime;
-          }
-          // Track latest start time (for deletion of multi-session tournaments)
-          if (beginTime > new Date(groups[key].lastBeginTime)) {
-            groups[key].lastBeginTime = window.beginTime;
-          }
-        }
+        rawSessions.push({
+          key: `${title}-${region}`,
+          name: title,
+          titleLower,
+          region,
+          beginTime: window.beginTime,
+          consoleOnly: platforms.length === 1 && platforms[0] === 'Console',
+          platforms,
+        });
       }
+    }
+  }
+
+  // Stage 2: collapse same-title+region raw sessions that fall on the same UTC calendar day down
+  // to just the earliest. This is specifically for "Fortnite Performance Evaluation", which
+  // scrapes as two same-day sessions under the identical title+region each week: an earlier
+  // "Opens" session and a later "Finals" session the same day — confirmed only by each week's
+  // pair sharing a calendar day, NOT by any distinguishing text. This dev environment can't reach
+  // fortnitetracker.com to inspect the raw JSON directly (same Cloudflare block that got the VPS's
+  // IP flagged — confirmed again just now, still a 403), so this could not be verified against a
+  // live raw window/entry object; day-only is the sole signal implemented here. If a raw label
+  // field turns out to exist, add an explicit check for it on top of this — but don't remove this
+  // day-based collapse, since it's what actually guarantees Finals is discarded even once Opens
+  // has already started (see below).
+  //
+  // Ordering matters: this runs BEFORE the past-time filter (Stage 3), using every raw session
+  // including already-past ones — so once Opens has started (and would itself get filtered out as
+  // "past"), Finals still never surfaces as a fallback "earliest upcoming session for this key".
+  // Discarded sessions never touch beginTime, lastBeginTime, or isMultiSession detection for
+  // anything. Days with only one raw session (the overwhelming majority) are unaffected, and a
+  // genuinely multi-day tournament (FNCS's Fri/Sat/Sun) keeps every day's session since each falls
+  // on a different calendar day.
+  const earliestPerDay = new Map(); // `${key}|${utcDayKey}` -> rawSession
+
+  for (const session of rawSessions) {
+    const dayKey = new Date(session.beginTime).toISOString().slice(0, 10);
+    const dedupeKey = `${session.key}|${dayKey}`;
+    const existing = earliestPerDay.get(dedupeKey);
+    if (!existing || new Date(session.beginTime) < new Date(existing.beginTime)) {
+      earliestPerDay.set(dedupeKey, session);
+    }
+  }
+  const sameDayDuplicatesDropped = rawSessions.length - earliestPerDay.size;
+  if (sameDayDuplicatesDropped > 0) {
+    console.log(`📅 Collapsed ${sameDayDuplicatesDropped} same-day duplicate session(s) to their earliest occurrence (e.g. Performance Evaluation's Opens/Finals pairing)`);
+  }
+
+  // Stage 3: apply the past-time and unsupported-region filters to the already-deduplicated
+  // survivors, then fold what's left into one group per title+region — same aggregation as
+  // before (beginTime = earliest surviving session, lastBeginTime = latest).
+  let pastCount = 0;
+  let unsupportedRegionCount = 0;
+  const now = new Date();
+  const groups = {};
+
+  for (const session of earliestPerDay.values()) {
+    if (!SUPPORTED_REGIONS.includes(session.region)) {
+      unsupportedRegionCount++;
+      continue;
+    }
+
+    const beginTime = new Date(session.beginTime);
+    if (beginTime < now) {
+      pastCount++;
+      continue;
+    }
+
+    const isTrios = session.titleLower.includes('trio');
+    const isMultiSession = MULTI_SESSION_KEYWORDS.some(k => session.titleLower.includes(k));
+    const isPermanent = PERMANENT_KEYWORDS.some(k => session.titleLower.includes(k));
+
+    if (!groups[session.key]) {
+      groups[session.key] = {
+        name: session.name,
+        region: session.region,
+        beginTime: session.beginTime,
+        lastBeginTime: session.beginTime,
+        consoleOnly: session.consoleOnly,
+        isTrios,
+        isMultiSession,
+        isPermanent,
+        platforms: session.platforms,
+      };
+    } else {
+      const g = groups[session.key];
+      // Track earliest start time (for channel creation)
+      if (beginTime < new Date(g.beginTime)) g.beginTime = session.beginTime;
+      // Track latest start time (for deletion of multi-session tournaments)
+      if (beginTime > new Date(g.lastBeginTime)) g.lastBeginTime = session.beginTime;
     }
   }
 
