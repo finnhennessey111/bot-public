@@ -76,9 +76,53 @@ async function seedLegacyGuildFromEnv() {
   console.log(`[GuildConfig] Seeded legacy guild ${guildId} config from environment variables.`);
 }
 
-// Startup reconciliation: hydrate every known Guild doc, then make sure every guild the bot is
-// currently in (including ones joined while the bot was offline) has at least a bare doc — no
-// DM here, that's handleNewGuild's job exclusively.
+// Fields introduced by past code changes that an existing guild's stored config simply won't
+// have, since config isn't retroactively updated just because the code changed — without this, a
+// guild set up before the field existed is stuck logging a warning (e.g. permissions.js's "no
+// verified role configured") forever, until an admin notices and manually re-runs
+// /matchmaker-setup. Each entry here detects the gap and fills it in exactly the way
+// /matchmaker-setup itself would (matchmaker-setup.js's ROLE_SPECS 'verified' entry: create if
+// missing, name "MatchMaker Verified"), so runGuildConfigMigrations below can just walk the list.
+// Add future backfills here as new fields get introduced.
+const GUILD_CONFIG_MIGRATIONS = [
+  {
+    name: 'roleIds.verified',
+    isMissing: (config) => !config.roleIds?.verified,
+    apply: async (guild) => {
+      const role = await guild.roles.create({ name: 'MatchMaker Verified' });
+      await setGuildConfig(guild.id, { roleIds: { verified: role.id } });
+      return `created role "MatchMaker Verified" (${role.id})`;
+    },
+  },
+];
+
+// Startup self-heal: for every guild the bot is currently in, check each known migration against
+// that guild's (already-hydrated) config and backfill it live if missing. Re-reads config between
+// migrations (not one snapshot for the whole guild) so an earlier migration in this same pass is
+// visible to a later one's isMissing check, in case a future migration ever depends on one before
+// it. Must run after cache hydration above and before enforcePermissions (index.js's ready
+// handler already orders it that way) so a freshly-created role is applied on this same startup,
+// not just persisted for next time.
+async function runGuildConfigMigrations(client) {
+  for (const guild of client.guilds.cache.values()) {
+    for (const migration of GUILD_CONFIG_MIGRATIONS) {
+      const config = getGuildConfig(guild.id);
+      if (!migration.isMissing(config)) continue;
+
+      try {
+        const detail = await migration.apply(guild, config);
+        console.log(`[GuildConfig] 🩹 Auto-migrated guild ${guild.id} (${guild.name}) — ${migration.name}: ${detail}`);
+      } catch (err) {
+        console.error(`[GuildConfig] ⚠️ Failed to auto-migrate guild ${guild.id} (${guild.name}) for ${migration.name}:`, err.message);
+      }
+    }
+  }
+}
+
+// Startup reconciliation: hydrate every known Guild doc, make sure every guild the bot is
+// currently in (including ones joined while the bot was offline) has at least a bare doc, then
+// self-heal any known-missing config fields on every already-configured guild — no DM anywhere
+// in this function, that's handleNewGuild's job exclusively.
 async function init(client) {
   const docs = await GuildModel.find({}).lean();
   for (const doc of docs) cache[doc.guildId] = toCacheEntry(doc);
@@ -88,6 +132,7 @@ async function init(client) {
   }
 
   await seedLegacyGuildFromEnv();
+  await runGuildConfigMigrations(client);
   console.log(`[GuildConfig] Loaded config for ${Object.keys(cache).length} guild(s).`);
 }
 

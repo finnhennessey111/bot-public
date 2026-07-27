@@ -27,6 +27,7 @@ const { enforcePermissions } = require('./permissions');
 const guildConfig = require('./guild-config');
 const { getRoleId, getChannelId } = guildConfig;
 const { runMatchmakerSetup } = require('./matchmaker-setup');
+const { registerCommands } = require('./register-commands');
 const {
   buildTournamentEmbed, buildQueueButtons, buildLeaveQueueButton,
   buildMatchConfirmedEmbed,
@@ -439,6 +440,13 @@ const client = new Client({
 
 client.once('clientReady', async () => {
   console.log(`✅ MatchMaker bot is online as ${client.user.tag}`);
+
+  // Registration used to be a manual `node register-commands.js` step someone had to remember to
+  // run after adding/changing a command — now it happens on every boot instead. Discord's PUT
+  // applicationCommands endpoint is idempotent (just overwrites the current command set), so this
+  // is safe to call unconditionally on every startup; a failure here is logged but doesn't stop
+  // the bot from coming up (existing registered commands stay as they were).
+  await registerCommands().catch(err => console.error('❌ Failed to auto-register slash commands on startup:', err.message));
 
   // client.guilds.cache is only reliably populated once the ready sequence completes, so
   // guild-config's per-guild backfill/hydration has to happen here, not before login.

@@ -118,17 +118,25 @@ const commands = [
 
 ].map(c => c.toJSON());
 
-const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
+// Discord's PUT applicationCommands endpoint is idempotent — it just overwrites the app's entire
+// command set with `commands`, so this is safe to call on every bot startup (index.js's ready
+// handler does exactly that) as well as standalone via `node register-commands.js` below. No diffing
+// needed: an unchanged command set PUT again is a harmless no-op from Discord's side.
+async function registerCommands() {
+  const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
+  console.log('Registering slash commands...');
+  await rest.put(
+    Routes.applicationCommands(process.env.CLIENT_ID),
+    { body: commands }
+  );
+  console.log(`✅ Slash commands registered! (${commands.length} commands)`);
+}
 
-(async () => {
-  try {
-    console.log('Registering slash commands...');
-    await rest.put(
-      Routes.applicationCommands(process.env.CLIENT_ID),
-      { body: commands }
-    );
-    console.log('✅ Slash commands registered!');
-  } catch (err) {
+module.exports = { registerCommands };
+
+if (require.main === module) {
+  registerCommands().catch(err => {
     console.error('❌ Error:', err);
-  }
-})();
+    process.exitCode = 1;
+  });
+}
