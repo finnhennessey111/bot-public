@@ -33,6 +33,39 @@ function scheduleAfter(delayMs, callback) {
   return setTimeout(callback, Math.max(delayMs, 0));
 }
 
+// Actually deletes a managed tournament channel and cleans up its tracking state — shared by
+// armDeletionTimer's normal timer-fired path below and updateActiveTournamentEmbeds' safety-net
+// path, which differ only in *when* they run (a scheduled timer vs. catching an already-overdue
+// deleteAt synchronously during an embed-refresh pass) and how they log it, so a reader can tell
+// from the logs alone which path actually deleted a given channel.
+async function deleteManagedChannel(guild, channelId, pinned, pinnedMessages, viaSafetyNet = false) {
+  const label = `${pinned.tournamentName} (${pinned.region})`;
+
+  try {
+    const channel = await guild.channels.fetch(channelId).catch(() => null);
+    if (channel) {
+      await channel.delete();
+      console.log(viaSafetyNet
+        ? `  🧹 Safety net: deleted overdue channel ${channel.name} (${label}) — no timer had been armed for it`
+        : `🗑️ Deleted channel: ${channel.name}`);
+    } else {
+      console.log(viaSafetyNet
+        ? `  🧹 Safety net: channel ${channelId} (${label}) already gone — nothing to delete`
+        : `  ⏭️ Channel ${channelId} (${label}) already gone — nothing to delete`);
+    }
+  } catch (err) {
+    // If this keeps failing (rather than the "channel already gone" case above), check the bot's
+    // permissions in this guild — deleting a channel needs Manage Channels, and a guild where the
+    // bot was only ever granted enough to create channels (not delete them) would fail here every
+    // single time, which looks identical to "the channel is stuck" from the outside.
+    console.error(`${viaSafetyNet ? 'Safety-net delete' : 'Failed to delete channel'} ${channelId} (${label}):`, err.message);
+  } finally {
+    delete managedChannels[channelId];
+    delete pinnedMessages[channelId];
+    saveStore(guild.id);
+  }
+}
+
 // Arms (or re-arms) a channel's auto-deletion timer from a persisted deleteAt timestamp.
 // Used both right after creating a channel and to recover timers that never got armed in this
 // process — e.g. after a bot restart (managedChannels is in-memory only, unlike pinnedMessages),
@@ -43,23 +76,7 @@ function armDeletionTimer(guild, channelId, pinned, pinnedMessages) {
   const msUntilDelete = pinned.deleteAt - Date.now();
   const label = `${pinned.tournamentName} (${pinned.region})`;
 
-  const timer = scheduleAfter(msUntilDelete, async () => {
-    try {
-      const channel = await guild.channels.fetch(channelId).catch(() => null);
-      if (channel) {
-        await channel.delete();
-        console.log(`🗑️ Deleted channel: ${channel.name}`);
-      } else {
-        console.log(`  ⏭️ Channel ${channelId} (${label}) already gone — nothing to delete`);
-      }
-    } catch (err) {
-      console.error(`Failed to delete channel ${channelId} (${label}):`, err.message);
-    } finally {
-      delete managedChannels[channelId];
-      delete pinnedMessages[channelId];
-      saveStore(guild.id);
-    }
-  });
+  const timer = scheduleAfter(msUntilDelete, () => deleteManagedChannel(guild, channelId, pinned, pinnedMessages, false));
 
   managedChannels[channelId] = { tournamentName: pinned.tournamentName, region: pinned.region, beginTime: pinned.beginTime, deleteTimer: timer };
   const hrsUntil = (Math.max(msUntilDelete, 0) / 3600000).toFixed(1);
@@ -90,9 +107,14 @@ function isPerDayTournament(name) {
 }
 
 async function createTournamentChannel(guild, tournament, pinnedMessages) {
-  const { name, region, beginTime, lastBeginTime, isTrios, consoleOnly } = tournament;
+  const { name, region, beginTime, lastBeginTime, isTrios, consoleOnly, isPermanent } = tournament;
 
-  const perDay = isPerDayTournament(name);
+  // Permanent tournaments (FNCS Divisional Cups) must never get a date-suffixed name — 'fncs'
+  // also matches PER_DAY_KEYWORDS, but a date suffix keyed off *this* week's beginTime would give
+  // next week's occurrence a different channel name, which the dedupe check below (exact name
+  // match) wouldn't recognize as the same tournament — producing a brand new channel every week
+  // instead of the single always-open one this is supposed to be.
+  const perDay = !isPermanent && isPerDayTournament(name);
   const dateStr = perDay ? getDateStr(beginTime) : null;
   const channelName = buildChannelName(name, dateStr);
 
@@ -150,10 +172,12 @@ async function createTournamentChannel(guild, tournament, pinnedMessages) {
 
     console.log(`✅ Created channel: ${channelName} (id: ${channel.id})`);
 
-    const deleteAfter = new Date(lastBeginTime).getTime() + CHANNEL_DELETE_BUFFER_MS;
+    // Permanent tournaments never get a deleteAt at all — never scheduled for deletion, by
+    // design (see the class-level comment on PERMANENT_KEYWORDS in tournament-scraper.js).
+    const deleteAfter = isPermanent ? null : new Date(lastBeginTime).getTime() + CHANNEL_DELETE_BUFFER_MS;
 
     const { buildQueueButtons } = require('./embeds');
-    const embed = buildTournamentEmbed(name, region, 0, isTrios, beginTime, deleteAfter);
+    const embed = buildTournamentEmbed(name, region, 0, isTrios, beginTime, deleteAfter, isPermanent);
     const buttons = buildQueueButtons(isTrios);
     const msg = await channel.send({ embeds: [embed], components: [buttons] });
     await msg.pin();
@@ -166,10 +190,15 @@ async function createTournamentChannel(guild, tournament, pinnedMessages) {
       isTrios,
       beginTime,
       deleteAt: deleteAfter,
+      permanent: !!isPermanent,
     };
     saveStore(guild.id);
 
-    armDeletionTimer(guild, channel.id, { tournamentName: name, region, beginTime, deleteAt: deleteAfter }, pinnedMessages);
+    if (isPermanent) {
+      console.log(`  ♾️ Permanent tournament — no deletion timer armed for ${channel.id}`);
+    } else {
+      armDeletionTimer(guild, channel.id, { tournamentName: name, region, beginTime, deleteAt: deleteAfter }, pinnedMessages);
+    }
 
   } catch (err) {
     console.error(`  ❌ Failed to create channel ${channelName}:`, err.message);
@@ -192,19 +221,29 @@ async function checkAndCreateChannels(guild, tournaments, pinnedMessages) {
       const startDate = new Date(tournament.beginTime);
       const hoursUntilStart = (startDate.getTime() - now.getTime()) / (1000 * 60 * 60);
 
-      console.log(`→ ${tournament.name} | ${tournament.region} | begins ${tournament.beginTime} | ${hoursUntilStart.toFixed(1)}hrs away`);
+      console.log(`→ ${tournament.name} | ${tournament.region} | begins ${tournament.beginTime} | ${hoursUntilStart.toFixed(1)}hrs away${tournament.isPermanent ? ' | PERMANENT' : ''}`);
 
-      if (hoursUntilStart <= 0) {
-        console.log(`  ⏭️ Skipped — already started/in the past`);
-        continue;
+      // Permanent tournaments (FNCS Divisional Cups) skip the 48h window entirely — the channel
+      // should exist as soon as the division is known about and stay open regardless of any one
+      // occurrence's timing, not just within 48h of the next session. createTournamentChannel's
+      // own dedupe check (by stable channel name) makes this idempotent, so re-running this every
+      // hour just confirms the channel still exists rather than recreating it.
+      if (!tournament.isPermanent) {
+        if (hoursUntilStart <= 0) {
+          console.log(`  ⏭️ Skipped — already started/in the past`);
+          continue;
+        }
+
+        if (hoursUntilStart > 48) {
+          console.log(`  ⏭️ Skipped — outside 48h window (enters window in ${(hoursUntilStart - 48).toFixed(1)}hrs)`);
+          continue;
+        }
+
+        console.log(`  ✅ Within 48h window — attempting channel creation`);
+      } else {
+        console.log(`  ♾️ Permanent tournament — skipping 48h window check, ensuring channel exists`);
       }
 
-      if (hoursUntilStart > 48) {
-        console.log(`  ⏭️ Skipped — outside 48h window (enters window in ${(hoursUntilStart - 48).toFixed(1)}hrs)`);
-        continue;
-      }
-
-      console.log(`  ✅ Within 48h window — attempting channel creation`);
       // Only genuinely multi-session tournaments (e.g. FNCS) should keep their channel open
       // until the last session. Everything else groups all future occurrences of the same
       // recurring cup under one scraped entry, so lastBeginTime can be weeks/months out —
@@ -232,27 +271,49 @@ async function updateActiveTournamentEmbeds(guild, pinnedMessages, backfillTourn
   console.log(`🔄 Refreshing tournament embeds — ${entries.length} pinned channel(s) tracked`);
 
   // Legacy/manually-created entries can be missing beginTime (e.g. pinned before this field
-  // existed, or created via /setup-tournament with no known schedule). Try once to recover it
-  // by matching against backfillTournaments — marked attempted either way so a permanent miss (a
-  // custom name that will never appear in the scrape) doesn't retry forever.
-  const needsBackfill = entries.filter(([, pinned]) => !pinned.beginTime && !pinned.beginTimeBackfillAttempted);
+  // existed, or created via /setup-tournament with no known schedule) and/or missing deleteAt
+  // (e.g. pinned before that field existed, or a beginTime-only backfill from before this
+  // check covered deleteAt too) — either gap means no deletion timer ever gets armed for that
+  // channel, on any restart, ever, which is how channels ended up stuck open forever. Permanent
+  // tournaments are exempt — they deliberately have no deleteAt (see PERMANENT_KEYWORDS in
+  // tournament-scraper.js) and must never have one backfilled in.
+  const needsBackfill = entries.filter(
+    ([, pinned]) => !pinned.permanent && (!pinned.beginTime || !pinned.deleteAt) && !pinned.beginTimeBackfillAttempted
+  );
   if (needsBackfill.length > 0) {
-    if (!backfillTournaments) {
-      console.log(`  ⏭️ ${needsBackfill.length} pinned channel(s) missing beginTime, but no scrape was fetched this tick (or it failed) — will retry next tick`);
+    const stillMissingBeginTime = needsBackfill.filter(([, pinned]) => !pinned.beginTime);
+
+    // Only entries missing beginTime actually need this tick's scrape (to look up a match by
+    // name+region) — an entry that already has beginTime but is just missing deleteAt can
+    // compute it directly below, no scrape required, so it's never held up by one failing/not
+    // having run this tick.
+    if (stillMissingBeginTime.length > 0 && !backfillTournaments) {
+      console.log(`  ⏭️ ${stillMissingBeginTime.length} pinned channel(s) missing beginTime, but no scrape was fetched this tick (or it failed) — will retry next tick`);
     } else {
-      console.log(`  🔍 ${needsBackfill.length} pinned channel(s) missing beginTime — backfilling from this tick's shared scrape`);
-      const byKey = new Map(backfillTournaments.map(t => [`${t.name}-${t.region}`, t]));
+      console.log(`  🔍 ${needsBackfill.length} pinned channel(s) missing beginTime and/or deleteAt — backfilling`);
+      const byKey = backfillTournaments ? new Map(backfillTournaments.map(t => [`${t.name}-${t.region}`, t])) : null;
 
       for (const [channelId, pinned] of needsBackfill) {
-        const match = byKey.get(`${pinned.tournamentName}-${pinned.region}`);
-        pinned.beginTimeBackfillAttempted = true;
-        if (match) {
+        const match = byKey?.get(`${pinned.tournamentName}-${pinned.region}`);
+
+        if (!pinned.beginTime) {
+          if (!match) {
+            pinned.beginTimeBackfillAttempted = true;
+            console.log(`  ⚠️ No match in current scrape for ${channelId} (${pinned.tournamentName}, ${pinned.region}) — leaving timer-less`);
+            continue;
+          }
           pinned.beginTime = match.beginTime;
-          pinned.deleteAt = new Date(match.isMultiSession ? match.lastBeginTime : match.beginTime).getTime() + CHANNEL_DELETE_BUFFER_MS;
-          console.log(`  🩹 Backfilled beginTime for ${channelId} (${pinned.tournamentName}, ${pinned.region}): ${pinned.beginTime}`);
-        } else {
-          console.log(`  ⚠️ No match in current scrape for ${channelId} (${pinned.tournamentName}, ${pinned.region}) — leaving timer-less`);
         }
+
+        // deleteAt is directly derivable from beginTime — prefer the scrape match's
+        // lastBeginTime (accurate for multi-session tournaments like FNCS), but fall back to
+        // this entry's own stored beginTime if there's no match (e.g. it's aged out of the
+        // scrape's forward-looking window), so a stuck channel still gets *a* deletion timer
+        // instead of none at all.
+        const effectiveLastBeginTime = match ? (match.isMultiSession ? match.lastBeginTime : match.beginTime) : pinned.beginTime;
+        pinned.deleteAt = new Date(effectiveLastBeginTime).getTime() + CHANNEL_DELETE_BUFFER_MS;
+        pinned.beginTimeBackfillAttempted = true;
+        console.log(`  🩹 Backfilled ${channelId} (${pinned.tournamentName}, ${pinned.region}) — beginTime=${pinned.beginTime}, deleteAt=${new Date(pinned.deleteAt).toISOString()}${match ? '' : ' (no scrape match — derived from stored beginTime)'}`);
       }
       saveStore(guild.id);
     }
@@ -262,13 +323,22 @@ async function updateActiveTournamentEmbeds(guild, pinnedMessages, backfillTourn
     // managedChannels is in-memory only — a bot restart wipes it even though pinnedMessages
     // (and its deleteAt) survives in data.json. Re-arm anything with a known deleteAt but no
     // timer in this process, whether that's restart recovery or an entry that was just
-    // backfilled above. armDeletionTimer deletes immediately if deleteAt has already passed.
+    // backfilled above — UNLESS deleteAt has already passed, in which case don't wait on a new
+    // timer's near-zero delay: delete it right here, synchronously, in this pass. This safety net
+    // is what actually closes the stuck-channel gap — those channels' deleteAt was simply never
+    // set (see the backfill above), so armDeletionTimer never got a chance to run at all, on any
+    // restart, ever.
     if (pinned.deleteAt && !managedChannels[channelId]) {
+      if (pinned.deleteAt <= Date.now()) {
+        console.log(`  🧹 Safety net: ${channelId} (${pinned.tournamentName}) is past its deleteAt (${new Date(pinned.deleteAt).toISOString()}) with no timer armed — deleting now instead of waiting on a new one`);
+        await deleteManagedChannel(guild, channelId, pinned, pinnedMessages, true);
+        continue;
+      }
       console.log(`  🔁 No deletion timer armed for ${channelId} (${pinned.tournamentName}) — arming now`);
       armDeletionTimer(guild, channelId, pinned, pinnedMessages);
     }
 
-    if (!pinned.beginTime) {
+    if (!pinned.permanent && !pinned.beginTime) {
       console.log(`  ⏭️ ${channelId} (${pinned.tournamentName ?? 'unknown'}) — no beginTime stored, countdown can't be rendered`);
       continue;
     }
@@ -277,8 +347,9 @@ async function updateActiveTournamentEmbeds(guild, pinnedMessages, backfillTourn
     // every registered player in this region so their cached stats pick up the event that just
     // happened, rather than each of them individually waiting out the 24h queue-join cache.
     // statsRescraped is set synchronously (before the rescrape resolves) so an overlapping tick
-    // within the same ~60s window can't fire it twice.
-    if (!pinned.statsRescraped && new Date(pinned.beginTime).getTime() <= Date.now()) {
+    // within the same ~60s window can't fire it twice. Doesn't apply to permanent tournaments —
+    // there's no single "this tournament just began" moment for something that's always open.
+    if (!pinned.permanent && !pinned.statsRescraped && new Date(pinned.beginTime).getTime() <= Date.now()) {
       pinned.statsRescraped = true;
       saveStore(guild.id);
       console.log(`  🔄 ${channelId} (${pinned.tournamentName}, ${pinned.region}) — tournament has begun, triggering batch stats rescrape`);
@@ -296,7 +367,7 @@ async function updateActiveTournamentEmbeds(guild, pinnedMessages, backfillTourn
       const msg = await channel.messages.fetch(pinned.messageId);
       const count = getQueueCount(guild.id, pinned.tournamentName, pinned.region);
       const newEmbed = buildTournamentEmbed(
-        pinned.tournamentName, pinned.region, count, pinned.isTrios, pinned.beginTime, pinned.deleteAt
+        pinned.tournamentName, pinned.region, count, pinned.isTrios, pinned.beginTime, pinned.deleteAt, pinned.permanent
       );
       await msg.edit({ embeds: [newEmbed], components: msg.components });
       console.log(`  ✅ ${channelId} (${pinned.tournamentName}) — embed refreshed`);
@@ -332,10 +403,13 @@ async function runTournamentCheckTick(client, pinnedMessages) {
 
 // Scrapes at most once per tick, and only if at least one guild actually has a pinned entry
 // needing beginTime backfill (checked across the whole global pinnedMessages, not per guild) —
-// so N guilds all needing backfill in the same tick still costs one scrape, not N.
+// so N guilds all needing backfill in the same tick still costs one scrape, not N. A
+// deleteAt-only backfill doesn't need a scrape at all (updateActiveTournamentEmbeds derives it
+// straight from the entry's own beginTime), so it isn't part of this gate. Permanent entries
+// never need one either — they deliberately have no beginTime/deleteAt to backfill.
 async function runEmbedRefreshTick(client, pinnedMessages) {
   const anyNeedsBackfill = Object.values(pinnedMessages).some(
-    pinned => !pinned.beginTime && !pinned.beginTimeBackfillAttempted
+    pinned => !pinned.permanent && !pinned.beginTime && !pinned.beginTimeBackfillAttempted
   );
 
   let backfillTournaments = null;

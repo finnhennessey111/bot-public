@@ -1878,7 +1878,7 @@ async function updateQueueEmbed(guildId, channelId, tournamentName, region, isTr
 
     const msg = await channel.messages.fetch(pinned.messageId);
     const count = getQueueCount(guildId, tournamentName, region);
-    const newEmbed = buildTournamentEmbed(tournamentName, region, count, isTrios, pinned.beginTime, pinned.deleteAt);
+    const newEmbed = buildTournamentEmbed(tournamentName, region, count, isTrios, pinned.beginTime, pinned.deleteAt, pinned.permanent);
     await msg.edit({ embeds: [newEmbed], components: msg.components });
   } catch (err) {
     console.error('Failed to update queue embed:', err);

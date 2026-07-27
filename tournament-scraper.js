@@ -4,7 +4,8 @@ const puppeteer = require('puppeteer');
 // separate FNCS-Major compound check below) is the single source of truth for tournament channel
 // eligibility. channel-manager.js has no whitelist of its own — anything that survives this
 // filter gets a channel, including ranked cups, skin/creator cups (Mongraal Cup, Clix Cup, etc.),
-// victory cups, cash cups, reload cups, and FNCS divisions.
+// victory cups, cash cups, reload cups, and FNCS divisions (which additionally get a permanent,
+// always-open channel — see PERMANENT_KEYWORDS below).
 const BLOCKED_KEYWORDS = [
   'mobile',
   'solo',
@@ -19,6 +20,16 @@ const BLOCKED_KEYWORDS = [
 // a single-session-per-week event, so it belongs on the default (per-occurrence beginTime) path.
 const MULTI_SESSION_KEYWORDS = [
   'fncs',
+];
+
+// Narrower than MULTI_SESSION_KEYWORDS' broad 'fncs' match, which would also catch FNCS Majors
+// and the Last Chance Qualifier — this specifically identifies FNCS Divisional Cups, which get a
+// permanent, always-open channel per division+region (channel-manager.js's
+// checkAndCreateChannels/createTournamentChannel) instead of the normal 48hr-window/auto-delete
+// path, since players want to find teammates early to prep. Majors and the Last Chance Qualifier
+// stay on the normal path.
+const PERMANENT_KEYWORDS = [
+  'fncs division',
 ];
 
 // Regions we support
@@ -119,6 +130,7 @@ async function scrapeUpcomingTournaments() {
         const consoleOnly = platforms.length === 1 && platforms[0] === 'Console';
         const isTrios = titleLower.includes('trio');
         const isMultiSession = MULTI_SESSION_KEYWORDS.some(k => titleLower.includes(k));
+        const isPermanent = PERMANENT_KEYWORDS.some(k => titleLower.includes(k));
 
         if (!groups[key]) {
           groups[key] = {
@@ -129,6 +141,7 @@ async function scrapeUpcomingTournaments() {
             consoleOnly,
             isTrios,
             isMultiSession,
+            isPermanent,
             platforms,
           };
         } else {

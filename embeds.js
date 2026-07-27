@@ -43,12 +43,17 @@ function formatDuration(ms) {
 
 // beginTime/endTime are only known for scheduler-created tournament channels — when omitted
 // (e.g. the manual /setup-tournament command has no scraped schedule) the embed falls back to
-// its plain, timer-less appearance.
-function buildTournamentEmbed(tournamentName, region, queueCount, isTrios = false, beginTime = null, endTime = null) {
+// its plain, timer-less appearance. isPermanent (FNCS Divisional Cups — see tournament-scraper.js's
+// PERMANENT_KEYWORDS) always wins over beginTime/endTime — a channel that never auto-deletes has
+// no countdown/"in progress"/"ending soon" state that makes sense to show.
+function buildTournamentEmbed(tournamentName, region, queueCount, isTrios = false, beginTime = null, endTime = null, isPermanent = false) {
   let color = COLOR_DEFAULT;
   let statusText = null;
 
-  if (beginTime) {
+  if (isPermanent) {
+    color = COLOR_UPCOMING;
+    statusText = '🟢 Ongoing — queue anytime';
+  } else if (beginTime) {
     const now = Date.now();
     const startMs = new Date(beginTime).getTime();
     const msUntilStart = startMs - now;
