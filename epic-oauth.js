@@ -41,8 +41,6 @@ function decodeState(state) {
   const expected = sign(payload);
   const signatureBuf = Buffer.from(signature);
   const expectedBuf = Buffer.from(expected);
-  // Signatures normally match in length; a length mismatch just means "invalid", not something to
-  // throw on, so compare lengths first — timingSafeEqual throws on mismatched buffer lengths.
   if (signatureBuf.length !== expectedBuf.length || !crypto.timingSafeEqual(signatureBuf, expectedBuf)) {
     return null;
   }
@@ -67,8 +65,20 @@ function buildAuthorizeUrl(discordId, guildId) {
   return url.toString();
 }
 
+// Decodes a JWT's payload segment (no signature verification needed here — this token just came
+// directly from Epic's own token endpoint over HTTPS, it wasn't handed to us by the client).
+function decodeJwtPayload(jwt) {
+  const parts = jwt.split('.');
+  if (parts.length !== 3) throw new Error('access_token is not a valid JWT.');
+  return JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+}
+
 // Epic's token endpoint authenticates the client via HTTP Basic Auth (client_id:client_secret in
 // the Authorization header), not client_secret in the request body.
+//
+// account_id is a top-level field on the token response, but the display name (dn) is NOT —
+// Epic only includes it as a claim inside the access_token JWT itself, so it has to be decoded
+// out from there rather than read directly off the response body.
 async function exchangeCodeForToken(code) {
   const basicAuth = Buffer.from(`${process.env.EPIC_CLIENT_ID}:${process.env.EPIC_CLIENT_SECRET}`).toString('base64');
 
@@ -87,11 +97,19 @@ async function exchangeCodeForToken(code) {
   }
 
   const data = await response.json();
-  if (!data.account_id || !data.dn) {
-    throw new Error('Epic token response missing account_id/dn.');
+  if (!data.account_id) {
+    throw new Error('Epic token response missing account_id.');
+  }
+  if (!data.access_token) {
+    throw new Error('Epic token response missing access_token.');
   }
 
-  return { epicId: data.account_id, epicUsername: data.dn };
+  const jwtPayload = decodeJwtPayload(data.access_token);
+  if (!jwtPayload.dn) {
+    throw new Error('Epic access_token JWT missing dn claim.');
+  }
+
+  return { epicId: data.account_id, epicUsername: jwtPayload.dn };
 }
 
 module.exports = { isConfigured, buildAuthorizeUrl, decodeState, exchangeCodeForToken };
