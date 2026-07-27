@@ -5,11 +5,7 @@ const commands = [
   new SlashCommandBuilder()
     .setName('matchmaker-setup')
     .setDescription('Set up all roles, categories, channels and starter embeds MatchMaker needs (admin-only)')
-    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
-    .addStringOption(o => o.setName('yunite-token').setDescription('Your Yunite API token').setRequired(true))
-    .addRoleOption(o => o.setName('yunite-verified-role')
-      .setDescription('The role Yunite auto-assigns when a member links their Epic account (unlocks get-roles/how-to-use)')
-      .setRequired(false)),
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
 
   new SlashCommandBuilder()
     .setName('setup-tournament')
@@ -84,7 +80,7 @@ const commands = [
   // ── MOD DEBUG COMMANDS (MatchMaker Mod role only) ──────────────────────────
   new SlashCommandBuilder()
     .setName('bot-status')
-    .setDescription('[Mod] Show bot uptime, MongoDB/Yunite connectivity, and active queue/match/party counts'),
+    .setDescription('[Mod] Show bot uptime, MongoDB/Epic OAuth connectivity, and active queue/match/party counts'),
 
   new SlashCommandBuilder()
     .setName('queue-status')

@@ -5,8 +5,8 @@
 // settings.matchCategoryId). creativeChannels mirrors the old store.js field, scoped per guild:
 // { '1v1': {channelId, messageId}, '2v2': {...} }. setupMessageIds tracks the message IDs
 // /matchmaker-setup posts (register/getRoles/howto/formParty) so re-running it is idempotent.
-// secrets holds per-guild third-party credentials (currently just { yuniteToken }) — plaintext,
-// consistent with this project's existing .env-based token handling.
+// secrets holds per-guild third-party credentials (currently unused, reserved for future
+// integrations) — plaintext, consistent with this project's existing .env-based token handling.
 
 const mongoose = require('mongoose');
 

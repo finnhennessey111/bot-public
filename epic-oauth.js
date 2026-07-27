@@ -1,7 +1,6 @@
-// epic-oauth.js - Epic Games OAuth (authorization_code grant), the primary path for linking a
-// player's Epic account, replacing Yunite (kept as a fallback — see index.js's
-// resolveEpicIdentity — for players who haven't linked via Epic OAuth yet, or where a token
-// exchange fails).
+// epic-oauth.js - Epic Games OAuth (authorization_code grant), the sole path for linking a
+// player's Epic account. A player who hasn't completed this flow just falls back to their
+// Discord display name (see index.js's resolveEpicIdentity) — there's no other lookup.
 //
 // The callback (webhook-server.js's GET /epic-callback) is a bare redirect from Epic with no
 // Discord context of its own, so `state` is how it learns which Discord user/guild initiated the

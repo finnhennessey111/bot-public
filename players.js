@@ -6,7 +6,6 @@
 
 const PlayerModel = require('./models/Player');
 const { scrapePlayer } = require('./scraper');
-const { getEpicFromDiscord } = require('./yunite');
 
 // How long a scraped stats snapshot is trusted before a Queue click triggers a fresh FT scrape
 // (getPlayerStats), vs. how often a player may force one early via /refresh-stats
@@ -121,12 +120,12 @@ async function rescrapeRegisteredPlayers(guildId, region) {
 
   for (const player of registered) {
     try {
-      // Re-resolve via Yunite rather than trusting the record's stored epicUsername/epicId —
-      // that's whatever was current at the last scrape, and a player can re-link a different
-      // Epic account in the meantime. Fall back to the stored value if Yunite's unavailable.
-      const identity = await getEpicFromDiscord(player.discordId, guildId).catch(() => null);
-      const epicUsername = identity?.epicName ?? player.epicUsername;
-      const epicId = identity?.epicId ?? player.epicId;
+      // Trusts the record's stored epicUsername/epicId as-is, with no live re-check — Epic OAuth
+      // (the sole linking method now) has no lightweight equivalent to a prior integration's live
+      // lookup, so there's no way to detect a player having re-linked a different Epic account
+      // short of them re-running the link flow themselves. This is an intentional behavior
+      // change, not an oversight.
+      const { epicUsername, epicId } = player;
 
       if (!epicUsername) {
         console.warn(`[stats]   skipping ${player.discordId} — no known Epic username`);

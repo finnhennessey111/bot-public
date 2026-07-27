@@ -250,7 +250,7 @@ function startWebhookServer(client) {
     console.warn('[webhook] STRIPE_SECRET_KEY/STRIPE_WEBHOOK_SECRET not set — /stripe/webhook disabled. Subscriptions are disabled.');
   }
   if (!epicEnabled) {
-    console.warn('[webhook] EPIC_CLIENT_ID/EPIC_CLIENT_SECRET/EPIC_REDIRECT_URI not set — /epic-callback disabled. Epic linking falls back to Yunite only.');
+    console.warn('[webhook] EPIC_CLIENT_ID/EPIC_CLIENT_SECRET/EPIC_REDIRECT_URI not set — /epic-callback disabled. Epic account linking is unavailable.');
   }
   if (!discordOAuthEnabled) {
     console.warn('[webhook] CLIENT_ID/DISCORD_CLIENT_SECRET/DISCORD_OAUTH_REDIRECT_URI not set — /premium and /discord-checkout-callback disabled. Website checkout is unavailable; /premium (Discord command) is unaffected.');
@@ -343,10 +343,10 @@ function startWebhookServer(client) {
         console.error('[epic-oauth] Token exchange failed:', err.message);
         await notifyEpicLinkResult(
           client, discordId, guildId,
-          '❌ Linking your Epic account failed. You can try again, or link via Yunite in #register in the meantime.'
+          '❌ Linking your Epic account failed. You can try again in #register.'
         );
         return res.status(502).send(renderEpicResultPage(
-          false, 'Failed to complete linking with Epic Games. You can try again, or use Yunite instead.'
+          false, 'Failed to complete linking with Epic Games. You can try again.'
         ));
       }
 
@@ -355,10 +355,9 @@ function startWebhookServer(client) {
           epicId, epicUsername, epicOAuthLinked: true, epicLinkedAt: new Date(),
         });
 
-        // Mirrors what Yunite's own verified-role assignment used to do — see permissions.js's
-        // progressive-visibility ladder, which gates #get-roles/#how-to-use behind this role
-        // regardless of which linking method granted it.
-        const verifiedRoleId = getRoleId(guildId, 'yuniteVerified');
+        // See permissions.js's progressive-visibility ladder, which gates
+        // #get-roles/#how-to-use/#form-party/#access behind this role.
+        const verifiedRoleId = getRoleId(guildId, 'verified');
         if (verifiedRoleId) {
           const guild = await client.guilds.fetch(guildId).catch(() => null);
           const member = await guild?.members.fetch(discordId).catch(() => null);

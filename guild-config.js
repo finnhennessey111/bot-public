@@ -1,7 +1,7 @@
 // guild-config.js - In-memory cache of per-guild configuration (role/channel/category IDs,
-// creative-channel routing, setup-message tracking, and secrets like a per-guild Yunite token),
-// backed by models/Guild.js. Mongo-only — there's no meaningful offline/JSON equivalent for
-// guild config, unlike store.js's queue/party/match data.
+// creative-channel routing, setup-message tracking, and per-guild secrets), backed by
+// models/Guild.js. Mongo-only — there's no meaningful offline/JSON equivalent for guild config,
+// unlike store.js's queue/party/match data.
 //
 // Two "ensure a Guild doc exists" paths exist and must never both fire a DM:
 //   - init(client): startup reconciliation for every already-joined guild — no DM.
@@ -72,8 +72,6 @@ async function seedLegacyGuildFromEnv() {
     ...(process.env.FORM_PARTY_CHANNEL_ID && { formParty: process.env.FORM_PARTY_CHANNEL_ID }),
   };
 
-  // YUNITE_TOKEN is deliberately NOT copied into secrets here — it stays available as the
-  // process.env fallback used by getYuniteToken() rather than being duplicated into Mongo.
   await setGuildConfig(guildId, { roleIds, categoryIds, channelIds });
   console.log(`[GuildConfig] Seeded legacy guild ${guildId} config from environment variables.`);
 }
@@ -125,10 +123,6 @@ function getCreativeChannelInfo(guildId, category) {
   return cache[guildId]?.creativeChannels?.[category] ?? null;
 }
 
-function getYuniteToken(guildId) {
-  return cache[guildId]?.secrets?.yuniteToken ?? null;
-}
-
 // Deep-merges partial.{channelIds,roleIds,categoryIds,creativeChannels,setupMessageIds,secrets}
 // into the cache, then persists just those fields to Mongo. Object.assign (shallow per top-level
 // map key) is sufficient here since every map is flat (id/token values, no nested objects) except
@@ -172,6 +166,5 @@ module.exports = {
   getRoleId,
   getCategoryId,
   getCreativeChannelInfo,
-  getYuniteToken,
   setGuildConfig,
 };

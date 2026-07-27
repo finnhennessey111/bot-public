@@ -1,8 +1,8 @@
 // matchmaker-setup.js - The /matchmaker-setup orchestrator: creates every role/category/channel
 // MatchMaker needs and posts the starter embeds, saving the resulting IDs to that guild's Mongo
 // config (guild-config.js). Idempotent — checks guild-config's stored ID *and* that the Discord
-// object still exists before creating anything, so re-running after a partial failure (or just
-// to rotate the Yunite token) reuses whatever's already there instead of duplicating it.
+// object still exists before creating anything, so re-running after a partial failure reuses
+// whatever's already there instead of duplicating it.
 //
 // All Discord API calls are sequential, not parallel — gentler on rate limits, and keeps a
 // partial failure in a cleanly resumable state rather than a pile of half-finished promises.
@@ -29,6 +29,11 @@ const ROLE_SPECS = [
   { key: 'Support', name: 'Support' },
   { key: 'Registered', name: 'Registered' },
   { key: 'mod', name: 'MatchMaker Mod' },
+  // Assigned directly by the Epic OAuth callback (webhook-server.js's /epic-callback) on a
+  // successful link — gates #get-roles/#how-to-use/#form-party/#access (permissions.js's
+  // progressive-visibility ladder). Auto-created here like every other role, so setup never needs
+  // an admin to hand us an externally-managed role ID.
+  { key: 'verified', name: 'MatchMaker Verified' },
 ];
 
 const CATEGORY_SPECS = [
@@ -177,7 +182,7 @@ async function ensurePosted(client, existingMessageIds, channelIds, key, buildPa
   return msg.id;
 }
 
-async function runMatchmakerSetup(guild, yuniteToken, yuniteVerifiedRoleId = null) {
+async function runMatchmakerSetup(guild) {
   if (runningGuilds.has(guild.id)) {
     throw new Error('Setup is already running for this server — wait for it to finish before running it again.');
   }
@@ -188,12 +193,6 @@ async function runMatchmakerSetup(guild, yuniteToken, yuniteVerifiedRoleId = nul
 
     const roleIds = {};
     for (const spec of ROLE_SPECS) roleIds[spec.key] = await ensureRole(guild, config.roleIds, spec);
-    // Not created by us — Yunite assigns this role itself (via its own dashboard config) when a
-    // member successfully links their Epic account. We just need to know its ID to gate
-    // get-roles/how-to-use behind it (permissions.js). Omitting the option on a re-run keeps
-    // whatever was already configured rather than clearing it.
-    if (yuniteVerifiedRoleId) roleIds.yuniteVerified = yuniteVerifiedRoleId;
-    else if (config.roleIds.yuniteVerified) roleIds.yuniteVerified = config.roleIds.yuniteVerified;
 
     const categoryIds = { ...config.categoryIds };
     for (const spec of CATEGORY_SPECS) {
@@ -247,15 +246,12 @@ async function runMatchmakerSetup(guild, yuniteToken, yuniteVerifiedRoleId = nul
 
     await setGuildConfig(guild.id, {
       roleIds, categoryIds, channelIds, setupMessageIds,
-      secrets: { yuniteToken },
     });
 
     await enforcePermissions(guild);
 
-    const verifiedRoleLine = roleIds.yuniteVerified
-      ? `Yunite verified role: <@&${roleIds.yuniteVerified}> — get-roles/how-to-use unlock once a member has it.`
-      : '⚠️ No Yunite verified role set — get-roles/how-to-use won\'t progressively unlock until you re-run ' +
-        '/matchmaker-setup with that option set to the role Yunite assigns on verification.';
+    const verifiedRoleLine = `Verified role: <@&${roleIds.verified}> — get-roles/how-to-use/form-party/access `
+      + 'unlock once a member links their Epic account via the Link Epic Account button in #register.';
 
     return {
       summary:

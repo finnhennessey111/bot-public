@@ -666,10 +666,11 @@ function buildSetupInstructionsEmbed() {
   return new EmbedBuilder()
     .setTitle('🛠️ Admin Setup')
     .setDescription(
-      '• Run `/matchmaker-setup` and enter your Yunite API token\n' +
-      '• Go to Yunite dashboard → Fortnite Registration → Post verification message → select #register\n' +
+      '• Run `/matchmaker-setup` — creates every role, category, channel and starter embed ' +
+      'MatchMaker needs, including an auto-created verified role\n' +
       '• Assign **MatchMaker Mod** role to your mod team in Server Settings → Roles\n' +
-      '• That\'s it — everything else is automatic\n' +
+      '• Members link their Epic account with the **Link Epic Account** button in #register — ' +
+      'that\'s it, everything else is automatic\n' +
       '• Tournament channels appear automatically 48hrs before each tournament\n' +
       '• For help: personalediting2@gmail.com'
     )
@@ -771,7 +772,6 @@ function buildRegisterEmbed(getRolesChannelId) {
     .setTitle('📋 Get Started')
     .setDescription(
       '• 🔗 Click **Link Epic Account** below to link your Epic account\n' +
-      '  (or use **Yunite** in this channel if that\'s what this server has set up)\n' +
       `• ✅ Once linked, go to ${getRolesChannelId ? `<#${getRolesChannelId}>` : '#get-roles'} to complete your profile\n` +
       '• 🎮 Then you can queue in tournament and creative channels'
     )
@@ -809,16 +809,11 @@ function buildWelcomeDmEmbed(guildName) {
   return new EmbedBuilder()
     .setTitle('👋 Thanks for adding MatchMaker!')
     .setDescription(
-      `Before your members can use MatchMaker in **${guildName}**, a couple of setup steps:\n\n` +
-      '**1.** Install Yunite (yunite.xyz) in your server, if you haven\'t already.\n' +
-      '**2.** Authorize the MatchMaker app on Yunite for your server — this lets MatchMaker look up ' +
-      'linked Epic accounts.\n' +
-      '**3.** (Optional but recommended) In Yunite\'s own dashboard, set it to auto-assign a role ' +
-      'when a member links their Epic account — new members only see #register until they have it, ' +
-      'then #get-roles/#how-to-use unlock automatically.\n' +
-      '**4.** Run `/matchmaker-setup` as a server admin — this creates all the roles, categories, ' +
-      'channels, and starter embeds MatchMaker needs, asks for your Yunite API token, and (if you did ' +
-      'step 3) which role Yunite assigns on verification.\n\n' +
+      `Before your members can use MatchMaker in **${guildName}**, one setup step:\n\n` +
+      '**1.** Run `/matchmaker-setup` as a server admin — this creates all the roles, categories, ' +
+      'channels, and starter embeds MatchMaker needs, including a verified role that\'s assigned ' +
+      'automatically when a member links their Epic account (new members only see #register until ' +
+      'they have it, then #get-roles/#how-to-use/#form-party/#access unlock automatically).\n\n' +
       'That\'s it — MatchMaker will be fully live for your server after that.'
     )
     .setColor(0x4A90D9)
@@ -1086,14 +1081,14 @@ function buildDmSubscribeButtons(monthlyUrl, yearlyUrl) {
 
 // ── MOD DEBUG COMMANDS ──────────────────────────────────────────────────────
 
-function buildBotStatusEmbed({ uptimeMs, mongoConnected, yuniteReachable, activeQueues, activeMatches, activeParties }) {
+function buildBotStatusEmbed({ uptimeMs, mongoConnected, epicOAuthConfigured, activeQueues, activeMatches, activeParties }) {
   return new EmbedBuilder()
     .setTitle('🛠️ Bot Status')
-    .setColor(mongoConnected && yuniteReachable ? 0x2ECC71 : 0xE67E22)
+    .setColor(mongoConnected && epicOAuthConfigured ? 0x2ECC71 : 0xE67E22)
     .addFields(
       { name: '⏱️ Uptime', value: formatDuration(uptimeMs), inline: true },
       { name: '🗄️ MongoDB', value: mongoConnected ? '✅ Connected' : '❌ Not connected', inline: true },
-      { name: '🔗 Yunite API', value: yuniteReachable ? '✅ Reachable' : '❌ Unreachable', inline: true },
+      { name: '🔗 Epic OAuth', value: epicOAuthConfigured ? '✅ Configured' : '❌ Not configured', inline: true },
       { name: '🎮 Active Queues', value: `**${activeQueues}**`, inline: true },
       { name: '⚔️ Active Matches', value: `**${activeMatches}**`, inline: true },
       { name: '🤝 Active Parties', value: `**${activeParties}**`, inline: true },

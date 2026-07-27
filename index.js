@@ -20,7 +20,6 @@ const { createMatchChannelsForMatch } = require('./match-channels');
 // Named playerStore (not `players`) — this file uses `players` extensively as a local variable
 // name for arrays of built player objects, which would otherwise shadow this module import.
 const playerStore = require('./players');
-const { getEpicFromDiscord, checkYuniteReachable } = require('./yunite');
 const epicOAuth = require('./epic-oauth');
 const { startScheduler, checkAndCreateChannels } = require('./channel-manager');
 const { enforcePermissions } = require('./permissions');
@@ -700,11 +699,8 @@ async function handleInteraction(interaction) {
     if (interaction.commandName === 'matchmaker-setup') {
       await interaction.deferReply({ flags: 64 });
 
-      const yuniteToken = interaction.options.getString('yunite-token');
-      const yuniteVerifiedRole = interaction.options.getRole('yunite-verified-role');
-
       try {
-        const result = await runMatchmakerSetup(interaction.guild, yuniteToken, yuniteVerifiedRole?.id ?? null);
+        const result = await runMatchmakerSetup(interaction.guild);
         await interaction.editReply({ content: result.summary });
       } catch (err) {
         console.error('matchmaker-setup failed:', err.message);
@@ -740,10 +736,8 @@ async function handleInteraction(interaction) {
       await interaction.deferReply({ flags: 64 });
       if (!isModMember(interaction.guild.id, interaction)) return replyModOnly(interaction);
 
-      const [mongoConnected, yuniteReachable] = await Promise.all([
-        Promise.resolve(db.isConnected()),
-        checkYuniteReachable(interaction.guild.id),
-      ]);
+      const mongoConnected = db.isConnected();
+      const epicOAuthConfigured = epicOAuth.isConfigured();
 
       const guildId = interaction.guild.id;
       const activeQueues = getTournamentQueueEntries(guildId).length
@@ -756,7 +750,7 @@ async function handleInteraction(interaction) {
         embeds: [buildBotStatusEmbed({
           uptimeMs: Date.now() - botStartTime,
           mongoConnected,
-          yuniteReachable,
+          epicOAuthConfigured,
           activeQueues,
           activeMatches,
           activeParties,
@@ -1003,7 +997,7 @@ async function handleInteraction(interaction) {
       }
       if (!epicOAuth.isConfigured()) {
         return interaction.reply({
-          content: '❌ Epic account linking isn\'t set up for this bot yet — link via Yunite in this channel instead.',
+          content: '❌ Epic account linking isn\'t set up for this bot yet — contact a mod.',
           flags: 64,
         });
       }
@@ -1843,17 +1837,6 @@ function ingameRoleId(guildId, role) {
   return getRoleId(guildId, role);
 }
 
-function platformRoleId(guildId, platform) {
-  const map = {
-    PC: getRoleId(guildId, 'PC'),
-    PS4: getRoleId(guildId, 'Console'),
-    XB1: getRoleId(guildId, 'Console'),
-    SWITCH: getRoleId(guildId, 'Console'),
-    MOBILE: getRoleId(guildId, 'Mobile'),
-  };
-  return map[platform] ?? null;
-}
-
 // ── HELPER: ASSIGN ROLE ───────────────────────────────────────────────────────
 async function assignRole(guild, discordId, roleId) {
   if (!roleId) return;
@@ -1866,29 +1849,21 @@ async function assignRole(guild, discordId, roleId) {
 }
 
 // ── HELPER: RESOLVE EPIC IDENTITY ──────────────────────────────────────────────
-// Epic OAuth (epic-oauth.js) is the primary link path — if this player has already completed it,
-// their epicId/epicUsername in Mongo are a real, player-confirmed link, so use those directly
-// without a network round trip. Otherwise falls back to a live Yunite lookup exactly as before,
-// and finally to the Discord display name if neither is available.
+// Epic OAuth (epic-oauth.js) is the sole link path — if this player has already completed it,
+// their epicId/epicUsername in Mongo are a real, player-confirmed link, so use those directly.
+// No live re-check happens (Epic OAuth has no lightweight equivalent to the live lookup a former
+// integration used to provide here) — a player who hasn't linked just falls back to their Discord
+// display name.
 async function resolveEpicIdentity(guild, member) {
   const stored = await playerStore.getPlayer(guild.id, member.id);
   if (stored?.epicOAuthLinked && stored.epicId && stored.epicUsername) {
     return { epicUsername: stored.epicUsername, epicId: stored.epicId };
   }
 
-  try {
-    const yuniteData = await getEpicFromDiscord(member.id, guild.id);
-    if (yuniteData.platform) {
-      await assignRole(guild, member.id, platformRoleId(guild.id, yuniteData.platform));
-    }
-    return { epicUsername: yuniteData.epicName, epicId: yuniteData.epicId };
-  } catch (yuniteErr) {
-    console.warn('Yunite lookup failed, falling back to Discord username:', yuniteErr.message);
-    return {
-      epicUsername: member.nickname ?? member.user.globalName ?? member.user.username,
-      epicId: null,
-    };
-  }
+  return {
+    epicUsername: member.nickname ?? member.user.globalName ?? member.user.username,
+    epicId: null,
+  };
 }
 
 // ── HELPER: UPDATE QUEUE EMBED ────────────────────────────────────────────────
