@@ -1,4 +1,7 @@
 const puppeteer = require('puppeteer');
+const { proxyLaunchArgs, authenticatePage, logProxyMode } = require('./proxy-config');
+
+logProxyMode('tournament-scraper');
 
 // Skip these entirely when creating queue channels (scrapeUpcomingTournaments) — this (plus the
 // separate FNCS-Major compound check below) is the single source of truth for tournament channel
@@ -47,11 +50,12 @@ const SUPPORTED_REGIONS = ['EU', 'NAC', 'ME'];
 async function fetchRawCalendar() {
   const browser = await puppeteer.launch({
     headless: 'new',
-    args: ['--no-sandbox', '--disable-setuid-sandbox']
+    args: ['--no-sandbox', '--disable-setuid-sandbox', ...proxyLaunchArgs()]
   });
 
   try {
     const page = await browser.newPage();
+    await authenticatePage(page);
     await page.setUserAgent(
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     );
