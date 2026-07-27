@@ -59,6 +59,12 @@ async function fetchRawCalendar() {
   }
 }
 
+// Returns global tournament-calendar data — identical regardless of which guild (if any) asks,
+// since it's one shared fortnitetracker.com/events scrape, not scoped to a guild in any way.
+// Callers MUST hoist this out of any per-guild loop and fan the single result out to every guild
+// instead — calling it once per guild means one full Puppeteer navigation per guild for data
+// that's the same every time, which at scale (40+ guilds) is exactly what got this bot's VPS IP
+// blocked by Cloudflare. See channel-manager.js's runTournamentCheckTick/runEmbedRefreshTick.
 async function scrapeUpcomingTournaments() {
   const rawCalendar = await fetchRawCalendar();
 

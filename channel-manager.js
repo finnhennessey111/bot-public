@@ -176,12 +176,14 @@ async function createTournamentChannel(guild, tournament, pinnedMessages) {
   }
 }
 
-async function checkAndCreateChannels(guild, pinnedMessages) {
+// tournaments is a single scrape's worth of data, shared across every guild this tick — see
+// tournament-scraper.js's scrapeUpcomingTournaments doc comment and runTournamentCheckTick below.
+// This function must never call scrapeUpcomingTournaments() itself.
+async function checkAndCreateChannels(guild, tournaments, pinnedMessages) {
   console.log('🔍 Checking for upcoming tournaments...');
 
   try {
-    const tournaments = await scrapeUpcomingTournaments();
-    console.log(`📋 Scraped ${tournaments.length} tournaments`);
+    console.log(`📋 Checking ${tournaments.length} tournaments`);
 
     const now = new Date();
     console.log(`🕐 Current time: ${now.toISOString()}`);
@@ -222,21 +224,24 @@ async function checkAndCreateChannels(guild, pinnedMessages) {
 
 // Refreshes the pinned embed for every tournament channel that has a known beginTime, so the
 // countdown/elapsed/ending-soon status and left-border color stay live between player actions.
-async function updateActiveTournamentEmbeds(guild, pinnedMessages) {
+// backfillTournaments is a single scrape's worth of data shared across every guild this tick (null
+// if no guild needed one this tick) — see runEmbedRefreshTick below. This function must never call
+// scrapeUpcomingTournaments() itself.
+async function updateActiveTournamentEmbeds(guild, pinnedMessages, backfillTournaments = null) {
   const entries = Object.entries(pinnedMessages).filter(([, pinned]) => pinned.guildId === guild.id);
   console.log(`🔄 Refreshing tournament embeds — ${entries.length} pinned channel(s) tracked`);
 
   // Legacy/manually-created entries can be missing beginTime (e.g. pinned before this field
   // existed, or created via /setup-tournament with no known schedule). Try once to recover it
-  // by matching against a fresh scrape — gated behind "any missing" so this doesn't launch
-  // Puppeteer on every 60s tick, and marked attempted either way so a permanent miss (a custom
-  // name that will never appear in the scrape) doesn't retry forever.
+  // by matching against backfillTournaments — marked attempted either way so a permanent miss (a
+  // custom name that will never appear in the scrape) doesn't retry forever.
   const needsBackfill = entries.filter(([, pinned]) => !pinned.beginTime && !pinned.beginTimeBackfillAttempted);
   if (needsBackfill.length > 0) {
-    console.log(`  🔍 ${needsBackfill.length} pinned channel(s) missing beginTime — attempting one-time backfill from a fresh scrape`);
-    try {
-      const tournaments = await scrapeUpcomingTournaments();
-      const byKey = new Map(tournaments.map(t => [`${t.name}-${t.region}`, t]));
+    if (!backfillTournaments) {
+      console.log(`  ⏭️ ${needsBackfill.length} pinned channel(s) missing beginTime, but no scrape was fetched this tick (or it failed) — will retry next tick`);
+    } else {
+      console.log(`  🔍 ${needsBackfill.length} pinned channel(s) missing beginTime — backfilling from this tick's shared scrape`);
+      const byKey = new Map(backfillTournaments.map(t => [`${t.name}-${t.region}`, t]));
 
       for (const [channelId, pinned] of needsBackfill) {
         const match = byKey.get(`${pinned.tournamentName}-${pinned.region}`);
@@ -250,8 +255,6 @@ async function updateActiveTournamentEmbeds(guild, pinnedMessages) {
         }
       }
       saveStore(guild.id);
-    } catch (err) {
-      console.error('  ❌ Backfill scrape failed:', err.message);
     }
   }
 
@@ -312,15 +315,51 @@ async function forEachGuild(client, action) {
   }
 }
 
+// Scrapes exactly once (never per-guild — see tournament-scraper.js's doc comment on
+// scrapeUpcomingTournaments), then fans the single result out to every guild's
+// checkAndCreateChannels call. This is what keeps an hourly tick at O(1) Puppeteer navigations
+// regardless of guild count, instead of the O(guilds) it used to be.
+async function runTournamentCheckTick(client, pinnedMessages) {
+  let tournaments;
+  try {
+    tournaments = await scrapeUpcomingTournaments();
+  } catch (err) {
+    console.error('Failed to scrape tournaments for this check:', err.message);
+    return;
+  }
+  await forEachGuild(client, guild => checkAndCreateChannels(guild, tournaments, pinnedMessages));
+}
+
+// Scrapes at most once per tick, and only if at least one guild actually has a pinned entry
+// needing beginTime backfill (checked across the whole global pinnedMessages, not per guild) —
+// so N guilds all needing backfill in the same tick still costs one scrape, not N.
+async function runEmbedRefreshTick(client, pinnedMessages) {
+  const anyNeedsBackfill = Object.values(pinnedMessages).some(
+    pinned => !pinned.beginTime && !pinned.beginTimeBackfillAttempted
+  );
+
+  let backfillTournaments = null;
+  if (anyNeedsBackfill) {
+    console.log('  🔍 At least one pinned channel is missing beginTime — fetching one shared scrape for backfill this tick');
+    try {
+      backfillTournaments = await scrapeUpcomingTournaments();
+    } catch (err) {
+      console.error('  ❌ Backfill scrape failed:', err.message);
+    }
+  }
+
+  await forEachGuild(client, guild => updateActiveTournamentEmbeds(guild, pinnedMessages, backfillTournaments));
+}
+
 function startScheduler(client, pinnedMessages) {
   // Runs immediately on every startup (not just at the next hourly tick) so a tournament that
   // entered the 48h window while the bot was offline gets its channel created right away.
   console.log('📅 Running initial tournament check on startup...');
-  forEachGuild(client, guild => checkAndCreateChannels(guild, pinnedMessages));
+  runTournamentCheckTick(client, pinnedMessages);
   // Also run immediately (not just on the 60s interval below) so deletion timers lost to a
   // restart — managedChannels is in-memory only — get re-armed right away instead of after
   // up to a minute's delay.
-  forEachGuild(client, guild => updateActiveTournamentEmbeds(guild, pinnedMessages));
+  runEmbedRefreshTick(client, pinnedMessages);
 
   // Every hour, not just once a day — a tournament can enter the 48h creation window at any
   // point between ticks, and the previous "only at 12:00 UTC" gate meant a tournament entering
@@ -331,11 +370,11 @@ function startScheduler(client, pinnedMessages) {
   setInterval(async () => {
     const now = new Date();
     console.log(`⏰ Scheduler tick fired — UTC hour ${now.getUTCHours()} (${now.toISOString()}) — running tournament check`);
-    await forEachGuild(client, guild => checkAndCreateChannels(guild, pinnedMessages));
+    await runTournamentCheckTick(client, pinnedMessages);
   }, 60 * 60 * 1000);
 
   setInterval(() => {
-    forEachGuild(client, guild => updateActiveTournamentEmbeds(guild, pinnedMessages)).catch(console.error);
+    runEmbedRefreshTick(client, pinnedMessages).catch(console.error);
   }, EMBED_REFRESH_INTERVAL_MS);
 
   console.log('📅 Tournament scheduler started — hourly tournament check + 60s embed refresh armed');

@@ -22,6 +22,7 @@ const { createMatchChannelsForMatch } = require('./match-channels');
 const playerStore = require('./players');
 const epicOAuth = require('./epic-oauth');
 const { startScheduler, checkAndCreateChannels } = require('./channel-manager');
+const { scrapeUpcomingTournaments } = require('./tournament-scraper');
 const { enforcePermissions } = require('./permissions');
 const guildConfig = require('./guild-config');
 const { getRoleId, getChannelId } = guildConfig;
@@ -690,7 +691,9 @@ async function handleInteraction(interaction) {
         return interaction.reply({ content: '❌ This command is restricted to the MatchMaker Mod role.', flags: 64 });
       }
       await interaction.reply({ content: '🔍 Checking tournaments in background... check #master-tournaments shortly.', flags: 64 });
-      checkAndCreateChannels(interaction.guild, pinnedMessages).catch(console.error);
+      scrapeUpcomingTournaments()
+        .then(tournaments => checkAndCreateChannels(interaction.guild, tournaments, pinnedMessages))
+        .catch(console.error);
     }
 
     // /matchmaker-setup — admin-only (see register-commands.js's setDefaultMemberPermissions).
