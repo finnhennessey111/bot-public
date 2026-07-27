@@ -107,7 +107,7 @@ function isPerDayTournament(name) {
 }
 
 // Permanent tournament channels are never recreated or deleted, so their stored beginTime would
-// otherwise freeze at creation time — called every hourly tick (even when createTournamentChannel
+// otherwise freeze at creation time — called every daily tick (even when createTournamentChannel
 // is otherwise a no-op because the channel already exists) so the embed's "Next event" countdown
 // (buildTournamentEmbed's isPermanent branch) stays accurate as occurrences pass, using the
 // latest scrape's earliest-future-occurrence beginTime for this tournament+region.
@@ -357,18 +357,20 @@ async function updateActiveTournamentEmbeds(guild, pinnedMessages, backfillTourn
       continue;
     }
 
-    // Tournament just moved from upcoming to past (beginTime has elapsed) — batch-rescrape
-    // every registered player in this region so their cached stats pick up the event that just
-    // happened, rather than each of them individually waiting out the 24h queue-join cache.
-    // statsRescraped is set synchronously (before the rescrape resolves) so an overlapping tick
-    // within the same ~60s window can't fire it twice. Doesn't apply to permanent tournaments —
-    // there's no single "this tournament just began" moment for something that's always open.
+    // Tournament just moved from upcoming to past (beginTime has elapsed) — expire every
+    // registered player's cached stats in this region (no scraping here, see players.js's
+    // rescrapeRegisteredPlayers) so their cached stats pick up the event that just happened the
+    // next time they actually queue, rather than each of them individually waiting out the 24h
+    // queue-join cache. statsRescraped is set synchronously (before the invalidation resolves) so
+    // an overlapping tick within the same ~60s window can't fire it twice. Doesn't apply to
+    // permanent tournaments — there's no single "this tournament just began" moment for something
+    // that's always open.
     if (!pinned.permanent && !pinned.statsRescraped && new Date(pinned.beginTime).getTime() <= Date.now()) {
       pinned.statsRescraped = true;
       saveStore(guild.id);
-      console.log(`  🔄 ${channelId} (${pinned.tournamentName}, ${pinned.region}) — tournament has begun, triggering batch stats rescrape`);
+      console.log(`  🔄 ${channelId} (${pinned.tournamentName}, ${pinned.region}) — tournament has begun, expiring cached stats for registered players in this region`);
       playerStore.rescrapeRegisteredPlayers(guild.id, pinned.region)
-        .catch(err => console.error(`  ❌ Batch rescrape failed for ${pinned.tournamentName} (${pinned.region}):`, err.message));
+        .catch(err => console.error(`  ❌ Cache invalidation failed for ${pinned.tournamentName} (${pinned.region}):`, err.message));
     }
 
     try {
@@ -402,7 +404,7 @@ async function forEachGuild(client, action) {
 
 // Scrapes exactly once (never per-guild — see tournament-scraper.js's doc comment on
 // scrapeUpcomingTournaments), then fans the single result out to every guild's
-// checkAndCreateChannels call. This is what keeps an hourly tick at O(1) Puppeteer navigations
+// checkAndCreateChannels call. This is what keeps each tick at O(1) Puppeteer navigations
 // regardless of guild count, instead of the O(guilds) it used to be.
 async function runTournamentCheckTick(client, pinnedMessages) {
   let tournaments;
@@ -440,7 +442,7 @@ async function runEmbedRefreshTick(client, pinnedMessages) {
 }
 
 function startScheduler(client, pinnedMessages) {
-  // Runs immediately on every startup (not just at the next hourly tick) so a tournament that
+  // Runs immediately on every startup (not just at the next daily tick) so a tournament that
   // entered the 48h window while the bot was offline gets its channel created right away.
   console.log('📅 Running initial tournament check on startup...');
   runTournamentCheckTick(client, pinnedMessages);
@@ -449,23 +451,26 @@ function startScheduler(client, pinnedMessages) {
   // up to a minute's delay.
   runEmbedRefreshTick(client, pinnedMessages);
 
-  // Every hour, not just once a day — a tournament can enter the 48h creation window at any
-  // point between ticks, and the previous "only at 12:00 UTC" gate meant a tournament entering
-  // the window just after that daily check could sit unnoticed for up to ~24h. This log fires
-  // unconditionally on every tick (independent of whether checkAndCreateChannels itself finds
-  // anything to do) so a live deployment's logs make it obvious the interval is still alive
-  // hour to hour, rather than only ever seeing evidence when a channel actually gets created.
+  // Once a day, not hourly — each tick is a full Puppeteer navigation (scrapeUpcomingTournaments),
+  // and the hourly cadence this used to run at was a real contributor to the Cloudflare IP block
+  // described in tournament-scraper.js's doc comment. A tournament entering the 48h creation
+  // window between daily ticks can now sit unnoticed for up to ~24h before its channel appears —
+  // an accepted tradeoff against scrape volume, still comfortably inside the 48h window itself.
+  // This log fires unconditionally on every tick (independent of whether checkAndCreateChannels
+  // itself finds anything to do) so a live deployment's logs make it obvious the interval is
+  // still alive day to day, rather than only ever seeing evidence when a channel actually gets
+  // created.
   setInterval(async () => {
     const now = new Date();
     console.log(`⏰ Scheduler tick fired — UTC hour ${now.getUTCHours()} (${now.toISOString()}) — running tournament check`);
     await runTournamentCheckTick(client, pinnedMessages);
-  }, 60 * 60 * 1000);
+  }, 24 * 60 * 60 * 1000);
 
   setInterval(() => {
     runEmbedRefreshTick(client, pinnedMessages).catch(console.error);
   }, EMBED_REFRESH_INTERVAL_MS);
 
-  console.log('📅 Tournament scheduler started — hourly tournament check + 60s embed refresh armed');
+  console.log('📅 Tournament scheduler started — daily tournament check + 60s embed refresh armed');
 }
 
 module.exports = { startScheduler, checkAndCreateChannels, managedChannels };

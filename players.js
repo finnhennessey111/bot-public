@@ -102,45 +102,27 @@ async function forceRefreshStats(guildId, discordId, epicUsername, epicId, regio
   return fresh;
 }
 
-// Called by channel-manager.js when a tournament's beginTime passes (upcoming -> past).
-// Re-scrapes every player registered with this guild+region so their cached stats reflect the
-// event that just happened, instead of waiting for each of them to individually hit the 24h
-// cache expiry or the /refresh-stats cooldown. Scrapes are sequential (each launches its own
-// headless browser via scrapePlayer) — deliberately not parallelized, so a region with many
-// registered players doesn't spike memory with dozens of concurrent Chrome instances.
+// Called by channel-manager.js when a tournament's beginTime passes (upcoming -> past). Used to
+// eagerly re-scrape every player registered with this guild+region via a sequential burst of
+// Puppeteer launches — a real contributor to the Cloudflare IP block described in
+// tournament-scraper.js's doc comment. No scraping happens here anymore: this just expires every
+// matching player's cached stats (clears lastUpdated) via one plain Mongo update, so
+// getPlayerStats' existing cache-miss path naturally re-scrapes each of them fresh the next time
+// they actually queue — spread out one-at-a-time over real usage instead of a synchronous burst,
+// and a player who never queues again soon never gets scraped for nothing.
 async function rescrapeRegisteredPlayers(guildId, region) {
-  const registered = await PlayerModel.find({ guildId, region }).lean();
+  const result = await PlayerModel.updateMany(
+    { guildId, region },
+    { $set: { lastUpdated: null } }
+  );
 
-  if (registered.length === 0) {
-    console.log(`[stats] batch rescrape: no registered players for guild=${guildId} region=${region}`);
+  const matched = result.matchedCount ?? 0;
+  if (matched === 0) {
+    console.log(`[stats] cache invalidation: no registered players for guild=${guildId} region=${region}`);
     return;
   }
 
-  console.log(`[stats] batch rescrape starting — ${registered.length} registered player(s) in guild=${guildId} region=${region}`);
-
-  for (const player of registered) {
-    try {
-      // Trusts the record's stored epicUsername/epicId as-is, with no live re-check — Epic OAuth
-      // (the sole linking method now) has no lightweight equivalent to a prior integration's live
-      // lookup, so there's no way to detect a player having re-linked a different Epic account
-      // short of them re-running the link flow themselves. This is an intentional behavior
-      // change, not an oversight.
-      const { epicUsername, epicId } = player;
-
-      if (!epicUsername) {
-        console.warn(`[stats]   skipping ${player.discordId} — no known Epic username`);
-        continue;
-      }
-
-      const fresh = await scrapePlayer(epicUsername, region, epicId);
-      await upsertPlayer(guildId, player.discordId, { epicUsername, epicId, ...toStatsFields(fresh) });
-      console.log(`[stats]   refreshed ${epicUsername} (${player.discordId})`);
-    } catch (err) {
-      console.error(`[stats]   failed to rescrape ${player.discordId}:`, err.message);
-    }
-  }
-
-  console.log(`[stats] batch rescrape complete for guild=${guildId} region=${region}`);
+  console.log(`[stats] cache invalidation — expired lastUpdated for ${matched} registered player(s) in guild=${guildId} region=${region} (re-scraped lazily on their next queue, via getPlayerStats)`);
 }
 
 module.exports = {
