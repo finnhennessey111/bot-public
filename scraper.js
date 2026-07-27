@@ -107,23 +107,39 @@ function getPlacementScore(placement) {
   return 0;
 }
 
+// soloModifier deliberately excludes ranked-cup events (name matches /ranked/i) even though
+// they're otherwise eligible (rosterSize === 1): ranked cups have easy lobbies and no real
+// stakes, so strong results there don't indicate real skill and must never feed this signal.
+// This exclusion is specific to soloModifier's use of results as a GENERAL skill signal — it
+// does NOT apply to ownTournamentModifier below, where self-referential history for the exact
+// same tournament (even if that tournament is a ranked cup) is always a fair signal.
 function calculateMatchScore(playerData, tournamentName, homeRegion, queueRegion) {
-  const tournamentEvents = playerData.recentEvents
+  const base = (playerData.totalPR * 10) + (playerData.thisSeasonPR * 5);
+
+  const ownTournamentEvents = playerData.recentEvents
     .filter(e => e.name === tournamentName)
     .slice(0, 3);
-
-  const avgPlacementScore = tournamentEvents.length > 0
-    ? tournamentEvents.reduce((sum, e) => sum + getPlacementScore(e.placement), 0) / tournamentEvents.length
+  const ownTournamentModifier = ownTournamentEvents.length > 0
+    ? (ownTournamentEvents.reduce((sum, e) => sum + getPlacementScore(e.placement), 0) / ownTournamentEvents.length / 100) * 0.30
     : 0;
 
-  let matchScore = (playerData.totalPR * 10) + (playerData.thisSeasonPR * 5) + avgPlacementScore;
+  const soloEvents = playerData.recentEvents
+    .filter(e => e.rosterSize === 1 && !/ranked/i.test(e.name))
+    .slice(0, 5);
 
-  if (homeRegion !== queueRegion) {
-    const penalty = config.regionPenalties[homeRegion]?.[queueRegion] ?? 0;
-    matchScore = matchScore * (1 - penalty);
+  let soloModifier = 0;
+  if (soloEvents.length > 0) {
+    const placementQuality = (soloEvents.reduce((sum, e) => sum + getPlacementScore(e.placement), 0) / soloEvents.length) / 100;
+    const killsQuality = Math.min((soloEvents.reduce((sum, e) => sum + e.elims, 0) / soloEvents.length) / 45, 1);
+    const soloSignal = (placementQuality * 0.7) + (killsQuality * 0.3);
+    soloModifier = soloSignal * 0.35;
   }
 
-  return Math.round(matchScore);
+  const regionPenalty = homeRegion !== queueRegion
+    ? (config.regionPenalties[homeRegion]?.[queueRegion] ?? 0)
+    : 0;
+
+  return Math.round(base * (1 + soloModifier + ownTournamentModifier - regionPenalty));
 }
 
 module.exports = { scrapePlayer, calculateMatchScore };

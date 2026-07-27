@@ -31,6 +31,17 @@ module.exports = {
     { afterSeconds: 25, maxLogPRDiff: 60, samePlatformOnly: false },
   ],
 
+  // Tournament queue widening — same logPR-distance approach as creativeWideningSchedule, but
+  // unlike creative's permanent 60-logPR ceiling, ends with an unlimited tier after a longer
+  // wait (same philosophy as the old raw-PR matchWideningSchedule's final Infinity tier) —
+  // tournament lobbies are large enough that an eventual any-PR pairing is preferable to an
+  // unfilled queue.
+  tournamentWideningSchedule: [
+    { afterSeconds: 0,  maxLogPRDiff: 50, samePlatformOnly: true },
+    { afterSeconds: 45, maxLogPRDiff: 80, samePlatformOnly: false },
+    { afterSeconds: 90, maxLogPRDiff: Infinity, samePlatformOnly: false },
+  ],
+
   // 6s/8s creative team queue — post-formation channel lifecycle and vote-kick timings.
   // PR/platform matching itself reuses creativeWideningSchedule above, not a separate schedule.
   teamQueue: {
@@ -52,14 +63,16 @@ module.exports = {
     'EU': {},
   },
 
-  // Placement score conversion
+  // Placement score conversion — bounded 0-100 scale. Worst possible placement in any
+  // tournament is #10,000 (confirmed), so this is fully bounded rather than open-ended; bands
+  // are calibrated against the actual player base, where top-10/top-50 finishes essentially
+  // never happen.
   placementScores: [
-    { threshold: 10,   score: 400 },
-    { threshold: 50,   score: 300 },
-    { threshold: 100,  score: 200 },
-    { threshold: 500,  score: 100 },
-    { threshold: 1000, score: 50  },
-    { threshold: 5000, score: 20  },
+    { threshold: 300,   score: 100 },
+    { threshold: 1000,  score: 70  },
+    { threshold: 2000,  score: 40  },
+    { threshold: 5000,  score: 15  },
+    { threshold: 10000, score: 5   },
   ],
 
   // Channel lifecycle

@@ -13,9 +13,11 @@
 // from the same guild (parties are formed within one server), so `unit.guildId` covers every
 // member.
 //
-// Matching has no hard PR bands. Eligibility is gated by a soft, time-widening Total PR
-// distance rule (getWideningTier), and among eligible candidates the closest Match Score
-// wins, with a PR-distance penalty nudging the ranking (getPRDistancePenalty). The whole
+// Matching has no hard PR bands. Eligibility is gated by a soft, time-widening logPR
+// distance rule (getWideningTier, same Math.log(totalPR + 1) * 100 mechanism as
+// creative-queue.js, against config.tournamentWideningSchedule), and among eligible candidates
+// the closest Match Score wins, with a PR-distance penalty nudging the ranking
+// (getPRDistancePenalty). The whole
 // waiting pool for a tournament+region (across every guild) is reconciled together
 // (attemptMatchingForQueue), triggered by joins, by reject/expire requeues, and by a periodic
 // sweep — never by per-unit timers, so eligibility is always derivable from `joinedAt` alone
@@ -113,14 +115,21 @@ function isCompatiblePlatform(unitA, unitB) {
   return true;
 }
 
-// Max allowed Total PR difference for a unit right now, based purely on elapsed wait time —
-// no stored timer state, so this is always correct even immediately after a restart.
+function toLogPR(totalPR) {
+  return Math.log(totalPR + 1) * 100;
+}
+
+// Widening tier for a unit right now, based purely on elapsed wait time — no stored timer
+// state, so this is always correct even immediately after a restart. Gates on logPR distance
+// (Math.log(totalPR + 1) * 100), not raw PR — same mechanism as creative-queue.js's
+// getCreativeWideningTier, just against config.tournamentWideningSchedule instead of
+// config.creativeWideningSchedule.
 function getWideningTier(waitSeconds) {
-  let maxPRDiff = config.matchWideningSchedule[0].maxPRDiff;
-  for (const step of config.matchWideningSchedule) {
-    if (waitSeconds >= step.afterSeconds) maxPRDiff = step.maxPRDiff;
+  let tier = config.tournamentWideningSchedule[0];
+  for (const step of config.tournamentWideningSchedule) {
+    if (waitSeconds >= step.afterSeconds) tier = step;
   }
-  return maxPRDiff;
+  return tier;
 }
 
 function getPRDistancePenalty(prDiff) {
@@ -130,19 +139,30 @@ function getPRDistancePenalty(prDiff) {
   return config.prDistancePenalties[config.prDistancePenalties.length - 1].scorePenalty;
 }
 
+// Same-platform-only gate for the tier's early band — generalized from creative-queue.js's
+// single-member check (unitA.members[0].platform !== unitB.members[0].platform) to tournament
+// units, which can carry 2 members (an lf1 party).
+function isSamePlatform(unitA, unitB) {
+  const platforms = new Set([...unitA.members, ...unitB.members].map(p => p.platform));
+  return platforms.size === 1;
+}
+
 function canMatch(unitA, unitB, now) {
   if (!isCompatibleQueueType(unitA.queueType, unitB.queueType)) return false;
   if (!isCompatiblePlatform(unitA, unitB)) return false;
 
-  const prDiff = Math.abs(unitA.totalPR - unitB.totalPR);
   const waitA = (now - new Date(unitA.joinedAt).getTime()) / 1000;
   const waitB = (now - new Date(unitB.joinedAt).getTime()) / 1000;
-  // Both sides must currently allow the gap — the more restrictive (less-waited) side wins,
-  // so a freshly-joined unit can't be dragged into a huge gap just because the other side
-  // has been waiting long enough to be fully open.
-  const allowedDiff = Math.min(getWideningTier(waitA), getWideningTier(waitB));
+  // Tiers widen monotonically with wait time, so the tier keyed off the *smaller* of the two
+  // waits is always the more restrictive one — same principle creative-queue.js's evaluateMatch
+  // relies on, so a freshly-joined unit can't be dragged into a wide-open gap just because the
+  // other side has been waiting long enough to be fully open.
+  const tier = getWideningTier(Math.min(waitA, waitB));
 
-  return prDiff <= allowedDiff;
+  if (tier.samePlatformOnly && !isSamePlatform(unitA, unitB)) return false;
+
+  const logPRDiff = Math.abs(toLogPR(unitA.totalPR) - toLogPR(unitB.totalPR));
+  return logPRDiff <= tier.maxLogPRDiff;
 }
 
 function rankingDiff(unitA, unitB) {
