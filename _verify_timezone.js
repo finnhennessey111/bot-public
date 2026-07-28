@@ -1,0 +1,100 @@
+// One-off timezone verification — NOT part of the app, delete after use.
+// Run with: node _verify_timezone.js EU
+//
+// Fetches the same schedule page 3x with different emulated browser timezones (default/system,
+// forced UTC, forced America/Los_Angeles which is UTC-7 in July/DST) and compares the displayed
+// event times. If the site formats times client-side using the browser's local timezone, the
+// UTC and LA runs will show times exactly 7 hours apart for the same events; if the site bakes in
+// a fixed zone regardless of viewer, all 3 runs will show identical times.
+const puppeteer = require('puppeteer');
+const fs = require('fs');
+const { proxyLaunchArgs, authenticatePage, logProxyMode } = require('./proxy-config');
+
+logProxyMode('verify-timezone');
+
+const region = process.argv[2] || 'EU';
+
+async function fetchBodyText(timezone) {
+  const browser = await puppeteer.launch({
+    headless: 'new',
+    args: ['--no-sandbox', '--disable-setuid-sandbox', ...proxyLaunchArgs()],
+  });
+
+  try {
+    const page = await browser.newPage();
+    await authenticatePage(page);
+    if (timezone) await page.emulateTimezone(timezone);
+    await page.setUserAgent(
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    );
+
+    const url = `https://www.fortnite.com/competitive/schedule?region=${region}`;
+    const response = await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
+    console.log(`  [${timezone ?? 'system-default'}] HTTP status: ${response.status()}`);
+
+    return await page.evaluate(() => document.body.innerText);
+  } finally {
+    await browser.close();
+  }
+}
+
+// Pulls out the sequence of (time, roundLabel, eventName) triples in document order, ignoring the
+// optional trailing player-name line — same line-grammar as the real inspection, just enough to
+// diff two runs against each other.
+function extractEntries(bodyText) {
+  const lines = bodyText.split('\n').map(l => l.trim()).filter(Boolean);
+  const isTime = l => /^\d{1,2}:\d{2} (AM|PM)$/i.test(l);
+  const isWeekday = l => /^(MONDAY|TUESDAY|WEDNESDAY|THURSDAY|FRIDAY|SATURDAY|SUNDAY)$/.test(l);
+  const isRoundLabel = l => /^(WEEK|SESSION) \d+( - ROUND \d+)?$/.test(l);
+
+  const entries = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (isTime(lines[i]) && isRoundLabel(lines[i + 1] ?? '')) {
+      const time = lines[i];
+      const roundLabel = lines[i + 1];
+      const eventName = lines[i + 2] ?? '';
+      entries.push(`${time} | ${roundLabel} | ${eventName}`);
+    }
+  }
+  return entries;
+}
+
+(async () => {
+  console.log('Fetching with system-default timezone...');
+  const textDefault = await fetchBodyText(null);
+  console.log('Fetching with forced UTC...');
+  const textUTC = await fetchBodyText('UTC');
+  console.log('Fetching with forced America/Los_Angeles (UTC-7 in July)...');
+  const textLA = await fetchBodyText('America/Los_Angeles');
+
+  fs.writeFileSync(`tz_${region}_default.txt`, textDefault);
+  fs.writeFileSync(`tz_${region}_utc.txt`, textUTC);
+  fs.writeFileSync(`tz_${region}_la.txt`, textLA);
+
+  const entriesDefault = extractEntries(textDefault);
+  const entriesUTC = extractEntries(textUTC);
+  const entriesLA = extractEntries(textLA);
+
+  console.log(`\nFound ${entriesDefault.length} / ${entriesUTC.length} / ${entriesLA.length} entries (default/UTC/LA)\n`);
+  console.log('First 15 entries, side by side:\n');
+  const n = Math.min(15, entriesDefault.length, entriesUTC.length, entriesLA.length);
+  for (let i = 0; i < n; i++) {
+    console.log(`DEFAULT: ${entriesDefault[i]}`);
+    console.log(`UTC:     ${entriesUTC[i]}`);
+    console.log(`LA:      ${entriesLA[i]}`);
+    console.log('---');
+  }
+
+  const defaultMatchesUTC = JSON.stringify(entriesDefault) === JSON.stringify(entriesUTC);
+  const utcMatchesLA = JSON.stringify(entriesUTC) === JSON.stringify(entriesLA);
+  console.log(`\nDefault === UTC: ${defaultMatchesUTC}`);
+  console.log(`UTC === LA: ${utcMatchesLA}`);
+  if (!utcMatchesLA) {
+    console.log('=> Times DO shift with emulated timezone: page renders client-side in browser-local time. Force page.emulateTimezone(\'UTC\') in the real scraper and treat displayed times as true UTC.');
+  } else {
+    console.log('=> Times do NOT shift with emulated timezone: page bakes in a fixed zone server-side. Need to cross-reference a known event against tournament-scraper.js\'s existing Fortnite Tracker beginTime to pin down which fixed zone this is.');
+  }
+})().catch(err => {
+  console.error('Verification failed:', err);
+  process.exit(1);
+});
