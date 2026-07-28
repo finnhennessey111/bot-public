@@ -1,6 +1,7 @@
 const puppeteer = require('puppeteer');
 const config = require('./config');
 const { proxyLaunchArgs, authenticatePage, logProxyMode } = require('./proxy-config');
+const { inferRosterSize } = require('./roster-size');
 
 logProxyMode('scraper');
 
@@ -105,17 +106,6 @@ function parseProfileData(data) {
   const cappedRecentEvents = recentEvents.slice(0, 20);
 
   return { totalPR, thisSeasonPR, prBand, recentEvents: cappedRecentEvents };
-}
-
-// Keyword-based team-size fallback for when event.rosterSize comes back null (see call site in
-// parseProfileData). Word-boundary match against the lowercased title only — deliberately no
-// attempt to infer a size for titles with no team-size word at all (returns null, caller logs it).
-function inferRosterSize(nameLower) {
-  if (/\bsolos?\b/.test(nameLower)) return 1;
-  if (/\bduos?\b/.test(nameLower)) return 2;
-  if (/\btrios?\b/.test(nameLower)) return 3;
-  if (/\bsquads?\b/.test(nameLower)) return 4;
-  return null;
 }
 
 function extractPowerRank(powerRank) {
