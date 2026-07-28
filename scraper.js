@@ -85,7 +85,11 @@ function parseProfileData(data) {
 
   recentEvents.sort((a, b) => new Date(b.date) - new Date(a.date));
 
-  return { totalPR, thisSeasonPR, prBand, recentEvents };
+  // calculateMatchScore only ever reads at most 8 (3 for ownTournamentModifier, 5 for
+  // soloModifier), so cap well above that to bound what gets stored without risking either signal.
+  const cappedRecentEvents = recentEvents.slice(0, 20);
+
+  return { totalPR, thisSeasonPR, prBand, recentEvents: cappedRecentEvents };
 }
 
 function extractPowerRank(powerRank) {
