@@ -13,6 +13,13 @@ logProxyMode('scraper');
 const PLAYER_SCRAPE_MAX_ATTEMPTS = 3;
 const PLAYER_SCRAPE_RETRY_DELAY_MS = 1500;
 
+// Every real successful scrape observed (manual tests and production) finishes in 2-15s — 30s was
+// sized to catch a genuinely hung request, not describe the normal case, and burning the full 30s
+// before a bad exit IP's attempt gets abandoned made each retry cycle needlessly slow. 15s stays
+// comfortably above every observed real completion time while still meaningfully speeding up how
+// fast a bad attempt fails and retries.
+const PLAYER_SCRAPE_NAV_TIMEOUT_MS = 15000;
+
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
@@ -36,7 +43,7 @@ async function scrapePlayerOnce(epicUsername, region = 'EU', epicId = null) {
       .replace('{epicId}', epicId ?? '');
 
     console.log(`Scraping: ${url}`);
-    await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
+    await page.goto(url, { waitUntil: 'networkidle2', timeout: PLAYER_SCRAPE_NAV_TIMEOUT_MS });
 
     const data = await page.evaluate(() => {
       const scripts = Array.from(document.querySelectorAll('script'));

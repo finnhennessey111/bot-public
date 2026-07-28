@@ -732,6 +732,29 @@ async function handleInteraction(interaction) {
       await handleRefreshStatsRequest(interaction);
     }
 
+    // /unlink-epic — the only way to fully unlink (re-triggering Link Epic Account in #register
+    // only ever *replaces* the link with a new one, see epic_link_open below). No confirmation
+    // step: this is low-stakes and reversible — the cleared stats are just a cached snapshot of
+    // data Fortnite Tracker still has, re-populated automatically on the next queue-join scrape,
+    // and running a slash command is already a deliberate action, same precedent as /party-leave
+    // and /cancel-tournament not requiring one either.
+    if (interaction.commandName === 'unlink-epic') {
+      await interaction.deferReply({ flags: 64 });
+
+      const existing = await playerStore.getPlayer(interaction.guild.id, interaction.user.id);
+      if (!playerStore.isEpicLinked(existing)) {
+        return interaction.editReply({ content: '❌ You don\'t have an Epic account linked.' });
+      }
+
+      const previousUsername = existing.epicUsername;
+      await playerStore.unlinkEpicAccount(interaction.guild.id, interaction.user.id);
+
+      await interaction.editReply({
+        content: `✅ Unlinked **${previousUsername}**. Your cached stats were cleared too. `
+          + 'Head to #register and click **Link Epic Account** to link a different one whenever you\'re ready.',
+      });
+    }
+
     // /cancel-tournament
     if (interaction.commandName === 'cancel-tournament') {
       await interaction.deferReply({ flags: 64 });
@@ -1165,9 +1188,18 @@ async function handleInteraction(interaction) {
         });
       }
 
+      // Re-triggering this while already linked is how a player switches to a different Epic
+      // account — the callback (webhook-server.js) replaces the existing link outright, no extra
+      // step needed — but say so up front so it's clear continuing replaces the current link
+      // rather than, say, adding a second account or silently failing.
+      const existing = await playerStore.getPlayer(guild.id, user.id);
+      const alreadyLinkedMessage = playerStore.isEpicLinked(existing)
+        ? `You're currently linked as **${existing.epicUsername}**. Continuing below will replace that link with whichever Epic account you sign in with. `
+        : '';
+
       const url = epicOAuth.buildAuthorizeUrl(user.id, guild.id);
       await interaction.reply({
-        content: '🔗 Click below to link your Epic account. This link expires in 10 minutes.',
+        content: `🔗 ${alreadyLinkedMessage}Click below to link your Epic account. This link expires in 10 minutes.`,
         components: [buildEpicAuthorizeLinkRow(url)],
         flags: 64,
       });
@@ -1609,6 +1641,12 @@ async function handleInteraction(interaction) {
         return interaction.reply({ content: '❌ Nothing to queue — this team is no longer forming.', flags: 64 });
       }
 
+      // Deferred immediately, before any of the Discord API cleanup calls below (invite/status
+      // message fetch+edit) — those are real network round trips that could otherwise eat into
+      // Discord's 3s initial-acknowledgment window on their own, on top of the stats scrape that
+      // follows via finalizeTeamQueueJoin (retries can now realistically take 60-90+s worst case).
+      await interaction.deferReply({ flags: 64 });
+
       const selection = { mode: team.mode, region: team.region };
       const membersRaw = team.members.map(m => ({ discordId: m.discordId, username: m.username }));
       const category = team.category;
@@ -1636,7 +1674,6 @@ async function handleInteraction(interaction) {
         }
       }
 
-      await interaction.deferReply({ flags: 64 });
       await finalizeTeamQueueJoin(interaction, category, selection, membersRaw);
     }
 

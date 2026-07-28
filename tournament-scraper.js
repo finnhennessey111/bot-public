@@ -5,12 +5,13 @@ const { resolveRosterSize } = require('./roster-size');
 logProxyMode('tournament-scraper');
 
 // Skip these entirely when creating queue channels (scrapeUpcomingTournaments) — this (plus the
-// separate FNCS-Major compound check below) is the single source of truth for tournament channel
-// eligibility. channel-manager.js has no whitelist of its own — anything that survives this
-// filter gets a channel, including ranked cups, skin/creator cups (Mongraal Cup, Clix Cup, etc.),
-// victory cups, cash cups, reload cups, and FNCS divisions (which additionally get a permanent,
-// always-open channel — see PERMANENT_KEYWORDS below). Applies identically regardless of which
-// source (official schedule or Fortnite Tracker) produced the raw session.
+// separate restricted-FNCS-stage compound checks below, isFncsFinals/isFncsHeats) is the single
+// source of truth for tournament channel eligibility. channel-manager.js has no whitelist of its
+// own — anything that survives this filter gets a channel, including ranked cups, skin/creator
+// cups (Mongraal Cup, Clix Cup, etc.), victory cups, cash cups, reload cups, and FNCS divisions
+// (which additionally get a permanent, always-open channel — see PERMANENT_KEYWORDS below).
+// Applies identically regardless of which source (official schedule or Fortnite Tracker) produced
+// the raw session.
 const BLOCKED_KEYWORDS = [
   'mobile',
   'solo',
@@ -66,15 +67,17 @@ function buildTournamentGroups(rawSessions) {
   const survivingSessions = [];
   for (const session of rawSessions) {
     const blockedMatch = BLOCKED_KEYWORDS.find(k => session.titleLower.includes(k));
-    // FNCS Majors are a compound match — "fncs" and "major" don't work as standalone
-    // BLOCKED_KEYWORDS entries without also blocking regular FNCS divisions.
-    const isFncsMajor = session.titleLower.includes('fncs') && session.titleLower.includes('major');
-    // The Grand Finals is the only stage of FNCS branded under the fully-spelled-out name
-    // "Fortnite Championship Series" rather than "FNCS" — every other 'fncs' substring check above
-    // (and MULTI_SESSION_KEYWORDS/PERMANENT_KEYWORDS below) misses it entirely for that reason.
-    // Pros-only, same exclusion rationale as FNCS Majors.
-    const isFncsGrandFinals = session.titleLower.includes('fortnite championship series');
-    if (blockedMatch || isFncsMajor || isFncsGrandFinals) {
+    // Restricted-to-already-qualified-players FNCS stages are compound matches — "fncs" alone
+    // would also block regular FNCS divisions, so these check for a second, stage-specific word
+    // instead. Confirmed against real titles (not slugs): the Last Chance Qualifier's actual title
+    // is "FNCS Major 2 Last Chance Qualifier" — a plain 'fncs'+'major' check (the previous version
+    // of this logic) wrongly excluded it, since "Major 2" is just part of its real name, not an
+    // indicator it's restricted. 'finals' covers the Grand Finals too (whether branded "FNCS Grand
+    // Finals" or the fully-spelled-out "Fortnite Championship Series ... Finals") without needing
+    // a separate check for that alternate branding.
+    const isFncsFinals = session.titleLower.includes('fncs') && session.titleLower.includes('finals');
+    const isFncsHeats = session.titleLower.includes('fncs') && session.titleLower.includes('heats');
+    if (blockedMatch || isFncsFinals || isFncsHeats) {
       blockedCount++;
       continue;
     }

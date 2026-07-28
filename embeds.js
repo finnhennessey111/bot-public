@@ -765,6 +765,17 @@ function buildSetupInstructionsEmbed() {
       '• Tournament channels appear automatically 48hrs before each tournament\n' +
       '• For help: personalediting2@gmail.com'
     )
+    .addFields({
+      name: '🔧 Troubleshooting common issues',
+      value:
+        '• Channels aren\'t being created / "Category does not exist" errors — a category got ' +
+        'deleted or renamed since setup ran. Fix: re-run `/matchmaker-setup`.\n' +
+        '• "No verified role configured" warnings — same cause, same fix: re-run `/matchmaker-setup`.\n' +
+        '• Someone stuck on "fetching stats" — this can occasionally take up to a minute if it ' +
+        'needs a couple of retries behind the scenes; it should resolve on its own. If it errors ' +
+        'outright, have them try again in a minute.\n' +
+        '• Still stuck after re-running setup? — contact personalediting2@gmail.com',
+    })
     .setColor(0x4A90D9)
     .setFooter({ text: 'MatchMaker' });
 }

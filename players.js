@@ -42,6 +42,46 @@ function isEpicLinked(playerRecord) {
   return !!(playerRecord?.epicOAuthLinked && playerRecord.epicId && playerRecord.epicUsername);
 }
 
+// Clears whatever cached Fortnite Tracker stats are on a record — used whenever the linked Epic
+// account changes (a fresh link, a re-link to a *different* account, or an explicit unlink), since
+// getPlayerStats' 24h cache (below) keys purely off lastUpdated/discordId+guildId with no check
+// that the cached snapshot actually belongs to the currently-linked epicId. Without this, a re-
+// link to a different account could keep serving the OLD account's stats — mislabeled as the new
+// one's — for up to 24h.
+function clearedStatsFields() {
+  return { totalPR: null, thisSeasonPR: null, prBand: null, recentEvents: [], lastUpdated: null };
+}
+
+// Called by the Epic OAuth callback (webhook-server.js) on every successful link, including a re-
+// link to a different Epic account than whatever was linked before — re-triggering the same Link
+// Epic Account flow is the existing, already-working way to change accounts (see epic_link_open's
+// index.js handler), this just makes it safe: cached stats are only cleared when the epicId
+// actually changes, so a same-account re-link (e.g. re-authorizing after a token issue) doesn't
+// force a needless re-scrape. Delegates through module.exports (not closed-over local references)
+// so a test can stub getPlayer/upsertPlayer without a live MongoDB connection — same pattern
+// scraper.js's scrapePlayer uses for scrapePlayerOnce.
+async function linkEpicAccount(guildId, discordId, { epicId, epicUsername }) {
+  const existing = await module.exports.getPlayer(guildId, discordId);
+  const isDifferentAccount = isEpicLinked(existing) && existing.epicId !== epicId;
+
+  return module.exports.upsertPlayer(guildId, discordId, {
+    epicId, epicUsername, epicOAuthLinked: true, epicLinkedAt: new Date(),
+    ...(isDifferentAccount ? clearedStatsFields() : {}),
+  });
+}
+
+// Reverts a player to the unlinked state (resolveEpicIdentity's Discord-nickname fallback) — the
+// only way to fully unlink today, since re-triggering Link Epic Account only ever replaces the
+// link with a new one, never removes it outright (see index.js's /unlink-epic command). Cached
+// stats are always cleared here — they belong to the account being unlinked and must never be
+// served against whatever gets linked (or not) next.
+async function unlinkEpicAccount(guildId, discordId) {
+  return module.exports.upsertPlayer(guildId, discordId, {
+    epicId: null, epicUsername: null, epicOAuthLinked: false, epicLinkedAt: null,
+    ...clearedStatsFields(),
+  });
+}
+
 function formatAge(ms) {
   const mins = Math.round(ms / 60000);
   if (mins < 60) return `${mins}m`;
@@ -141,6 +181,8 @@ module.exports = {
   upsertPlayer,
   isRegisteredPlayer,
   isEpicLinked,
+  linkEpicAccount,
+  unlinkEpicAccount,
   getPlayerStats,
   refreshPlayerStats,
   forceRefreshStats,

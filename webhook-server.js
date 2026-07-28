@@ -351,9 +351,9 @@ function startWebhookServer(client) {
       }
 
       try {
-        await playerStore.upsertPlayer(guildId, discordId, {
-          epicId, epicUsername, epicOAuthLinked: true, epicLinkedAt: new Date(),
-        });
+        // linkEpicAccount (not a raw upsertPlayer) — this fires on a re-link to a different Epic
+        // account too, and must invalidate any cached stats tied to whatever was linked before.
+        await playerStore.linkEpicAccount(guildId, discordId, { epicId, epicUsername });
 
         // See permissions.js's progressive-visibility ladder, which gates
         // #get-roles/#how-to-use/#access behind this role.

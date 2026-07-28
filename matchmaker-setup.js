@@ -262,4 +262,10 @@ async function runMatchmakerSetup(guild) {
   }
 }
 
-module.exports = { runMatchmakerSetup };
+module.exports = {
+  runMatchmakerSetup,
+  // Specs exported for testing (e.g. a regression guard confirming no "general" text/voice
+  // channel is ever added back) — runMatchmakerSetup itself needs a live Discord guild object to
+  // exercise, so asserting against these directly is how that's verified without one.
+  ROLE_SPECS, CATEGORY_SPECS, CHANNEL_SPECS, CREATIVE_CHANNEL_SPECS,
+};

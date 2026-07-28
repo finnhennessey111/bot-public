@@ -73,18 +73,25 @@ test('buildChannelName renders the tag at the front of the slugified name', () =
   assert.notEqual(buildChannelName('Typical Gamer Icon Cup (Zero Build)'), 'typical-gamer-icon-cup-zb');
 });
 
-// --- Issue 3: FNCS Grand Finals ("Fortnite Championship Series") excluded -----------------------
+// --- Issue 3: FNCS Grand Finals exclusion ---------------------------------------------------
+// Superseded by real scraped title data (see test/fncs-exclusion.test.js for the full, current
+// rule set) — the original "Fortnite Championship Series" title and the 'fncs'+'major' check were
+// both unconfirmed/wrong: 'major' alone wrongly excluded real, non-restricted titles like "FNCS
+// Major 2 Last Chance Qualifier". Kept here (updated) rather than deleted, for continuity with the
+// rest of this file's BR/ZB history.
 
-test('buildTournamentGroups excludes "Fortnite Championship Series" (FNCS Grand Finals)', () => {
+test('buildTournamentGroups excludes real FNCS Finals/Heats titles but not a bare "Major" division stage', () => {
   const sessions = [
-    rawSession('Fortnite Championship Series'),
-    rawSession('FNCS Major 3'),
+    rawSession('FNCS Grand Finals'),
+    rawSession('FNCS Major 3 Heats'),
+    rawSession('FNCS Major 3 Last Chance Qualifier'),
     rawSession('FNCS Division 1'),
   ];
   const groups = buildTournamentGroups(sessions);
   const names = groups.map(g => g.name);
 
-  assert.ok(!names.includes('Fortnite Championship Series'), 'Grand Finals must be excluded');
-  assert.ok(!names.includes('FNCS Major 3'), 'FNCS Majors must stay excluded');
+  assert.ok(!names.includes('FNCS Grand Finals'), 'Grand Finals must be excluded');
+  assert.ok(!names.includes('FNCS Major 3 Heats'), 'FNCS Heats stages must be excluded');
+  assert.ok(names.includes('FNCS Major 3 Last Chance Qualifier'), 'the Last Chance Qualifier must survive — the actual bug this fixes');
   assert.ok(names.includes('FNCS Division 1'), 'regular FNCS divisions must still survive');
 });

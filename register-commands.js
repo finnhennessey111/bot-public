@@ -60,6 +60,10 @@ const commands = [
     .setName('refresh-stats')
     .setDescription('Force a rescrape of your Fortnite Tracker stats (once per hour)'),
 
+  new SlashCommandBuilder()
+    .setName('unlink-epic')
+    .setDescription('Unlink your Epic account — use this before linking a different one, or to remove your link entirely'),
+
   // ── MOD DEBUG COMMANDS (MatchMaker Mod role only) ──────────────────────────
   new SlashCommandBuilder()
     .setName('bot-status')
