@@ -6,6 +6,7 @@ const {
 } = require('discord.js');
 const config = require('./config');
 const { MODES, REGIONS } = require('./creative-queue');
+const epicOAuth = require('./epic-oauth');
 
 const PLATFORM_ICONS = {
   PC: '🖥️',
@@ -91,7 +92,7 @@ function buildTournamentEmbed(tournamentName, region, queueCount, isTrios = fals
       { name: '📍 Region', value: region, inline: true },
       { name: '🎮 Format', value: isTrios ? 'Trios' : 'Duos', inline: true },
     )
-    .setFooter({ text: 'MatchMaker' })
+    .setFooter({ text: 'MatchMaker • matchmakerbot.xyz' })
     .setTimestamp();
 
   return embed;
@@ -431,7 +432,7 @@ function buildCreativeQueueEmbed(category, counts = {}, modes = MODES[category])
       modeLines.join('\n\n')
     )
     .setColor(CREATIVE_COLOR)
-    .setFooter({ text: 'MatchMaker Creative' })
+    .setFooter({ text: 'MatchMaker Creative • matchmakerbot.xyz' })
     .setTimestamp();
 }
 
@@ -893,6 +894,23 @@ function buildEpicAuthorizeLinkRow(url) {
   );
 }
 
+// Reply payload for every queue-join gate (tournament, creative 1v1/2v2, creative 6s/8s) once
+// players.js's isEpicLinked comes back false — reuses the exact same Epic OAuth flow #register's
+// Link Epic Account button uses (epic-oauth.js), just built directly here instead of round-
+// tripping through the epic_link_open button handler, since this fires from queue channels, not
+// #register itself. Built once here (not duplicated per call site) so the messaging and OAuth
+// behavior can never drift between queue types.
+function buildEpicLinkRequiredReply(guildId, discordId) {
+  if (!epicOAuth.isConfigured()) {
+    return { content: '❌ You need to link your Epic account before queueing, but Epic account linking isn\'t set up for this bot yet — contact a mod.' };
+  }
+  const url = epicOAuth.buildAuthorizeUrl(discordId, guildId);
+  return {
+    content: '🔗 You need to link your Epic account before queueing. Click below to get started — this link expires in 10 minutes.',
+    components: [buildEpicAuthorizeLinkRow(url)],
+  };
+}
+
 // ── WELCOME DM ─────────────────────────────────────────────────────────────
 
 function buildWelcomeDmEmbed(guildName) {
@@ -928,7 +946,11 @@ function buildAccessChannelEmbed() {
       'subscribe for unlimited access.'
     )
     .setColor(ACCESS_COLOR)
-    .setFooter({ text: 'MatchMaker' });
+    // Billing/payment issues (charged but no access, subscription not reflecting, etc.) aren't
+    // something a server's own mod team can fix — unlike gameplay questions (buildHowtoEmbed's
+    // "Tag a mod"), this is the one player-facing embed where the developer contact genuinely
+    // belongs, since it's the one player-facing surface tied to real money.
+    .setFooter({ text: 'MatchMaker • Billing issue? personalediting2@gmail.com' });
 }
 
 function buildAccessChannelButtons() {
@@ -1301,6 +1323,7 @@ module.exports = {
   buildRegisterEmbed,
   buildEpicLinkButtonRow,
   buildEpicAuthorizeLinkRow,
+  buildEpicLinkRequiredReply,
   buildWelcomeDmEmbed,
   buildAccessChannelEmbed,
   buildAccessChannelButtons,

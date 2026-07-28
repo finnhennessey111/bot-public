@@ -224,6 +224,26 @@ function combineDateAndTime(dateLine, timeLine) {
 // so fetchOfficialScheduleBodyTextOnce also collects every /events/ anchor's href, in document
 // order, alongside the plain rendered text.
 
+// Some entries render TWO anchors for the same visual card (confirmed against a real page:
+// whenever a leaderboard player-name sub-line is present, its own text is wrapped in a second,
+// identical-href anchor right next to the round's own — the grammar's own note that the player-
+// name line is present on some entries and absent on others matches exactly where these
+// duplicates show up). Collapsing only *consecutive* duplicates (not all duplicates — a genuinely
+// repeated event later in the list, e.g. the same Ranked Cup round appearing again on a different
+// day, must stay) is what realigns this array 1:1 with parseScheduleBodyText's text-block count.
+// Confirmed on a real EU scrape: 105 raw anchors, 76 after this collapse — exactly matching the 76
+// parsed text entries that scrape produced. Without this, hrefs silently correlate to the wrong
+// text entry from the first duplicate onward, which is what was causing "PlayStation Typical
+// Gamer Icon Cup"'s Battle Royale round to get some unrelated tournament's href (never matching
+// the Zero Build detection below) instead of its own.
+function dedupeConsecutiveHrefs(hrefs) {
+  const deduped = [];
+  for (const href of hrefs) {
+    if (deduped[deduped.length - 1] !== href) deduped.push(href);
+  }
+  return deduped;
+}
+
 // Pulls the `round=` query value out of an event href, e.g. "S41_PSTypicalGamer_Qualifier_EU".
 function parseRoundSlug(href) {
   if (!href) return null;
@@ -340,42 +360,27 @@ function parseScheduleBodyText(bodyText, region, eventLinks = []) {
       linkIndex++;
 
       const beginTime = combineDateAndTime(dateLine, timeLine);
-      let name = eventName.trim();
-      if (!beginTime || !name) {
+      const baseName = eventName.trim();
+      if (!beginTime || !baseName) {
         skippedEntries++;
         continue;
       }
 
+      // Build-mode tagging is deferred to a second pass below (needs every entry's baseName+
+      // buildMode collected first) — see that pass's comment for why. Only Final-round filtering
+      // happens here, since dropped entries must never count toward "does this name have a ZB
+      // sibling" either.
+      let buildMode = null;
       if (link) {
         const roundSlug = parseRoundSlug(link.href);
         if (isFinalRoundSlug(roundSlug)) {
           droppedFinalCount++;
           continue; // restricted to already-qualified players — never eligible for a queue channel
         }
-
-        const buildMode = detectBuildMode(link.href);
-        if (buildMode === 'ZB' && !hasBuildModeMarker(name.toLowerCase())) {
-          // Distinguishes this from an identically-worded Battle Royale entry (same title, no
-          // marker, no ZB in its own href) — appended in full-word form so it reads naturally and
-          // so buildChannelName's abbreviation step shortens it the same way it would any other
-          // organically-worded "(Zero Build)" title.
-          name = `${name} (Zero Build)`;
-        }
+        buildMode = detectBuildMode(link.href);
       }
 
-      rawSessions.push({
-        key: `${name}-${region}`,
-        name,
-        titleLower: name.toLowerCase(),
-        region,
-        beginTime,
-        // No structured platform metadata on this source (unlike Tracker's platformGroups) — the
-        // title itself spells out "Console"/"PlayStation" etc. when relevant, so fall back to a
-        // keyword check. False (not console-restricted) is the safe default when ambiguous, same
-        // as Tracker's own default for anything that isn't a clean single-platform-Console match.
-        consoleOnly: /\bconsole\b/i.test(name),
-        platforms: null,
-      });
+      rawSessions.push({ baseName, buildMode, region, beginTime });
     }
   }
 
@@ -389,7 +394,47 @@ function parseScheduleBodyText(bodyText, region, eventLinks = []) {
     console.log(`🔒 [official-schedule:${region}] excluded ${droppedFinalCount} Final-round session(s) from channel eligibility (restricted to already-qualified players)`);
   }
 
-  return rawSessions;
+  // Some tournaments render byte-identical visible text for both their Battle Royale and Zero
+  // Build variants (hasBuildModeMarker's doc comment) — detectBuildMode only ever recognizes the
+  // ZB one explicitly (its href contains "_ZB"), so a same-named sibling entry with no marker at
+  // all used to just stay untagged, producing a genuinely-named but mode-less duplicate channel
+  // alongside the correctly-tagged ZB one. Confirmed against a real scrape: "PlayStation Typical
+  // Gamer Icon Cup"'s Zero Build round's href has "_ZB"; its Qualifier (Battle Royale) round's
+  // href has no build-mode marker whatsoever. The fix: a same-region entry with no marker is only
+  // inferred as Battle Royale when a same-named ZB sibling actually exists (proving this name
+  // really is mode-split) — every *other* tournament (FNCS, Ranked Cup Duos, etc., which never
+  // splits by mode at all) is left exactly as-is, untagged, same as always.
+  const namesWithZbSibling = new Set(rawSessions.filter(s => s.buildMode === 'ZB').map(s => s.baseName));
+
+  const finalSessions = rawSessions.map(session => {
+    let name = session.baseName;
+    const nameLower = name.toLowerCase();
+
+    if (session.buildMode === 'ZB' && !hasBuildModeMarker(nameLower)) {
+      // Appended in full-word form so it reads naturally and so buildChannelName's abbreviation
+      // step shortens it the same way it would any other organically-worded "(Zero Build)" title.
+      name = `${name} (Zero Build)`;
+    } else if (session.buildMode !== 'ZB' && namesWithZbSibling.has(session.baseName) && !hasBuildModeMarker(nameLower)) {
+      name = `${name} (Battle Royale)`;
+      console.log(`🏷️ [official-schedule:${session.region}] "${session.baseName}" has a Zero Build sibling — inferred this entry as Battle Royale (its own href had no build-mode marker)`);
+    }
+
+    return {
+      key: `${name}-${session.region}`,
+      name,
+      titleLower: name.toLowerCase(),
+      region: session.region,
+      beginTime: session.beginTime,
+      // No structured platform metadata on this source (unlike Tracker's platformGroups) — the
+      // title itself spells out "Console"/"PlayStation" etc. when relevant, so fall back to a
+      // keyword check. False (not console-restricted) is the safe default when ambiguous, same
+      // as Tracker's own default for anything that isn't a clean single-platform-Console match.
+      consoleOnly: /\bconsole\b/i.test(name),
+      platforms: null,
+    };
+  });
+
+  return finalSessions;
 }
 
 async function fetchOfficialScheduleBodyTextOnce(region) {
@@ -409,14 +454,15 @@ async function fetchOfficialScheduleBodyTextOnce(region) {
     const url = `https://www.fortnite.com/competitive/schedule?region=${region}`;
     const response = await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
     const status = response.status();
-    const { bodyText, eventLinks } = await page.evaluate(() => {
+    const { bodyText, rawHrefs } = await page.evaluate(() => {
       const anchors = Array.from(document.querySelectorAll('a[href*="/events/"]'))
         .filter(a => (a.getAttribute('href') || '').includes('round='));
       return {
         bodyText: document.body.innerText,
-        eventLinks: anchors.map(a => ({ href: a.getAttribute('href') || '' })),
+        rawHrefs: anchors.map(a => a.getAttribute('href') || ''),
       };
     });
+    const eventLinks = dedupeConsecutiveHrefs(rawHrefs).map(href => ({ href }));
     return { status, bodyText, eventLinks };
   } finally {
     await browser.close();
@@ -566,7 +612,10 @@ async function scrapeUpcomingTournaments() {
   }
 }
 
-module.exports = { scrapeUpcomingTournaments, buildTournamentGroups, isBareBuildModeLabel };
+module.exports = {
+  scrapeUpcomingTournaments, buildTournamentGroups, isBareBuildModeLabel,
+  parseScheduleBodyText, dedupeConsecutiveHrefs,
+};
 
 // Test run
 if (require.main === module) {

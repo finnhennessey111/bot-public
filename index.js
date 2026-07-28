@@ -40,7 +40,7 @@ const {
   buildAccessStatusEmbed, buildAccessSubscribeButtons, buildNoAccessEmbed,
   buildUseCreditsButton, buildCreditWindowStartedDmEmbed,
   buildBotStatusEmbed, buildQueueStatusEmbed, buildPlayerLookupEmbed,
-  buildEpicAuthorizeLinkRow,
+  buildEpicAuthorizeLinkRow, buildEpicLinkRequiredReply,
 } = require('./embeds');
 const store = require('./store');
 const { pinnedMessages, save: saveStore } = store;
@@ -153,6 +153,22 @@ async function finalizeTeamQueueJoin(interaction, category, selection, membersRa
     if (unregistered) {
       return interaction.editReply({
         content: `❌ **${unregistered.user.username}** needs to complete their profile in <#${getChannelId(guild.id, 'getRoles')}> first (set their region).`,
+      });
+    }
+
+    // Checked per-member (not just the clicker) since Queue Now can finalize a whole team at
+    // once — if a teammate rather than the clicker is unlinked, there's no button to hand them
+    // (only they can complete their own OAuth flow), so that case just names them instead.
+    let unlinkedMember = null;
+    for (const member of members) {
+      if (!(await isEpicLinked(guild.id, member.id))) { unlinkedMember = member; break; }
+    }
+    if (unlinkedMember) {
+      if (unlinkedMember.id === interaction.user.id) {
+        return interaction.editReply(buildEpicLinkRequiredReply(guild.id, unlinkedMember.id));
+      }
+      return interaction.editReply({
+        content: `❌ **${unlinkedMember.user.username}** needs to link their Epic account before this team can queue.`,
       });
     }
 
@@ -1196,6 +1212,10 @@ async function handleInteraction(interaction) {
         });
       }
 
+      if (!(await isEpicLinked(guild.id, user.id))) {
+        return replyAndDismiss(interaction, buildEpicLinkRequiredReply(guild.id, user.id));
+      }
+
       const platform = getPlatformFromMember(guild.id, member);
 
       if (consoleOnly && isPCPlayer(guild.id, member)) {
@@ -1376,6 +1396,10 @@ async function handleInteraction(interaction) {
           return replyAndDismiss(interaction, {
             content: `❌ Complete your profile in <#${getChannelId(guild.id, 'getRoles')}> first (set your region).`,
           });
+        }
+
+        if (!(await isEpicLinked(guild.id, user.id))) {
+          return replyAndDismiss(interaction, buildEpicLinkRequiredReply(guild.id, user.id));
         }
 
         const creativeAccess = await access.checkAccess(user.id);
@@ -1932,10 +1956,12 @@ async function assignRole(guild, discordId, roleId) {
 // their epicId/epicUsername in Mongo are a real, player-confirmed link, so use those directly.
 // No live re-check happens (Epic OAuth has no lightweight equivalent to the live lookup a former
 // integration used to provide here) — a player who hasn't linked just falls back to their Discord
-// display name.
+// display name. Callers that are about to scrape/queue with this identity should check
+// isEpicLinked first (below) rather than relying on this fallback silently producing a Discord
+// nickname that Fortnite Tracker has never heard of.
 async function resolveEpicIdentity(guild, member) {
   const stored = await playerStore.getPlayer(guild.id, member.id);
-  if (stored?.epicOAuthLinked && stored.epicId && stored.epicUsername) {
+  if (playerStore.isEpicLinked(stored)) {
     return { epicUsername: stored.epicUsername, epicId: stored.epicId };
   }
 
@@ -1943,6 +1969,16 @@ async function resolveEpicIdentity(guild, member) {
     epicUsername: member.nickname ?? member.user.globalName ?? member.user.username,
     epicId: null,
   };
+}
+
+// ── HELPER: CHECK EPIC LINK STATUS ─────────────────────────────────────────────
+// Thin async convenience around players.js's isEpicLinked (the actual, tested decision logic) —
+// queue-join call sites gate on this *before* ever calling resolveEpicIdentity/buildPlayer/
+// getPlayerStats. Without this, an unlinked player's Discord nickname gets scraped as if it were
+// their Epic username, which fails with a raw "Could not find profile data for: <nickname>"
+// Fortnite Tracker error instead of a message telling them what's actually wrong.
+async function isEpicLinked(guildId, discordId) {
+  return playerStore.isEpicLinked(await playerStore.getPlayer(guildId, discordId));
 }
 
 // ── HELPER: UPDATE QUEUE EMBED ────────────────────────────────────────────────

@@ -31,6 +31,17 @@ async function isRegisteredPlayer(guildId, discordId) {
   return !!(await getPlayer(guildId, discordId));
 }
 
+// A player can hold the "Registered" role (region set) without ever having linked Epic — legacy
+// players from before Epic OAuth gating existed, or a manually-granted role — so linking is its
+// own, independently-checked condition rather than inferred from Registered. Pure predicate over
+// an already-fetched record (not an async DB lookup itself) so callers that already have the
+// record on hand don't pay for a second fetch, and so this exact check is trivially unit-testable
+// without a live MongoDB connection. Same three-field check index.js's resolveEpicIdentity uses
+// internally to decide whether to trust the stored epicId/epicUsername.
+function isEpicLinked(playerRecord) {
+  return !!(playerRecord?.epicOAuthLinked && playerRecord.epicId && playerRecord.epicUsername);
+}
+
 function formatAge(ms) {
   const mins = Math.round(ms / 60000);
   if (mins < 60) return `${mins}m`;
@@ -129,6 +140,7 @@ module.exports = {
   getPlayer,
   upsertPlayer,
   isRegisteredPlayer,
+  isEpicLinked,
   getPlayerStats,
   refreshPlayerStats,
   forceRefreshStats,

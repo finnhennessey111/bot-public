@@ -5,7 +5,19 @@ const { resolveRosterSize } = require('./roster-size');
 
 logProxyMode('scraper');
 
-async function scrapePlayer(epicUsername, region = 'EU', epicId = null) {
+// Same retry shape as tournament-scraper.js's fetchOfficialScheduleRegion — a rotating proxy gets
+// a different exit IP each attempt, and some IPs get through cleanly, so a single Puppeteer
+// navigation timeout (a known, occasional occurrence, not a real failure of the target site) used
+// to fail this player's entire queue attempt outright and surface a raw error. This makes that the
+// rare last-resort after 3 attempts, not the first-attempt norm.
+const PLAYER_SCRAPE_MAX_ATTEMPTS = 3;
+const PLAYER_SCRAPE_RETRY_DELAY_MS = 1500;
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function scrapePlayerOnce(epicUsername, region = 'EU', epicId = null) {
   const browser = await puppeteer.launch({
     headless: 'new',
     args: ['--no-sandbox', '--disable-setuid-sandbox', ...proxyLaunchArgs()]
@@ -44,6 +56,24 @@ async function scrapePlayer(epicUsername, region = 'EU', epicId = null) {
 
   } finally {
     await browser.close();
+  }
+}
+
+// Delegates through module.exports (not a direct call to scrapePlayerOnce) so a test can swap in
+// a fake single-attempt implementation without needing a real Puppeteer/network round trip — the
+// exported function is what actually gets called, same as any other real caller.
+async function scrapePlayer(epicUsername, region = 'EU', epicId = null) {
+  for (let attempt = 1; attempt <= PLAYER_SCRAPE_MAX_ATTEMPTS; attempt++) {
+    try {
+      return await module.exports.scrapePlayerOnce(epicUsername, region, epicId);
+    } catch (err) {
+      console.log(`  [scraper:${epicUsername}] attempt ${attempt}/${PLAYER_SCRAPE_MAX_ATTEMPTS} threw: ${err.message}`);
+      if (attempt < PLAYER_SCRAPE_MAX_ATTEMPTS) {
+        await sleep(PLAYER_SCRAPE_RETRY_DELAY_MS);
+        continue;
+      }
+      throw new Error(`profile scrape for ${epicUsername} failed after ${PLAYER_SCRAPE_MAX_ATTEMPTS} attempts (last error: ${err.message})`);
+    }
   }
 }
 
@@ -180,4 +210,4 @@ function calculateMatchScore(playerData, tournamentName, homeRegion, queueRegion
   return computeMatchScoreBreakdown(playerData, tournamentName, homeRegion, queueRegion).matchScore;
 }
 
-module.exports = { scrapePlayer, calculateMatchScore, computeMatchScoreBreakdown };
+module.exports = { scrapePlayer, scrapePlayerOnce, calculateMatchScore, computeMatchScoreBreakdown };
