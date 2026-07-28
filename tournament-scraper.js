@@ -1,6 +1,6 @@
 const puppeteer = require('puppeteer');
 const { proxyLaunchArgs, authenticatePage, logProxyMode } = require('./proxy-config');
-const { inferRosterSize } = require('./roster-size');
+const { resolveRosterSize } = require('./roster-size');
 
 logProxyMode('tournament-scraper');
 
@@ -62,14 +62,31 @@ function sleep(ms) {
 function buildTournamentGroups(rawSessions) {
   // Stage 1: blocked-keyword filter (title-only, doesn't depend on timing or source).
   let blockedCount = 0;
+  let bareBuildModeCount = 0;
   const survivingSessions = [];
   for (const session of rawSessions) {
     const blockedMatch = BLOCKED_KEYWORDS.find(k => session.titleLower.includes(k));
     // FNCS Majors are a compound match — "fncs" and "major" don't work as standalone
     // BLOCKED_KEYWORDS entries without also blocking regular FNCS divisions.
     const isFncsMajor = session.titleLower.includes('fncs') && session.titleLower.includes('major');
-    if (blockedMatch || isFncsMajor) {
+    // The Grand Finals is the only stage of FNCS branded under the fully-spelled-out name
+    // "Fortnite Championship Series" rather than "FNCS" — every other 'fncs' substring check above
+    // (and MULTI_SESSION_KEYWORDS/PERMANENT_KEYWORDS below) misses it entirely for that reason.
+    // Pros-only, same exclusion rationale as FNCS Majors.
+    const isFncsGrandFinals = session.titleLower.includes('fortnite championship series');
+    if (blockedMatch || isFncsMajor || isFncsGrandFinals) {
       blockedCount++;
+      continue;
+    }
+    // Real scrapes have shown entries whose only visible title text is the build-mode label
+    // itself (e.g. a generic "Battle Royale" or "Zero Build" ranked queue with no cup/event name
+    // attached) — every 'fncs'/BLOCKED_KEYWORDS check above is title-content-based and lets these
+    // straight through, and buildChannelName (channel-manager.js) would turn one into a channel
+    // literally named "battle-royale"/"zero-build" with no way for players to tell which
+    // tournament it's for. A build-mode label alone is never a valid channel name, so drop these
+    // here — the single place both scrape sources funnel through — rather than in each source.
+    if (isBareBuildModeLabel(session.titleLower)) {
+      bareBuildModeCount++;
       continue;
     }
     survivingSessions.push(session);
@@ -123,7 +140,7 @@ function buildTournamentGroups(rawSessions) {
     // isTrios only matters as a boolean downstream (buildTournamentEmbed/buildQueueButtons only
     // distinguish Trios vs. Duos) — solo is already blocked above, and squads isn't a format this
     // bot's queue system offers at all, so any non-trios survivor defaults to "Duos" same as today.
-    const isTrios = inferRosterSize(session.titleLower) === 3;
+    const isTrios = resolveRosterSize(session.titleLower) === 3;
     const isMultiSession = MULTI_SESSION_KEYWORDS.some(k => session.titleLower.includes(k));
     const isPermanent = PERMANENT_KEYWORDS.some(k => session.titleLower.includes(k));
 
@@ -148,7 +165,7 @@ function buildTournamentGroups(rawSessions) {
     }
   }
 
-  console.log(`📊 Filtering: ${blockedCount} blocked-keyword session(s), ${pastCount} past session(s), ${unsupportedRegionCount} unsupported-region session(s) skipped`);
+  console.log(`📊 Filtering: ${blockedCount} blocked-keyword session(s), ${bareBuildModeCount} bare-build-mode-label session(s), ${pastCount} past session(s), ${unsupportedRegionCount} unsupported-region session(s) skipped`);
   console.log(`📋 Grouped into ${Object.keys(groups).length} tournament/region entries`);
 
   return Object.values(groups);
@@ -197,6 +214,63 @@ function combineDateAndTime(dateLine, timeLine) {
   return new Date(Date.UTC(year, monthIndex, day, hour, minute)).toISOString();
 }
 
+// Visible text alone can't distinguish two entries that render identically but link to different
+// events — confirmed real case: "PlayStation Typical Gamer Icon Cup" appears with byte-identical
+// visible text for both its Battle Royale and Zero Build variants, and for its Qualifier vs.
+// (players-only) Final rounds. The distinguishing info only exists in each entry's <a href>, e.g.:
+//   .../events/S41_PSTypicalGamer_ZB?round=S41_PSTypicalGamer_ZB_Qualifier_EU
+//   .../events/S41_PSTypicalGamer?round=S41_PSTypicalGamer_Qualifier_EU
+//   .../events/S41_PSTypicalGamer?round=S41_PSTypicalGamer_Final_EU
+// so fetchOfficialScheduleBodyTextOnce also collects every /events/ anchor's href, in document
+// order, alongside the plain rendered text.
+
+// Pulls the `round=` query value out of an event href, e.g. "S41_PSTypicalGamer_Qualifier_EU".
+function parseRoundSlug(href) {
+  if (!href) return null;
+  const match = href.match(/[?&]round=([^&]+)/);
+  return match ? decodeURIComponent(match[1]) : null;
+}
+
+// Only "Final"/"Finals" is confirmed restricted-to-qualified-players vocabulary so far. Rather
+// than an allowlist of confirmed "open" words (Qualifier is confirmed, but there may be other
+// open-round vocabulary — "Opens", numbered "EventNRoundM" — we haven't seen a real example of
+// yet), this blocks only the confirmed-restricted case and defaults everything else to open. An
+// allowlist would risk silently excluding a legitimate open round using vocabulary we haven't
+// observed; this blocklist risks the opposite (a restricted round we haven't seen slips through) —
+// if production logs turn up another restricted-round keyword, add it here.
+function isFinalRoundSlug(roundSlug) {
+  return !!roundSlug && /final/i.test(roundSlug);
+}
+
+// "_ZB" appears in both the /events/{slug} path and the round slug for Zero Build variants in the
+// confirmed real examples — checking the whole href catches either.
+function detectBuildMode(href) {
+  if (!href) return null;
+  return /_zb(_|\?|$)/i.test(href) ? 'ZB' : null;
+}
+
+// True if the visible name already spells out a build mode some other way (e.g. "Duos Ranked Cup
+// (Zero Build)", "Console Solo Victory Cup (ZB)") — so the href-derived suffix below is only
+// appended when the visible text genuinely has no distinguishing marker of its own.
+function hasBuildModeMarker(nameLower) {
+  return /battle royale|zero build|\bzb\b/.test(nameLower);
+}
+
+// True if, once every build-mode word/abbreviation is stripped out, nothing recognizable is left —
+// i.e. the title IS a build-mode label and nothing else (e.g. "Battle Royale", "Zero Build (ZB)"),
+// as opposed to a real tournament name that merely mentions a build mode ("Solo Ranked Cup (Battle
+// Royale)"). Exported so channel-manager.js can use it as a last-resort guard right before channel
+// creation too, in case a future scrape source feeds buildTournamentGroups something this stage-1
+// filter didn't catch.
+function isBareBuildModeLabel(nameLower) {
+  const stripped = nameLower
+    .replace(/\(?\s*battle royale\s*\)?/gi, ' ')
+    .replace(/\(?\s*zero build\s*\)?/gi, ' ')
+    .replace(/\bbr\b|\bzb\b/gi, ' ')
+    .replace(/[^a-z0-9]+/gi, '');
+  return stripped.length === 0;
+}
+
 // Grammar (confirmed against real rendered output, not assumed):
 //   WEEKDAY_LINE   → "MONDAY" | "TUESDAY" | ...
 //   DATE_LINE      → "July 13, 2026"
@@ -209,11 +283,20 @@ function combineDateAndTime(dateLine, timeLine) {
 //                      entry, not on tournament type) — resolved via lookahead, not guessed: a
 //                      genuine next entry always starts with another TIME_LINE or a new
 //                      WEEKDAY_LINE, so anything else in that slot must be a name line to skip.
-function parseScheduleBodyText(bodyText, region) {
+//
+// eventLinks is the array of {href} for every /events/ anchor on the page, in document order.
+// Each successfully-parsed text entry is correlated positionally with the next unused eventLinks
+// entry — the Nth entry-shaped text block corresponds to the Nth anchor. This is only trusted when
+// the final counts actually line up (checked at the end); a mismatch means the "one anchor per
+// entry" assumption didn't hold for this scrape, and mis-attributing hrefs would be worse than
+// just not having slug data at all, so it's logged loudly rather than silently trusted.
+function parseScheduleBodyText(bodyText, region, eventLinks = []) {
   const lines = bodyText.split('\n').map(l => l.trim()).filter(Boolean);
   const rawSessions = [];
   let i = 0;
   let skippedEntries = 0;
+  let droppedFinalCount = 0;
+  let linkIndex = 0;
 
   while (i < lines.length) {
     if (!isWeekdayLine(lines[i])) {
@@ -250,11 +333,34 @@ function parseScheduleBodyText(bodyText, region) {
         i++;
       }
 
+      // This text block is entry-shaped regardless of whether beginTime/name end up valid below,
+      // so it consumes a link slot now — keeping link correlation in lockstep with "an entry was
+      // found" rather than with "an entry was kept".
+      const link = eventLinks[linkIndex];
+      linkIndex++;
+
       const beginTime = combineDateAndTime(dateLine, timeLine);
-      const name = eventName.trim();
+      let name = eventName.trim();
       if (!beginTime || !name) {
         skippedEntries++;
         continue;
+      }
+
+      if (link) {
+        const roundSlug = parseRoundSlug(link.href);
+        if (isFinalRoundSlug(roundSlug)) {
+          droppedFinalCount++;
+          continue; // restricted to already-qualified players — never eligible for a queue channel
+        }
+
+        const buildMode = detectBuildMode(link.href);
+        if (buildMode === 'ZB' && !hasBuildModeMarker(name.toLowerCase())) {
+          // Distinguishes this from an identically-worded Battle Royale entry (same title, no
+          // marker, no ZB in its own href) — appended in full-word form so it reads naturally and
+          // so buildChannelName's abbreviation step shortens it the same way it would any other
+          // organically-worded "(Zero Build)" title.
+          name = `${name} (Zero Build)`;
+        }
       }
 
       rawSessions.push({
@@ -273,8 +379,14 @@ function parseScheduleBodyText(bodyText, region) {
     }
   }
 
+  if (eventLinks.length > 0 && linkIndex !== eventLinks.length) {
+    console.warn(`⚠️ [official-schedule:${region}] event-link count (${eventLinks.length}) didn't match parsed-entry count (${linkIndex}) — href correlation may be misaligned this cycle, so Final-round filtering and build-mode detection may be unreliable until this is investigated`);
+  }
   if (skippedEntries > 0) {
     console.warn(`⚠️ [official-schedule:${region}] skipped ${skippedEntries} entry/entries that didn't match the expected time/round/name grammar`);
+  }
+  if (droppedFinalCount > 0) {
+    console.log(`🔒 [official-schedule:${region}] excluded ${droppedFinalCount} Final-round session(s) from channel eligibility (restricted to already-qualified players)`);
   }
 
   return rawSessions;
@@ -297,8 +409,15 @@ async function fetchOfficialScheduleBodyTextOnce(region) {
     const url = `https://www.fortnite.com/competitive/schedule?region=${region}`;
     const response = await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
     const status = response.status();
-    const bodyText = await page.evaluate(() => document.body.innerText);
-    return { status, bodyText };
+    const { bodyText, eventLinks } = await page.evaluate(() => {
+      const anchors = Array.from(document.querySelectorAll('a[href*="/events/"]'))
+        .filter(a => (a.getAttribute('href') || '').includes('round='));
+      return {
+        bodyText: document.body.innerText,
+        eventLinks: anchors.map(a => ({ href: a.getAttribute('href') || '' })),
+      };
+    });
+    return { status, bodyText, eventLinks };
   } finally {
     await browser.close();
   }
@@ -323,7 +442,7 @@ async function fetchOfficialScheduleRegion(region) {
       throw new Error(`official schedule fetch for ${region} failed after ${SCHEDULE_MAX_ATTEMPTS} attempts (last error: ${err.message})`);
     }
 
-    const sessions = parseScheduleBodyText(result.bodyText, region);
+    const sessions = parseScheduleBodyText(result.bodyText, region, result.eventLinks);
     if (result.status === 200 && sessions.length > 0) {
       console.log(`  [official-schedule:${region}] attempt ${attempt}/${SCHEDULE_MAX_ATTEMPTS} succeeded: HTTP 200, ${sessions.length} raw session(s) parsed`);
       return sessions;
@@ -447,7 +566,7 @@ async function scrapeUpcomingTournaments() {
   }
 }
 
-module.exports = { scrapeUpcomingTournaments };
+module.exports = { scrapeUpcomingTournaments, buildTournamentGroups, isBareBuildModeLabel };
 
 // Test run
 if (require.main === module) {

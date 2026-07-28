@@ -1,7 +1,7 @@
 const puppeteer = require('puppeteer');
 const config = require('./config');
 const { proxyLaunchArgs, authenticatePage, logProxyMode } = require('./proxy-config');
-const { inferRosterSize } = require('./roster-size');
+const { resolveRosterSize } = require('./roster-size');
 
 logProxyMode('scraper');
 
@@ -70,14 +70,15 @@ function parseProfileData(data) {
       const name = event.displayMetadata?.title_line_1?.trim() ?? 'Unknown';
 
       // Real scrapes show event.rosterSize coming back null across the board — FT Tracker doesn't
-      // populate it on this payload shape — so fall back to a title keyword. If the title has no
-      // team-size word either (e.g. some skin/creator cups like "PlayStation Typical Gamer Icon
-      // Cup Battle Royale"), leave it null rather than guessing a default: soloModifier's
-      // rosterSize === 1 check just won't count this event either way, but a wrong guess could
-      // make it count (or wrongly exclude it) silently. Logged so unclassified titles stay visible.
+      // populate it on this payload shape — so fall back to the manually-verified override map,
+      // then a title keyword. If neither resolves it (e.g. some skin/creator cups have no
+      // team-size word AND aren't in the override map yet), leave it null rather than guessing a
+      // default: soloModifier's rosterSize === 1 check just won't count this event either way, but
+      // a wrong guess could make it count (or wrongly exclude it) silently. Logged so unclassified
+      // titles stay visible.
       let rosterSize = event.rosterSize ?? null;
       if (rosterSize == null) {
-        rosterSize = inferRosterSize(name.toLowerCase());
+        rosterSize = resolveRosterSize(name.toLowerCase());
         if (rosterSize == null) {
           console.warn(`⚠️ Could not determine roster size for event "${name}" — no rosterSize field and no team-size keyword in title. Leaving unclassified.`);
         }

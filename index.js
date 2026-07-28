@@ -31,9 +31,10 @@ const { registerCommands } = require('./register-commands');
 const {
   buildTournamentEmbed, buildQueueButtons, buildLeaveQueueButton,
   buildMatchConfirmedEmbed,
-  buildPartyInviteEmbed, buildPartyInviteButtons, buildPartyStatusEmbed,
-  buildFormPartyInstructionsEmbed, buildPartyInviteOpenButtonRow, buildUserSelectRow,
-  buildPartyChannelInstructionsEmbed, buildPartyChannelButtonRow,
+  buildUserSelectRow,
+  buildTeamBringCountSelectRow, buildTeamMemberUserSelectRow,
+  buildTeamInviteEmbed, buildTeamInviteButtons,
+  buildTeamFormingEmbed, buildTeamFormingButtons,
   buildCreativeMatchConfirmedEmbed, buildCloseChannelButton,
   buildHowtoEmbed, buildRolesEmbed, buildRolesComponents,
   buildAccessStatusEmbed, buildAccessSubscribeButtons, buildNoAccessEmbed,
@@ -43,7 +44,7 @@ const {
 } = require('./embeds');
 const store = require('./store');
 const { pinnedMessages, save: saveStore } = store;
-const party = require('./party');
+const teamInvite = require('./team-invite');
 const {
   REGIONS: CREATIVE_REGIONS, buildCreativePlayer, joinCreativeQueue, requeueCreativeUnit,
   removeFromCreativeQueueAnywhere, findCreativeUnitByDiscordId, isInCreativeQueue,
@@ -102,7 +103,7 @@ async function sendQueueStatusMessage(interaction, label, joinedAt, leaveCustomI
 }
 
 // Checked on every creative (1v1/2v2/6s/8s) queue join — only ever for the clicking user
-// themselves (`discordId`/interaction.user), never their party: an ephemeral message is only
+// themselves (`discordId`/interaction.user), never their teammates: an ephemeral message is only
 // visible to whoever the interaction belongs to, so there's no way to prompt a teammate who
 // didn't click the button. Sent as a separate followUp (not folded into the queue-status
 // editReply above) so it can be dismissed/answered independently.
@@ -117,151 +118,189 @@ async function maybeSendFeedbackPrompt(interaction, discordId, mode) {
   }).catch(err => console.error('Failed to send feedback prompt:', err.message));
 }
 
-// Shared by the /party-invite command and the ➕ Invite to Party button + user-select flow —
-// `interaction` just needs to already be deferred (deferReply for the command, deferUpdate for
-// the select menu) with editReply available; `invited` is the target User either way.
-async function handlePartyInviteRequest(interaction, invited) {
+// Shared by the inline 6s/8s team-forming flow's "0 bring" (solo) path and "Queue Now" — the
+// actual stats-fetch + eligibility checks + creativeTeamQueue.queueUnit() call for a resolved list
+// of members (just the leader for solo, leader + whoever accepted for a formed team). Assumes the
+// interaction is already deferred (or otherwise has editReply available) — same busy/access/stats
+// checks the old party-backed team_queue_ handler used to run for partyMembersRaw.
+async function finalizeTeamQueueJoin(interaction, category, selection, membersRaw) {
   const guild = interaction.guild;
-  const leader = interaction.user;
 
-  if (interaction.channelId !== getChannelId(guild.id, 'formParty')) {
+  const alreadyBusy = membersRaw.some(m =>
+    isInCreativeQueue(guild.id, m.discordId)
+    || creativeTeamQueue.isInTeamQueue(guild.id, m.discordId)
+    || teamJoinInProgress.has(`${guild.id}:${m.discordId}`)
+    || teamMatchLifecycle.isPlayerInActiveTeamMatch(guild.id, m.discordId)
+  );
+  if (alreadyBusy) {
+    return interaction.editReply({ content: '❌ One or more teammates is already queued or in an active match.' });
+  }
+
+  const busyWithTournament = membersRaw.find(m => isInTournamentActivity(guild.id, m.discordId));
+  if (busyWithTournament) {
     return interaction.editReply({
-      content: `❌ Use this in <#${getChannelId(guild.id, 'formParty')}>.`,
+      content: `❌ **${busyWithTournament.username}** is already in a tournament queue or match — leave it before queueing for creative.`,
     });
   }
 
-  if (invited.id === leader.id) {
-    return interaction.editReply({ content: '❌ You cannot invite yourself.' });
-  }
-  if (invited.bot) {
-    return interaction.editReply({ content: '❌ You cannot invite a bot.' });
-  }
-  if (party.hasPendingInvite(guild.id, leader.id)) {
-    return interaction.editReply({ content: '❌ You already have a pending invite out. Wait for it to resolve first.' });
-  }
-  if (!party.canAddMember(guild.id, leader.id)) {
-    return interaction.editReply({ content: `❌ Your party is already at the ${party.MAX_PARTY_SIZE}-member cap.` });
-  }
-  if (party.isInParty(guild.id, invited.id) || party.hasPendingInvite(guild.id, invited.id)) {
-    return interaction.editReply({ content: `❌ **${invited.username}** is already in a party or has a pending invite.` });
-  }
-
-  const existingParty = party.getPartyByDiscordId(guild.id, leader.id);
-  const formPartyChannel = interaction.channel;
-
-  let privateChannel;
-  if (existingParty) {
-    // Growing an existing party — invite into the party's shared channel rather than
-    // spinning up a new one per invite.
-    try {
-      privateChannel = await client.channels.fetch(existingParty.channelId);
-      await privateChannel.permissionOverwrites.edit(invited.id, { ViewChannel: true });
-    } catch (err) {
-      console.error('Failed to add invitee to existing party channel:', err.message);
-      return interaction.editReply({ content: '❌ Failed to open the party channel to the invitee.' });
-    }
-  } else {
-    const channelName = `party-${leader.username}-${invited.username}`
-      .toLowerCase()
-      .replace(/[^a-z0-9-]/g, '-')
-      .slice(0, 90);
-
-    try {
-      privateChannel = await guild.channels.create({
-        name: channelName,
-        type: ChannelType.GuildText,
-        parent: formPartyChannel.parentId ?? null,
-        permissionOverwrites: [
-          { id: guild.roles.everyone, deny: [PermissionFlagsBits.ViewChannel] },
-          { id: leader.id, allow: [PermissionFlagsBits.ViewChannel] },
-          { id: invited.id, allow: [PermissionFlagsBits.ViewChannel] },
-          { id: client.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages] },
-        ],
-      });
-    } catch (err) {
-      console.error('Failed to create party channel:', err.message);
-      return interaction.editReply({ content: '❌ Failed to create private party channel.' });
-    }
-  }
-
-  const inviteId = party.createInvite({
-    leaderId: leader.id,
-    leaderUsername: leader.username,
-    invitedId: invited.id,
-    invitedUsername: invited.username,
-    channelId: privateChannel.id,
-    guildId: guild.id,
-  });
-
-  await privateChannel.send({
-    content: `<@${invited.id}>`,
-    embeds: [buildPartyInviteEmbed(leader.username, invited.username)],
-    components: [buildPartyInviteButtons(inviteId)],
-  });
-
-  setTimeout(async () => {
-    const expired = party.expireInvite(inviteId);
-    if (!expired) return;
-    try {
-      const ch = await client.channels.fetch(expired.channelId);
-      await ch.send('⌛ This party invite expired.');
-      setTimeout(() => ch.delete().catch(console.error), 10000);
-    } catch (err) {
-      console.error('Failed to clean up expired party invite channel:', err.message);
-    }
-  }, 5 * 60 * 1000);
-
-  await interaction.editReply({ content: `✅ Invite sent! Head to ${privateChannel} to continue.` });
-}
-
-// Shared by /party-leave and the 🚪 Leave Party button posted in the party's private channel —
-// looked up by discordId, not by channel, so it works from either place (or anywhere else).
-async function handlePartyLeaveRequest(interaction) {
-  const guild = interaction.guild;
-  const record = party.getPartyByDiscordId(guild.id, interaction.user.id);
-  if (!record) {
-    return interaction.editReply({ content: '❌ You are not in a party.' });
-  }
-
-  const memberIds = record.members.map(m => m.discordId);
-
-  // Reject any pending match first (requeues both units in that match, and tears down its
-  // channel cluster — the match channel now exists from the moment a match is found, not
-  // just after confirm, so this can't be skipped anymore).
-  for (const discordId of memberIds) {
-    const pending = getPendingMatchByDiscordId(guild.id, discordId);
-    if (pending) {
-      const result = rejectMatch(pending.matchId, discordId);
-      if (result.status === 'rejected') {
-        await closeMatchChannelCluster(result.channelsByGuildId, '❌ Match declined — a party member disbanded. This channel will close shortly.');
-      }
-    }
-  }
-  // ...then pull the disbanding unit back out again, wherever it ended up.
-  for (const discordId of memberIds) {
-    removeFromQueueAnywhere(guild.id, discordId);
-  }
+  for (const m of membersRaw) teamJoinInProgress.add(`${guild.id}:${m.discordId}`);
+  await interaction.editReply({ content: `⏳ Fetching stats for ${membersRaw.length} player(s)...` });
 
   try {
-    const ch = await client.channels.fetch(record.channelId);
-    if (ch) await ch.delete();
+    const members = await Promise.all(membersRaw.map(m => guild.members.fetch(m.discordId)));
+
+    const unregistered = members.find(m => !m.roles.cache.has(getRoleId(guild.id, 'Registered')));
+    if (unregistered) {
+      return interaction.editReply({
+        content: `❌ **${unregistered.user.username}** needs to complete their profile in <#${getChannelId(guild.id, 'getRoles')}> first (set their region).`,
+      });
+    }
+
+    for (const member of members) {
+      const memberAccess = await access.checkAccess(member.id);
+      if (!memberAccess.allowed) {
+        await notifyCreditWindowStartedIfNeeded(client, member.id, memberAccess);
+        return interaction.editReply({
+          embeds: [buildNoAccessEmbed(memberAccess)],
+          components: [buildAccessSubscribeButtons()],
+        });
+      }
+    }
+
+    const players = await Promise.all(members.map(async member => {
+      const platform = getPlatformFromMember(guild.id, member);
+      const { epicUsername, epicId } = await resolveEpicIdentity(guild, member);
+      return buildCreativePlayer({
+        guildId: guild.id,
+        guildName: guild.name,
+        discordId: member.id,
+        discordUsername: member.user.username,
+        discordTag: member.user.tag,
+        epicUsername,
+        epicId,
+        mode: selection.mode,
+        region: selection.region,
+        platform,
+      });
+    }));
+
+    const { unit } = creativeTeamQueue.queueUnit(guild.id, players, selection.mode, selection.region);
+
+    await updateCreativeQueueEmbed(guild.id, client, category, QUEUE_CHANNEL_CONFIGS[category]);
+
+    const targetSize = creativeTeamQueue.targetSizeForMode(selection.mode);
+    const needed = targetSize - players.length;
+    const teamLabel = `${selection.mode} (${selection.region})` + (needed > 0 ? ` — LF${needed}` : '');
+    await sendQueueStatusMessage(interaction, teamLabel, unit.joinedAt, 'team_leave_queue');
+    await maybeSendFeedbackPrompt(interaction, membersRaw[0].discordId, selection.mode);
   } catch (err) {
-    console.error('Failed to delete party channel:', err.message);
+    console.error('Team queue error:', err);
+    await interaction.editReply({ content: `❌ Error joining queue: ${err.message}` });
+  } finally {
+    for (const m of membersRaw) teamJoinInProgress.delete(`${guild.id}:${m.discordId}`);
   }
-
-  party.disbandParty(record.partyId);
-
-  await interaction.editReply({ content: '✅ Party disbanded.' });
 }
 
-// Shared by /party-status and the ℹ️ Party Status button posted in the party's private channel.
-async function handlePartyStatusRequest(interaction) {
-  const record = party.getPartyByDiscordId(interaction.guild.id, interaction.user.id);
-  if (!record) {
-    return interaction.editReply({ content: '❌ You are not in a party. Use /party-invite (or the button in #form-party) to form one.' });
-  }
+// Builds the "On the team" / "Invited — pending" name lists for buildTeamFormingEmbed from a
+// team-invite.js pending-team record — leader is tagged so the roster reads clearly.
+function teamFormingEmbedFor(team) {
+  const acceptedUsernames = team.members.map(m => m.discordId === team.leaderId ? `${m.username} (leader)` : m.username);
+  const pendingUsernames = teamInvite.pendingInvitesForTeam(team).map(inv => inv.invitedUsername);
+  return buildTeamFormingEmbed(team.leaderUsername, team.mode, team.region, team.bringCount, acceptedUsernames, pendingUsernames);
+}
 
-  await interaction.editReply({ embeds: [buildPartyStatusEmbed(record)] });
+// Re-fetches and edits the shared "Team Forming" status message in place — called after every
+// accept/decline/edit so the whole channel always sees the current roster, not just whoever
+// triggered the change (see embeds.js's buildTeamFormingEmbed doc comment for why this can't just
+// be an ephemeral message).
+async function refreshTeamFormingMessage(team) {
+  if (!team.statusChannelId || !team.statusMessageId) return;
+  try {
+    const channel = await client.channels.fetch(team.statusChannelId);
+    const msg = await channel.messages.fetch(team.statusMessageId);
+    await msg.edit({ embeds: [teamFormingEmbedFor(team)] });
+  } catch (err) {
+    console.error('Failed to refresh team-forming status message:', err.message);
+  }
+}
+
+// Posts one invite message per newly-created invite (channel message, not ephemeral — Accept/
+// Decline come from the invited player's own interaction) and arms its 5-minute expiry, same
+// timeout value the old party.js used. teammatePlayers is the *current* team roster (leader +
+// anyone already accepted), stats-fetched fresh each time so a newly-added teammate's PR/platform
+// is accurate — small and infrequent enough (at most a handful of invites per forming attempt)
+// that re-fetching (cached in players.js) rather than threading a cache through is fine.
+async function sendTeamInvites(channel, guild, team, invites) {
+  const teammatePlayers = await Promise.all(team.members.map(async m => {
+    const member = await guild.members.fetch(m.discordId);
+    const platform = getPlatformFromMember(guild.id, member) ?? 'PC';
+    const { epicUsername } = await resolveEpicIdentity(guild, member);
+    const playerData = await playerStore.getPlayerStats(guild.id, m.discordId, epicUsername, null, team.region);
+    return { epicUsername, platform, totalPR: playerData.totalPR };
+  }));
+
+  for (const invite of invites) {
+    let msg;
+    try {
+      msg = await channel.send({
+        content: `<@${invite.invitedId}>`,
+        embeds: [buildTeamInviteEmbed(team.leaderUsername, teammatePlayers, invite.invitedUsername, team.mode, team.region)],
+        components: [buildTeamInviteButtons(invite.inviteId)],
+      });
+    } catch (err) {
+      console.error('Failed to post team invite message:', err.message);
+      continue;
+    }
+    invite.messageId = msg.id;
+    invite.channelId = msg.channelId;
+
+    setTimeout(async () => {
+      const expired = teamInvite.expireInvite(invite.inviteId);
+      if (!expired) return;
+      try {
+        const ch = await client.channels.fetch(expired.channelId);
+        const m = await ch.messages.fetch(expired.messageId);
+        await m.edit({ content: `~~<@${expired.invitedId}>~~ — invite expired.`, embeds: m.embeds, components: [] });
+      } catch (err) {
+        console.error('Failed to mark expired team invite message:', err.message);
+      }
+      const stillForming = teamInvite.getPendingTeam(expired.guildId, expired.leaderId);
+      if (stillForming) await refreshTeamFormingMessage(stillForming);
+    }, 5 * 60 * 1000);
+  }
+}
+
+// Validates a leader's proposed teammate list (both the initial invite and Edit Team submissions)
+// before team-invite.js ever sees it — bots, self-selection, and anyone already committed
+// elsewhere (a different forming team, an active creative/tournament queue or match) are all
+// rejected outright rather than silently dropped, since the User Select's exact min=max count
+// means a partial acceptance would leave the leader short a teammate with no clear signal why.
+// Someone already on *this same* leader's team/invite list is fine — that's exactly what
+// resubmitting via Edit Team looks like.
+function validateTeamInviteCandidates(guild, leaderId, users) {
+  for (const u of users) {
+    if (u.id === leaderId) return { ok: false, reason: 'You cannot invite yourself.' };
+    if (u.bot) return { ok: false, reason: `**${u.username}** is a bot and cannot be invited.` };
+
+    const otherTeam = teamInvite.getPendingTeamByMember(guild.id, u.id);
+    if (otherTeam && otherTeam.leaderId !== leaderId) {
+      return { ok: false, reason: `**${u.username}** is already part of another forming team.` };
+    }
+    const otherInvite = teamInvite.getPendingInviteByDiscordId(guild.id, u.id);
+    if (otherInvite && otherInvite.leaderId !== leaderId) {
+      return { ok: false, reason: `**${u.username}** already has a pending team invite.` };
+    }
+
+    if (
+      isInCreativeQueue(guild.id, u.id)
+      || creativeTeamQueue.isInTeamQueue(guild.id, u.id)
+      || teamMatchLifecycle.isPlayerInActiveTeamMatch(guild.id, u.id)
+      || isInTournamentActivity(guild.id, u.id)
+    ) {
+      return { ok: false, reason: `**${u.username}** is already queued or in an active match.` };
+    }
+  }
+  return { ok: true };
 }
 
 // Shared by /votekick and the 🗳️ Vote Kick button + user-select posted in the match channel
@@ -636,18 +675,6 @@ async function handleInteraction(interaction) {
       await interaction.editReply({ content: '✅ Roles embed posted.' });
     }
 
-    // /setup-party-channel
-    if (interaction.commandName === 'setup-party-channel') {
-      await interaction.deferReply({ flags: 64 });
-      if (!isModMember(interaction.guild.id, interaction)) return replyModOnly(interaction);
-      const msg = await interaction.channel.send({
-        embeds: [buildFormPartyInstructionsEmbed()],
-        components: [buildPartyInviteOpenButtonRow()],
-      });
-      await msg.pin();
-      await interaction.editReply({ content: '✅ Party instructions posted and pinned.' });
-    }
-
     // /setup-creative-1v1, /setup-creative-2v2, /setup-creative-6s, /setup-creative-8s — all
     // post wherever the command is run (6s/8s used to target a fixed env-var channel; there's
     // no per-guild equivalent of that now that config lives in Mongo, so they match 1v1/2v2's
@@ -739,27 +766,6 @@ async function handleInteraction(interaction) {
       }
     }
 
-    // /party-invite — fallback for handlePartyInviteRequest below (the primary path is now the
-    // ➕ Invite to Party button + user-select in #form-party).
-    if (interaction.commandName === 'party-invite') {
-      await interaction.deferReply({ flags: 64 });
-      await handlePartyInviteRequest(interaction, interaction.options.getUser('user'));
-    }
-
-    // /party-leave — fallback for handlePartyLeaveRequest below (the primary path is now the
-    // 🚪 Leave Party button posted in the party's own private channel).
-    if (interaction.commandName === 'party-leave') {
-      await interaction.deferReply({ flags: 64 });
-      await handlePartyLeaveRequest(interaction);
-    }
-
-    // /party-status — fallback for handlePartyStatusRequest below (the primary path is now the
-    // ℹ️ Party Status button posted in the party's own private channel).
-    if (interaction.commandName === 'party-status') {
-      await interaction.deferReply({ flags: 64 });
-      await handlePartyStatusRequest(interaction);
-    }
-
     // ── MOD DEBUG COMMANDS ────────────────────────────────────────────────────
 
     // /bot-status
@@ -775,7 +781,6 @@ async function handleInteraction(interaction) {
         + getCreativeQueueEntries(guildId).length
         + getTeamQueueEntries(guildId).length;
       const activeMatches = getPendingMatchCount(guildId) + teamMatchLifecycle.getActiveTeamMatchCount(guildId);
-      const activeParties = Object.values(store.parties).filter(p => p.guildId === guildId).length;
 
       await interaction.editReply({
         embeds: [buildBotStatusEmbed({
@@ -784,7 +789,6 @@ async function handleInteraction(interaction) {
           epicOAuthConfigured,
           activeQueues,
           activeMatches,
-          activeParties,
         })],
       });
     }
@@ -979,20 +983,132 @@ async function handleInteraction(interaction) {
       creativeSelections.set(key, { ...creativeSelections.get(key), region: values[0] });
       await interaction.editReply({ content: `✅ Region set to **${values[0]}**. Now select a mode (if you haven't), then click Queue.` });
     }
+
+    // ── TEAM BRING-COUNT SELECT (6s/8s, step 1 of the inline team-forming flow) ───────────────
+    if (customId.startsWith('team_bring_count_')) {
+      const category = customId.replace('team_bring_count_', '');
+      const selection = creativeSelections.get(`${guildId}:${user.id}:${category}`);
+      if (!selection?.mode || !selection?.region) {
+        return replyAndDismiss(interaction, { content: '❌ Select a mode and region from the menus above first.' });
+      }
+
+      const bringCount = Number(values[0]);
+
+      if (bringCount === 0) {
+        await finalizeTeamQueueJoin(interaction, category, selection, [{ discordId: user.id, username: user.username }]);
+        return;
+      }
+
+      await interaction.editReply({
+        content: `Pick exactly ${bringCount} teammate${bringCount === 1 ? '' : 's'} to invite:`,
+        components: [buildTeamMemberUserSelectRow(`team_pick_members_${category}_${bringCount}`, bringCount)],
+      });
+    }
   }
 
   // ── USER SELECT MENUS ─────────────────────────────────────────────────────────
   if (interaction.isUserSelectMenu()) {
-    if (interaction.customId === 'party_invite_select') {
-      await interaction.deferUpdate();
-      const invited = interaction.users.first();
-      await handlePartyInviteRequest(interaction, invited);
-    }
-
     if (interaction.customId === 'votekick_select') {
       await interaction.deferUpdate();
       const target = interaction.users.first();
       await handleVoteKickRequest(interaction, target);
+    }
+
+    // ── TEAM MEMBER PICK (6s/8s, step 2 — initial invite) ───────────────────────────────────
+    if (interaction.customId.startsWith('team_pick_members_')) {
+      await interaction.deferUpdate();
+      const guild = interaction.guild;
+      const rest = interaction.customId.replace('team_pick_members_', '');
+      const lastUnderscore = rest.lastIndexOf('_');
+      const category = rest.slice(0, lastUnderscore);
+      const count = Number(rest.slice(lastUnderscore + 1));
+
+      const selection = creativeSelections.get(`${guild.id}:${interaction.user.id}:${category}`);
+      if (!selection?.mode || !selection?.region) {
+        return interaction.editReply({ content: '❌ Selection expired — go back and pick a mode/region again.', components: [] });
+      }
+
+      const selectedUsers = [...interaction.users.values()];
+      const validation = validateTeamInviteCandidates(guild, interaction.user.id, selectedUsers);
+      if (!validation.ok) {
+        return interaction.editReply({
+          content: `❌ ${validation.reason} Reselect and try again.`,
+          components: [buildTeamMemberUserSelectRow(interaction.customId, count)],
+        });
+      }
+
+      const team = teamInvite.startForming({
+        guildId: guild.id, leaderId: interaction.user.id, leaderUsername: interaction.user.username,
+        category, mode: selection.mode, region: selection.region, bringCount: count,
+      });
+      const { created } = teamInvite.inviteMembers(team, selectedUsers.map(u => ({ discordId: u.id, username: u.username })));
+
+      const statusMsg = await interaction.channel.send({
+        embeds: [teamFormingEmbedFor(team)],
+        components: [buildTeamFormingButtons(interaction.user.id)],
+      });
+      team.statusMessageId = statusMsg.id;
+      team.statusChannelId = statusMsg.channelId;
+
+      await sendTeamInvites(interaction.channel, guild, team, created);
+
+      await interaction.editReply({
+        content: `✅ Invited ${created.length} player(s) — see the status message below. You can Edit Team or Queue Now from there anytime.`,
+        components: [],
+      });
+    }
+
+    // ── TEAM EDIT PICK (6s/8s — "Edit Team" resubmission) ───────────────────────────────────
+    if (interaction.customId.startsWith('team_edit_pick_')) {
+      await interaction.deferUpdate();
+      const guild = interaction.guild;
+      const leaderId = interaction.customId.replace('team_edit_pick_', '');
+
+      if (interaction.user.id !== leaderId) {
+        return interaction.editReply({ content: '❌ Only the team leader can edit the team.', components: [] });
+      }
+
+      const team = teamInvite.getPendingTeam(guild.id, leaderId);
+      if (!team) {
+        return interaction.editReply({ content: '❌ This team is no longer forming (already queued or cancelled).', components: [] });
+      }
+
+      const selectedUsers = [...interaction.users.values()];
+      const validation = validateTeamInviteCandidates(guild, leaderId, selectedUsers);
+      if (!validation.ok) {
+        const currentTargetIds = [
+          ...team.members.filter(m => m.discordId !== leaderId).map(m => m.discordId),
+          ...teamInvite.pendingInvitesForTeam(team).map(inv => inv.invitedId),
+        ];
+        return interaction.editReply({
+          content: `❌ ${validation.reason} Reselect and try again.`,
+          components: [buildTeamMemberUserSelectRow(interaction.customId, team.bringCount, currentTargetIds)],
+        });
+      }
+
+      const diff = teamInvite.editTeam(team, selectedUsers.map(u => ({ discordId: u.id, username: u.username })));
+
+      for (const invite of diff.cancelledInvites) {
+        if (!invite.messageId) continue;
+        try {
+          const ch = await client.channels.fetch(invite.channelId);
+          const msg = await ch.messages.fetch(invite.messageId);
+          await msg.edit({ content: `~~<@${invite.invitedId}>~~ — invite cancelled by the leader.`, embeds: msg.embeds, components: [] });
+        } catch (err) {
+          console.error('Failed to mark cancelled team invite message:', err.message);
+        }
+      }
+
+      await sendTeamInvites(interaction.channel, guild, team, diff.newInvites);
+      await refreshTeamFormingMessage(team);
+
+      const summary = [];
+      if (diff.removedMembers.length > 0) summary.push(`removed ${diff.removedMembers.map(m => m.username).join(', ')}`);
+      if (diff.newInvites.length > 0) summary.push(`invited ${diff.newInvites.map(i => i.invitedUsername).join(', ')}`);
+      await interaction.editReply({
+        content: summary.length > 0 ? `✅ Team updated — ${summary.join('; ')}.` : '✅ No changes.',
+        components: [],
+      });
     }
   }
 
@@ -1041,32 +1157,6 @@ async function handleInteraction(interaction) {
       });
     }
 
-    // ── PARTY INVITE OPEN (button + user-select, primary path for /party-invite) ─────────────
-    if (customId === 'party_invite_open') {
-      if (channelId !== getChannelId(guild.id, 'formParty')) {
-        return interaction.reply({
-          content: `❌ Use this in <#${getChannelId(guild.id, 'formParty')}>.`,
-          flags: 64,
-        });
-      }
-      await interaction.reply({
-        content: 'Select a player to invite to your party:',
-        components: [buildUserSelectRow('party_invite_select', 'Choose a player to invite')],
-        flags: 64,
-      });
-    }
-
-    // ── PARTY LEAVE / STATUS BUTTONS (posted in the party's own private channel) ──────────────
-    if (customId === 'party_leave_btn') {
-      await interaction.deferReply({ flags: 64 });
-      await handlePartyLeaveRequest(interaction);
-    }
-
-    if (customId === 'party_status_btn') {
-      await interaction.deferReply({ flags: 64 });
-      await handlePartyStatusRequest(interaction);
-    }
-
     // ── REFRESH STATS BUTTON (posted in #access) ──────────────────────────────────────────────
     if (customId === 'access_refresh_stats') {
       await interaction.deferReply({ flags: 64 });
@@ -1084,55 +1174,6 @@ async function handleInteraction(interaction) {
         components: [buildUserSelectRow('votekick_select', 'Choose a player to vote-kick')],
         flags: 64,
       });
-    }
-
-    // ── PARTY INVITE BUTTONS ─────────────────────────────────────────────────
-    if (customId.startsWith('party_accept_')) {
-      const inviteId = customId.replace('party_accept_', '');
-      const invite = party.getInvite(inviteId);
-
-      if (!invite) {
-        return interaction.reply({ content: '❌ This invite is no longer active.', flags: 64 });
-      }
-      if (user.id !== invite.invitedId) {
-        return interaction.reply({ content: '❌ Only the invited player can accept this invite.', flags: 64 });
-      }
-
-      party.acceptInvite(inviteId);
-
-      await interaction.update({
-        content: `✅ **${invite.leaderUsername}** and **${invite.invitedUsername}** are now partied up!`,
-        embeds: [],
-        components: [],
-      });
-
-      const instructionsMsg = await interaction.channel.send({
-        embeds: [buildPartyChannelInstructionsEmbed()],
-        components: [buildPartyChannelButtonRow()],
-      });
-      await instructionsMsg.pin().catch(err => console.error('Failed to pin party instructions:', err.message));
-    }
-
-    if (customId.startsWith('party_decline_')) {
-      const inviteId = customId.replace('party_decline_', '');
-      const invite = party.getInvite(inviteId);
-
-      if (!invite) {
-        return interaction.reply({ content: '❌ This invite is no longer active.', flags: 64 });
-      }
-      if (user.id !== invite.invitedId && user.id !== invite.leaderId) {
-        return interaction.reply({ content: '❌ You are not part of this invite.', flags: 64 });
-      }
-
-      party.declineInvite(inviteId);
-
-      await interaction.update({
-        content: '❌ Party invite declined.',
-        embeds: [],
-        components: [],
-      });
-
-      setTimeout(() => interaction.channel.delete().catch(console.error), 10000);
     }
 
     // ── SOLO QUEUE BUTTONS (duo, or trios solo "Looking for 2") ──────────────
@@ -1165,12 +1206,6 @@ async function handleInteraction(interaction) {
       if (consoleOnly && !isConsolePlayer(guild.id, member)) {
         return replyAndDismiss(interaction, {
           content: '❌ This is a console-only tournament. You must have the Console role to queue.',
-        });
-      }
-
-      if (queueType === 'lf2' && party.isInParty(guild.id, user.id)) {
-        return replyAndDismiss(interaction, {
-          content: '❌ You are in a party — ask your party leader to click "Looking for 1", or run /party-leave to queue solo.',
         });
       }
 
@@ -1237,130 +1272,6 @@ async function handleInteraction(interaction) {
       }
     }
 
-    // ── PARTY QUEUE BUTTON ("Looking for 1", trios only) ──────────────────────
-    if (customId === 'queue_lf1') {
-      await interaction.deferReply({ flags: 64 });
-
-      const pinned = pinnedMessages[channelId];
-      if (!pinned) {
-        return replyAndDismiss(interaction, { content: '❌ Could not find tournament info for this channel.' });
-      }
-
-      const { tournamentName, region, isTrios, consoleOnly } = pinned;
-
-      const partyRecord = party.getPartyByDiscordId(guild.id, user.id);
-      if (!partyRecord) {
-        return replyAndDismiss(interaction, {
-          content: '❌ You need an active party to queue here. Use /party-invite in #form-party, or click "Looking for 2" to queue solo.',
-        });
-      }
-      if (partyRecord.leaderId !== user.id) {
-        return replyAndDismiss(interaction, {
-          content: '❌ Only your party leader can queue the party. Ask them to click "Looking for 1".',
-        });
-      }
-      if (partyRecord.members.length !== 2) {
-        return replyAndDismiss(interaction, {
-          content: `❌ Trios queueing needs a party of exactly 2 (yours has ${partyRecord.members.length}) — trios teams are fixed at 3 players total.`,
-        });
-      }
-
-      const partyMembers = await Promise.all(partyRecord.members.map(m => guild.members.fetch(m.discordId)));
-
-      const unregistered = partyMembers.find(m => !m.roles.cache.has(getRoleId(guild.id, 'Registered')));
-      if (unregistered) {
-        return replyAndDismiss(interaction, {
-          content: `❌ **${unregistered.user.username}** needs to complete their profile in <#${getChannelId(guild.id, 'getRoles')}> first (set their region).`,
-        });
-      }
-
-      for (const member of partyMembers) {
-        const platform = getPlatformFromMember(guild.id, member);
-        if (consoleOnly && platform === 'PC') {
-          return replyAndDismiss(interaction, {
-            content: `❌ This is a console-only tournament. **${member.user.username}** is registered as PC and cannot queue here.`,
-          });
-        }
-        if (consoleOnly && platform !== 'Console') {
-          return replyAndDismiss(interaction, {
-            content: `❌ This is a console-only tournament. **${member.user.username}** must have the Console role to queue.`,
-          });
-        }
-      }
-
-      for (const member of partyMembers) {
-        const memberUnit = findUnitByDiscordId(guild.id, member.id);
-        if (memberUnit) {
-          if (member.id === user.id && memberUnit.tournamentName === tournamentName && memberUnit.region === region) {
-            return sendQueueStatusMessage(interaction, tournamentName, memberUnit.unit.joinedAt, 'leave_queue');
-          }
-          return replyAndDismiss(interaction, { content: `❌ **${member.user.username}** is already queued for **${memberUnit.tournamentName}** (${memberUnit.region}) — leave that queue first.` });
-        }
-        if (getPendingMatchByDiscordId(guild.id, member.id)) {
-          return replyAndDismiss(interaction, { content: `❌ **${member.user.username}** already has a pending match to resolve first.` });
-        }
-        if (isInCreativeActivity(guild.id, member.id)) {
-          return replyAndDismiss(interaction, { content: `❌ **${member.user.username}** is already in a creative queue or match — leave it before queueing for a tournament.` });
-        }
-      }
-
-      for (const member of partyMembers) {
-        const memberAccess = await access.checkAccess(member.id);
-        if (!memberAccess.allowed) {
-          await notifyCreditWindowStartedIfNeeded(client, member.id, memberAccess);
-          return replyAndDismiss(interaction, {
-            embeds: [buildNoAccessEmbed(memberAccess)],
-            components: [buildAccessSubscribeButtons()],
-          });
-        }
-      }
-
-      await interaction.editReply({ content: '⏳ Fetching stats for both party members...' });
-
-      try {
-        const players = await Promise.all(partyMembers.map(async member => {
-          const userData = await playerStore.getPlayer(guild.id, member.id);
-          const identity = await resolveEpicIdentity(guild, member);
-          return buildPlayer({
-            guildId: guild.id,
-            guildName: guild.name,
-            discordId: member.id,
-            discordUsername: member.user.username,
-            discordTag: member.user.tag,
-            epicUsername: identity.epicUsername,
-            epicId: identity.epicId,
-            tournamentName,
-            homeRegion: userData?.region ?? region,
-            queueRegion: region,
-            queueType: 'lf1',
-            platform: getPlatformFromMember(guild.id, member),
-            consoleOnly,
-            ingameRoles: userData?.ingameRoles ?? [],
-            languages: userData?.languages ?? [],
-            ageBracket: userData?.ageBracket ?? null,
-            bio: userData?.bio ?? null,
-          });
-        }));
-
-        const { unit } = await joinQueue({
-          guildId: guild.id,
-          players,
-          tournamentName,
-          region,
-          queueType: 'lf1',
-          partyId: partyRecord.partyId,
-        });
-
-        await updateQueueEmbed(guild.id, channelId, tournamentName, region, isTrios);
-
-        await sendQueueStatusMessage(interaction, tournamentName, unit.joinedAt, 'leave_queue');
-
-      } catch (err) {
-        console.error('Party queue error:', err);
-        await replyAndDismiss(interaction, { content: `❌ Error joining queue: ${err.message}` });
-      }
-    }
-
     // ── LEAVE QUEUE ──────────────────────────────────────────────────────────
     if (customId === 'leave_queue') {
       await interaction.deferReply({ flags: 64 });
@@ -1373,12 +1284,7 @@ async function handleInteraction(interaction) {
 
       if (removed) {
         await updateQueueEmbed(guild.id, channelId, tournamentName, region, isTrios);
-        const inParty = party.isInParty(guild.id, user.id);
-        await replyAndDismiss(interaction, {
-          content: inParty
-            ? '✅ You have left the queue. Your party is still active — queue again anytime.'
-            : '✅ You have left the queue.',
-        });
+        await replyAndDismiss(interaction, { content: '✅ You have left the queue.' });
       } else {
         await replyAndDismiss(interaction, { content: '❌ You were not in the queue.' });
       }
@@ -1530,105 +1436,50 @@ async function handleInteraction(interaction) {
       await replyAndDismiss(interaction, { content: '✅ You have left the creative queue.' });
     }
 
-    // ── TEAM QUEUE BUTTON (6s/8s) ────────────────────────────────────────────
+    // ── TEAM QUEUE BUTTON (6s/8s) — kicks off the inline bring-count select ──────────────────
     if (customId.startsWith('team_queue_')) {
-      await interaction.deferReply({ flags: 64 });
-
       const category = customId.replace('team_queue_', '');
       const selection = creativeSelections.get(`${guild.id}:${user.id}:${category}`);
 
       if (!selection?.mode || !selection?.region) {
-        return replyAndDismiss(interaction, { content: '❌ Select a mode and region from the menus above first.' });
+        return interaction.reply({ content: '❌ Select a mode and region from the menus above first.', flags: 64 });
       }
-
-      const existingParty = party.getPartyByDiscordId(guild.id, user.id);
-      if (existingParty && existingParty.leaderId !== user.id) {
-        return replyAndDismiss(interaction, { content: '❌ Only your party leader can queue the party.' });
-      }
-
-      const partyMembersRaw = existingParty ? existingParty.members : [{ discordId: user.id, username: user.username }];
 
       const existingTeamUnit = creativeTeamQueue.findUnitByDiscordId(guild.id, user.id);
-      if (existingTeamUnit && existingTeamUnit.mode === selection.mode && existingTeamUnit.region === selection.region) {
+      if (existingTeamUnit) {
+        await interaction.deferReply({ flags: 64 });
         return sendQueueStatusMessage(
           interaction, `${existingTeamUnit.mode} (${existingTeamUnit.region})`,
           existingTeamUnit.unit.joinedAt, 'team_leave_queue'
         );
       }
 
-      const alreadyBusy = partyMembersRaw.some(m =>
-        isInCreativeQueue(guild.id, m.discordId)
-        || creativeTeamQueue.isInTeamQueue(guild.id, m.discordId)
-        || teamJoinInProgress.has(`${guild.id}:${m.discordId}`)
-        || teamMatchLifecycle.isPlayerInActiveTeamMatch(guild.id, m.discordId)
-      );
-      if (alreadyBusy) {
-        return replyAndDismiss(interaction, { content: '❌ One or more of your party members is already queued or in an active match.' });
-      }
-
-      const busyWithTournament = partyMembersRaw.find(m => isInTournamentActivity(guild.id, m.discordId));
-      if (busyWithTournament) {
-        return replyAndDismiss(interaction, {
-          content: `❌ **${busyWithTournament.username}** is already in a tournament queue or match — leave it before queueing for creative.`,
+      const existingForming = teamInvite.getPendingTeam(guild.id, user.id);
+      if (existingForming) {
+        return interaction.reply({
+          content: '🔍 You already have a team forming — use **Edit Team** or **Queue Now** on the status message above.',
+          flags: 64,
         });
       }
-
-      for (const m of partyMembersRaw) teamJoinInProgress.add(`${guild.id}:${m.discordId}`);
-      await interaction.editReply({ content: `⏳ Fetching stats for ${partyMembersRaw.length} player(s)...` });
-
-      try {
-        const members = await Promise.all(partyMembersRaw.map(m => guild.members.fetch(m.discordId)));
-
-        const unregistered = members.find(m => !m.roles.cache.has(getRoleId(guild.id, 'Registered')));
-        if (unregistered) {
-          return replyAndDismiss(interaction, {
-            content: `❌ **${unregistered.user.username}** needs to complete their profile in <#${getChannelId(guild.id, 'getRoles')}> first (set their region).`,
-          });
-        }
-
-        for (const member of members) {
-          const memberAccess = await access.checkAccess(member.id);
-          if (!memberAccess.allowed) {
-            await notifyCreditWindowStartedIfNeeded(client, member.id, memberAccess);
-            return replyAndDismiss(interaction, {
-              embeds: [buildNoAccessEmbed(memberAccess)],
-              components: [buildAccessSubscribeButtons()],
-            });
-          }
-        }
-
-        const players = await Promise.all(members.map(async member => {
-          const platform = getPlatformFromMember(guild.id, member);
-          const { epicUsername, epicId } = await resolveEpicIdentity(guild, member);
-          return buildCreativePlayer({
-            guildId: guild.id,
-            guildName: guild.name,
-            discordId: member.id,
-            discordUsername: member.user.username,
-            discordTag: member.user.tag,
-            epicUsername,
-            epicId,
-            mode: selection.mode,
-            region: selection.region,
-            platform,
-          });
-        }));
-
-        const { unit } = creativeTeamQueue.queueUnit(guild.id, players, selection.mode, selection.region);
-
-        await updateCreativeQueueEmbed(guild.id, client, category, QUEUE_CHANNEL_CONFIGS[category]);
-
-        const targetSize = creativeTeamQueue.targetSizeForMode(selection.mode);
-        const needed = targetSize - players.length;
-        const teamLabel = `${selection.mode} (${selection.region})` + (needed > 0 ? ` — LF${needed}` : '');
-        await sendQueueStatusMessage(interaction, teamLabel, unit.joinedAt, 'team_leave_queue');
-        await maybeSendFeedbackPrompt(interaction, user.id, selection.mode);
-      } catch (err) {
-        console.error('Team queue error:', err);
-        await replyAndDismiss(interaction, { content: `❌ Error joining queue: ${err.message}` });
-      } finally {
-        for (const m of partyMembersRaw) teamJoinInProgress.delete(`${guild.id}:${m.discordId}`);
+      const busyElsewhere = teamInvite.getPendingTeamByMember(guild.id, user.id) || teamInvite.hasPendingInvite(guild.id, user.id);
+      if (busyElsewhere) {
+        return interaction.reply({ content: '❌ You already have a pending team invite to resolve first.', flags: 64 });
       }
+
+      if (
+        isInCreativeQueue(guild.id, user.id)
+        || teamMatchLifecycle.isPlayerInActiveTeamMatch(guild.id, user.id)
+        || isInTournamentActivity(guild.id, user.id)
+      ) {
+        return interaction.reply({ content: '❌ You are already queued or in an active match elsewhere.', flags: 64 });
+      }
+
+      const targetSize = creativeTeamQueue.targetSizeForMode(selection.mode);
+      await interaction.reply({
+        content: 'How many people are you bringing?',
+        components: [buildTeamBringCountSelectRow(category, targetSize - 1)],
+        flags: 64,
+      });
     }
 
     // ── TEAM LEAVE QUEUE (6s/8s) ─────────────────────────────────────────────
@@ -1645,7 +1496,124 @@ async function handleInteraction(interaction) {
       const category = categoryForAnyMode(found.mode);
       if (category) await updateCreativeQueueEmbed(guild.id, client, category, QUEUE_CHANNEL_CONFIGS[category]);
 
-      await replyAndDismiss(interaction, { content: '✅ You (and your party) have left the 6s/8s queue.' });
+      await replyAndDismiss(interaction, { content: '✅ You (and your teammates, if any) have left the 6s/8s queue.' });
+    }
+
+    // ── TEAM INVITE ACCEPT/DECLINE (6s/8s inline team-forming) ───────────────────────────────
+    if (customId.startsWith('team_invite_accept_')) {
+      const inviteId = customId.replace('team_invite_accept_', '');
+      const invite = teamInvite.getInvite(inviteId);
+
+      if (!invite) {
+        return interaction.reply({ content: '❌ This invite is no longer active.', flags: 64 });
+      }
+      if (user.id !== invite.invitedId) {
+        return interaction.reply({ content: '❌ Only the invited player can accept this invite.', flags: 64 });
+      }
+
+      if (
+        isInCreativeQueue(guild.id, user.id)
+        || creativeTeamQueue.isInTeamQueue(guild.id, user.id)
+        || teamMatchLifecycle.isPlayerInActiveTeamMatch(guild.id, user.id)
+        || isInTournamentActivity(guild.id, user.id)
+      ) {
+        teamInvite.declineInvite(inviteId);
+        return interaction.update({ content: '❌ You are already queued or in an active match — invite declined automatically.', embeds: [], components: [] });
+      }
+
+      const result = teamInvite.acceptInvite(inviteId);
+      if (!result) {
+        return interaction.update({ content: '❌ This team is no longer forming (already queued or cancelled).', embeds: [], components: [] });
+      }
+
+      await interaction.update({ content: `✅ You joined **${result.team.leaderUsername}**'s team!`, embeds: [], components: [] });
+      await refreshTeamFormingMessage(result.team);
+    }
+
+    if (customId.startsWith('team_invite_decline_')) {
+      const inviteId = customId.replace('team_invite_decline_', '');
+      const invite = teamInvite.getInvite(inviteId);
+
+      if (!invite) {
+        return interaction.reply({ content: '❌ This invite is no longer active.', flags: 64 });
+      }
+      if (user.id !== invite.invitedId && user.id !== invite.leaderId) {
+        return interaction.reply({ content: '❌ You are not part of this invite.', flags: 64 });
+      }
+
+      teamInvite.declineInvite(inviteId);
+
+      await interaction.update({ content: '❌ Team invite declined.', embeds: [], components: [] });
+
+      const stillForming = teamInvite.getPendingTeam(invite.guildId, invite.leaderId);
+      if (stillForming) await refreshTeamFormingMessage(stillForming);
+    }
+
+    // ── EDIT TEAM (6s/8s inline team-forming status panel) ───────────────────────────────────
+    if (customId.startsWith('team_edit_') && !customId.startsWith('team_edit_pick_')) {
+      const leaderId = customId.replace('team_edit_', '');
+      if (user.id !== leaderId) {
+        return interaction.reply({ content: '❌ Only the team leader can edit the team.', flags: 64 });
+      }
+
+      const team = teamInvite.getPendingTeam(guild.id, leaderId);
+      if (!team) {
+        return interaction.reply({ content: '❌ This team is no longer forming (already queued or cancelled).', flags: 64 });
+      }
+
+      const currentTargetIds = [
+        ...team.members.filter(m => m.discordId !== leaderId).map(m => m.discordId),
+        ...teamInvite.pendingInvitesForTeam(team).map(inv => inv.invitedId),
+      ];
+
+      await interaction.reply({
+        content: `Pick exactly ${team.bringCount} teammate${team.bringCount === 1 ? '' : 's'} — currently selected/invited members are pre-filled:`,
+        components: [buildTeamMemberUserSelectRow(`team_edit_pick_${leaderId}`, team.bringCount, currentTargetIds)],
+        flags: 64,
+      });
+    }
+
+    // ── QUEUE NOW (6s/8s inline team-forming status panel) ───────────────────────────────────
+    if (customId.startsWith('team_queue_now_')) {
+      const leaderId = customId.replace('team_queue_now_', '');
+      if (user.id !== leaderId) {
+        return interaction.reply({ content: '❌ Only the team leader can queue the team.', flags: 64 });
+      }
+
+      const team = teamInvite.getPendingTeam(guild.id, leaderId);
+      if (!team) {
+        return interaction.reply({ content: '❌ Nothing to queue — this team is no longer forming.', flags: 64 });
+      }
+
+      const selection = { mode: team.mode, region: team.region };
+      const membersRaw = team.members.map(m => ({ discordId: m.discordId, username: m.username }));
+      const category = team.category;
+
+      const { cancelledInvites } = teamInvite.finalizeForming(guild.id, leaderId);
+
+      for (const invite of cancelledInvites) {
+        if (!invite.messageId) continue;
+        try {
+          const ch = await client.channels.fetch(invite.channelId);
+          const msg = await ch.messages.fetch(invite.messageId);
+          await msg.edit({ content: `~~<@${invite.invitedId}>~~ — the team already queued.`, embeds: msg.embeds, components: [] });
+        } catch (err) {
+          console.error('Failed to mark voided team invite message on queue-now:', err.message);
+        }
+      }
+
+      if (team.statusChannelId && team.statusMessageId) {
+        try {
+          const ch = await client.channels.fetch(team.statusChannelId);
+          const msg = await ch.messages.fetch(team.statusMessageId);
+          await msg.edit({ embeds: [teamFormingEmbedFor(team)], components: [] });
+        } catch (err) {
+          console.error('Failed to finalize team-forming status message:', err.message);
+        }
+      }
+
+      await interaction.deferReply({ flags: 64 });
+      await finalizeTeamQueueJoin(interaction, category, selection, membersRaw);
     }
 
     // ── TEAM METHOD VOTE BUTTONS ──────────────────────────────────────────────

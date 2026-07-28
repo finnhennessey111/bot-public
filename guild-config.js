@@ -1,7 +1,7 @@
 // guild-config.js - In-memory cache of per-guild configuration (role/channel/category IDs,
 // creative-channel routing, setup-message tracking, and per-guild secrets), backed by
 // models/Guild.js. Mongo-only — there's no meaningful offline/JSON equivalent for guild config,
-// unlike store.js's queue/party/match data.
+// unlike store.js's queue/match data.
 //
 // Two "ensure a Guild doc exists" paths exist and must never both fire a DM:
 //   - init(client): startup reconciliation for every already-joined guild — no DM.
@@ -69,7 +69,6 @@ async function seedLegacyGuildFromEnv() {
   const channelIds = {
     ...(process.env.GET_ROLES_CHANNEL_ID && { getRoles: process.env.GET_ROLES_CHANNEL_ID }),
     ...(process.env.HOWTO_CHANNEL_ID && { howto: process.env.HOWTO_CHANNEL_ID }),
-    ...(process.env.FORM_PARTY_CHANNEL_ID && { formParty: process.env.FORM_PARTY_CHANNEL_ID }),
   };
 
   await setGuildConfig(guildId, { roleIds, categoryIds, channelIds });

@@ -1,7 +1,7 @@
-// store.js - Persists pinnedMessages, matchmaking queue data, parties, and matchChannels to
-// MongoDB, scoped per guild — except the matchmaking queue pool itself, which is shared globally
-// across every installed guild (cross-server matchmaking). Falls back to a local data.json file
-// if MongoDB isn't configured or fails to connect — call init(client) once at startup.
+// store.js - Persists pinnedMessages, matchmaking queue data, and matchChannels to MongoDB,
+// scoped per guild — except the matchmaking queue pool itself, which is shared globally across
+// every installed guild (cross-server matchmaking). Falls back to a local data.json file if
+// MongoDB isn't configured or fails to connect — call init(client) once at startup.
 //
 // In-memory shapes:
 //   pinnedMessages: flat, keyed by channelId (channel IDs are globally unique) — each record
@@ -10,8 +10,6 @@
 //     guildId nesting; every installed guild's players share one pool. Each unit/player still
 //     carries its own guildId for channel routing (queue.js/creative-queue.js/
 //     creative-team-queue.js), just not as a partition key here.
-//   parties: flat, keyed by partyId (globally unique) — each record carries its own `guildId`
-//     (parties are still same-server; cross-server matching only pools already-built units).
 //   matchChannels: flat, keyed by groupId (one match's whole channel cluster, possibly spanning
 //     several guilds for a cross-server match) — each record carries a `channels` array of
 //     {guildId, textChannelId, voiceChannelId}.
@@ -24,7 +22,6 @@ const path = require('path');
 const db = require('./db');
 const GuildModel = require('./models/Guild');
 const QueueModel = require('./models/Queue');
-const PartyModel = require('./models/Party');
 const MatchChannelModel = require('./models/MatchChannel');
 
 const DATA_FILE = path.join(__dirname, 'data.json');
@@ -76,7 +73,6 @@ function load() {
     return {
       pinnedMessages: migratePinnedMessagesShape(parsed.pinnedMessages ?? {}),
       queues: flattenAcrossGuilds(parsed.queues ?? {}),
-      parties: parsed.parties ?? {}, // already guildId-per-record, no shape change needed
       creativeQueues: flattenAcrossGuilds(parsed.creativeQueues ?? {}),
       matchChannels: parsed.matchChannels ?? {}, // migrated to groupId-keyed on first save
     };
@@ -84,7 +80,6 @@ function load() {
     return {
       pinnedMessages: {},
       queues: {},
-      parties: {},
       creativeQueues: {},
       matchChannels: {},
     };
@@ -99,7 +94,6 @@ function saveJson() {
     {
       pinnedMessages: state.pinnedMessages,
       queues: state.queues,
-      parties: state.parties,
       creativeQueues: state.creativeQueues,
       matchChannels: state.matchChannels,
     },
@@ -154,9 +148,9 @@ async function migrateLegacyPerGuildQueueDocs() {
   return { data, creativeData };
 }
 
-// Hydrates every known guild's pinnedMessages/parties/matchChannels from Mongo, plus the one
-// global queue doc, into the shared in-memory objects, replacing whatever data.json had loaded.
-// Any guild present in the JSON-loaded state with no Mongo doc yet gets seeded INTO Mongo first
+// Hydrates every known guild's pinnedMessages/matchChannels from Mongo, plus the one global
+// queue doc, into the shared in-memory objects, replacing whatever data.json had loaded. Any
+// guild present in the JSON-loaded state with no Mongo doc yet gets seeded INTO Mongo first
 // (mirrors the original single-guild firstRun migration, generalized to however many guilds
 // data.json happens to hold).
 async function hydrateFromMongoAll() {
@@ -164,7 +158,6 @@ async function hydrateFromMongoAll() {
 
   const jsonGuildIds = new Set([
     ...Object.values(state.pinnedMessages).map(r => r.guildId).filter(Boolean),
-    ...Object.values(state.parties).map(r => r.guildId).filter(Boolean),
     ...(state.matchChannels ? Object.values(state.matchChannels).flatMap(r => (r.channels ?? []).map(c => c.guildId)) : []),
   ]);
 
@@ -198,41 +191,14 @@ async function hydrateFromMongoAll() {
   replaceContents(state.queues, globalQueueDoc.data ?? {});
   replaceContents(state.creativeQueues, globalQueueDoc.creativeData ?? {});
 
-  const partyDocs = await PartyModel.find({}).lean();
-  const parties = {};
-  for (const p of partyDocs) {
-    parties[p.partyId] = {
-      partyId: p.partyId,
-      leaderId: p.leaderId,
-      leaderUsername: p.leaderUsername,
-      members: p.members,
-      channelId: p.channelId,
-      guildId: p.guildId,
-      createdAt: p.createdAt,
-    };
-  }
-  replaceContents(state.parties, parties);
-
   const channelDocs = await MatchChannelModel.find({}).lean();
   const matchChannels = {};
   for (const c of channelDocs) matchChannels[c.groupId] = c.data;
   replaceContents(state.matchChannels, matchChannels);
 }
 
-// Full reconcile of a keyed store field (parties, matchChannels), scoped to one guild's entries:
-// upserts every current entry, then deletes any doc for this guild no longer present in-memory.
-async function syncCollection(Model, keyField, scopeField, guildId, entries, toDoc) {
-  const keys = Object.keys(entries);
-  await Promise.all(
-    keys.map(key =>
-      Model.updateOne({ [keyField]: key }, { $set: toDoc(key, entries[key]) }, { upsert: true })
-    )
-  );
-  await Model.deleteMany({ [scopeField]: guildId, [keyField]: { $nin: keys } });
-}
-
-// Persists just this guild's slice of pinnedMessages/parties (matchChannels handled separately
-// below, since a group can span multiple guilds and isn't cleanly "this guild's slice").
+// Persists just this guild's slice of pinnedMessages (matchChannels handled separately below,
+// since a group can span multiple guilds and isn't cleanly "this guild's slice").
 async function persistGuildScopedData(guildId) {
   const guildPinnedMessages = filterByGuild(state.pinnedMessages, guildId);
 
@@ -241,16 +207,6 @@ async function persistGuildScopedData(guildId) {
     { $set: { pinnedMessages: guildPinnedMessages }, $setOnInsert: { guildId, createdAt: new Date() } },
     { upsert: true }
   );
-
-  await syncCollection(PartyModel, 'partyId', 'guildId', guildId, filterByGuild(state.parties, guildId), (partyId, p) => ({
-    partyId,
-    guildId,
-    leaderId: p.leaderId,
-    leaderUsername: p.leaderUsername,
-    members: p.members,
-    channelId: p.channelId,
-    createdAt: p.createdAt,
-  }));
 }
 
 // The global queue pool has no single "owning" guild, so it's persisted independently of any one
@@ -285,7 +241,7 @@ async function persistMatchChannels() {
 }
 
 // Every mutation site already knows which guild it's acting on (a Discord interaction always
-// carries one) — save(guildId) persists that guild's pinnedMessages/parties slice, plus the
+// carries one) — save(guildId) persists that guild's pinnedMessages slice, plus the
 // (guild-agnostic) global queue pool and matchChannels every time, since either can change
 // as a side effect of any guild's activity.
 function save(guildId) {
@@ -300,10 +256,10 @@ function save(guildId) {
 }
 
 // Attempts the MongoDB connection and, if successful, hydrates every known guild's
-// pinnedMessages/parties/matchChannels plus the global queue pool from it (every Guild doc that
-// exists, not just guilds the bot is currently in — no client needed here). Call once at startup,
-// before the bot starts handling events. Safe to call even without MONGODB_URI set — falls back
-// to the JSON store (already loaded into `state` at module load).
+// pinnedMessages/matchChannels plus the global queue pool from it (every Guild doc that exists,
+// not just guilds the bot is currently in — no client needed here). Call once at startup, before
+// the bot starts handling events. Safe to call even without MONGODB_URI set — falls back to the
+// JSON store (already loaded into `state` at module load).
 async function init() {
   const connected = await db.connect();
 
@@ -315,7 +271,7 @@ async function init() {
   try {
     await hydrateFromMongoAll();
     mongoReady = true;
-    console.log('[Store] Using MongoDB for persistence (pinnedMessages, global queue pool, creativeQueues, parties, matchChannels).');
+    console.log('[Store] Using MongoDB for persistence (pinnedMessages, global queue pool, creativeQueues, matchChannels).');
   } catch (err) {
     mongoReady = false;
     console.error('[Store] Failed to hydrate from MongoDB — using local JSON file (data.json) for persistence:', err.message);
@@ -325,7 +281,6 @@ async function init() {
 module.exports = {
   pinnedMessages: state.pinnedMessages,
   queues: state.queues,
-  parties: state.parties,
   creativeQueues: state.creativeQueues,
   matchChannels: state.matchChannels,
   save,

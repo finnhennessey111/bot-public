@@ -27,6 +27,7 @@
 
 const { EventEmitter } = require('events');
 const { REGIONS, toLogPR, getCreativeWideningTier } = require('./creative-queue');
+const { canPartitionIntoHalves } = require('./team-partition');
 const config = require('./config');
 
 const MODES = {
@@ -101,6 +102,23 @@ function evaluateJoin(unit, match, now) {
   const room = targetSize - groupPlayerCount(match);
   if (unit.players.length > room) {
     return { fits: false, reason: `only ${room} slot(s) left, unit has ${unit.players.length}` };
+  }
+
+  // This unit would complete the match — if that leaves more than one unit total, make sure the
+  // resulting group of units can actually be split into two whole-unit teams before ever letting
+  // it confirm. Without this, a completing join can assemble a combination (e.g. three 2-person
+  // duos for 6s: 2+2+2=6, but no subset sums to 3) that team-match-lifecycle.js could only split
+  // by breaking a party apart — never split apart by the matcher, so reject the join instead and
+  // let this unit look elsewhere. A single unit filling the whole match by itself is exempt: that's
+  // a group choosing to scrimmage itself, not the matcher forcing anything.
+  if (unit.players.length === room && match.units.length >= 1) {
+    const sizes = [...match.units.map(u => u.players.length), unit.players.length];
+    if (sizes.length > 1 && !canPartitionIntoHalves(sizes, targetSize / 2)) {
+      return {
+        fits: false,
+        reason: `would complete the match with an unsplittable unit combination (sizes ${sizes.join('+')}, need two teams of ${targetSize / 2})`,
+      };
+    }
   }
 
   const wait = (now - new Date(match.createdAt).getTime()) / 1000;
@@ -235,6 +253,13 @@ function attemptMergeForBucket(mode, region) {
         const b = bucket[j];
 
         if (groupPlayerCount(a) + groupPlayerCount(b) > targetSize) continue;
+
+        // Same "never leave the matcher unable to split units cleanly" gate as evaluateJoin's
+        // completing-join check, applied here since a merge can complete a match too.
+        if (groupPlayerCount(a) + groupPlayerCount(b) === targetSize) {
+          const sizes = [...a.units, ...b.units].map(u => u.players.length);
+          if (sizes.length > 1 && !canPartitionIntoHalves(sizes, targetSize / 2)) continue;
+        }
 
         // Use the older (stricter) of the two matches' ages for the tier lookup.
         const olderCreatedAt = Math.min(new Date(a.createdAt).getTime(), new Date(b.createdAt).getTime());

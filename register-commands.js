@@ -32,23 +32,6 @@ const commands = [
     .setDescription('Manually check for upcoming tournaments and create channels'),
 
   new SlashCommandBuilder()
-    .setName('party-invite')
-    .setDescription('Invite another player to your party, up to 5 members (use in #form-party)')
-    .addUserOption(o => o.setName('user').setDescription('Player to invite').setRequired(true)),
-
-  new SlashCommandBuilder()
-    .setName('party-leave')
-    .setDescription('Leave/disband your current party'),
-
-  new SlashCommandBuilder()
-    .setName('party-status')
-    .setDescription('Check your current party status'),
-
-  new SlashCommandBuilder()
-    .setName('setup-party-channel')
-    .setDescription('Post the pinned party-forming instructions in this channel (run once in #form-party)'),
-
-  new SlashCommandBuilder()
     .setName('setup-creative-1v1')
     .setDescription('Post the pinned Creative 1v1 queue embed in this channel (run once)'),
 
@@ -80,7 +63,7 @@ const commands = [
   // ── MOD DEBUG COMMANDS (MatchMaker Mod role only) ──────────────────────────
   new SlashCommandBuilder()
     .setName('bot-status')
-    .setDescription('[Mod] Show bot uptime, MongoDB/Epic OAuth connectivity, and active queue/match/party counts'),
+    .setDescription('[Mod] Show bot uptime, MongoDB/Epic OAuth connectivity, and active queue/match counts'),
 
   new SlashCommandBuilder()
     .setName('queue-status')

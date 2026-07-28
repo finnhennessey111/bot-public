@@ -356,7 +356,7 @@ function startWebhookServer(client) {
         });
 
         // See permissions.js's progressive-visibility ladder, which gates
-        // #get-roles/#how-to-use/#form-party/#access behind this role.
+        // #get-roles/#how-to-use/#access behind this role.
         const verifiedRoleId = getRoleId(guildId, 'verified');
         if (verifiedRoleId) {
           const guild = await client.guilds.fetch(guildId).catch(() => null);

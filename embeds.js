@@ -289,73 +289,8 @@ function buildMatchConfirmedEmbed(players) {
     .setTimestamp();
 }
 
-function buildPartyInviteEmbed(leaderUsername, invitedUsername) {
-  return new EmbedBuilder()
-    .setTitle('🤝 Party Invite')
-    .setDescription(
-      `**${leaderUsername}** has invited **${invitedUsername}** to join their party.\n\n` +
-      `If accepted, you'll queue together as a unit — for a trios tournament, or 6s/8s creative queue.`
-    )
-    .setColor(0x4A90D9)
-    .setFooter({ text: 'MatchMaker • Invite expires in 5 minutes' })
-    .setTimestamp();
-}
-
-function buildPartyInviteButtons(inviteId) {
-  return new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId(`party_accept_${inviteId}`)
-      .setLabel('Accept')
-      .setStyle(ButtonStyle.Success)
-      .setEmoji('✅'),
-    new ButtonBuilder()
-      .setCustomId(`party_decline_${inviteId}`)
-      .setLabel('Decline')
-      .setStyle(ButtonStyle.Danger)
-      .setEmoji('❌'),
-  );
-}
-
-function buildPartyStatusEmbed(party) {
-  return new EmbedBuilder()
-    .setTitle('🤝 Your Party')
-    .setColor(0x4A90D9)
-    .addFields(
-      party.members.map(m => ({
-        name: m.discordId === party.leaderId ? 'Leader' : 'Member',
-        value: `<@${m.discordId}>`,
-        inline: true,
-      }))
-    )
-    .setFooter({ text: `MatchMaker • ${party.members.length}/${5} members • Leader queues with "Looking for N" or the 6s/8s creative queue` })
-    .setTimestamp();
-}
-
-function buildFormPartyInstructionsEmbed() {
-  return new EmbedBuilder()
-    .setTitle('🤝 How to Form a Party')
-    .setDescription(
-      '• Click **➕ Invite to Party** below and pick a teammate — repeat to grow your party up to **5** members\n' +
-      '• 🔒 Accept/Decline buttons appear in a **private channel** shared by the party\n' +
-      '• 👤 One party at a time — use **🚪 Leave Party** in your party channel to disband before forming a new one\n' +
-      '• (Fallback: `/party-invite @user` also works)'
-    )
-    .setColor(0x4A90D9)
-    .setFooter({ text: 'MatchMaker' });
-}
-
-function buildPartyInviteOpenButtonRow() {
-  return new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId('party_invite_open')
-      .setLabel('➕ Invite to Party')
-      .setStyle(ButtonStyle.Primary),
-  );
-}
-
 // Single-user picker shared by any button flow that used to be a `/command @user` slash option
-// (party invite, vote-kick) — a Discord-native user select needs no autocomplete or validation
-// UI of its own.
+// (vote-kick) — a Discord-native user select needs no autocomplete or validation UI of its own.
 function buildUserSelectRow(customId, placeholder) {
   return new ActionRowBuilder().addComponents(
     new UserSelectMenuBuilder()
@@ -366,29 +301,110 @@ function buildUserSelectRow(customId, placeholder) {
   );
 }
 
-function buildPartyChannelInstructionsEmbed() {
-  return new EmbedBuilder()
-    .setTitle('✅ Party Formed!')
-    .setDescription(
-      '• 🎮 Trios: leader goes to a **trios** tournament channel and clicks **Looking for 1** (party of exactly 2 required)\n' +
-      '• 🎮 6s/8s: leader clicks **Queue** in the creative 6s/8s channel — the bot fills any remaining slots automatically\n' +
-      '• 🚪 **Leave Party** / ℹ️ **Party Status** — use the buttons below\n' +
-      '• (Fallback: `/party-leave` and `/party-status` also work)'
-    )
-    .setColor(0x2E7D32)
-    .setFooter({ text: 'MatchMaker' });
+// ── INLINE 6s/8s TEAM FORMING (team-invite.js) ──────────────────────────────
+// Replaces the old standalone #form-party channel — bring-count select, then (if bringing 1+) an
+// exact-count User Select to invite specific teammates, all from inside the 6s/8s channel itself.
+
+// maxBring is 5 for 6s (target size 6, minus the clicking leader), 7 for 8s.
+function buildTeamBringCountSelectRow(category, maxBring) {
+  const options = [];
+  for (let n = 0; n <= maxBring; n++) {
+    options.push(
+      new StringSelectMenuOptionBuilder()
+        .setLabel(n === 0 ? '0 — queue solo' : `${n}`)
+        .setValue(`${n}`)
+    );
+  }
+  return new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId(`team_bring_count_${category}`)
+      .setPlaceholder('How many people are you bringing?')
+      .addOptions(options),
+  );
 }
 
-function buildPartyChannelButtonRow() {
+// count is exact (min = max) — the leader picked this number up front, so the select must
+// resolve to precisely that many teammates, no more, no less. defaultUserIds pre-fills the menu
+// (Edit Team re-opening this pre-selected with whoever's currently in/invited to the team).
+function buildTeamMemberUserSelectRow(customId, count, defaultUserIds = []) {
+  const menu = new UserSelectMenuBuilder()
+    .setCustomId(customId)
+    .setPlaceholder(`Pick exactly ${count} teammate${count === 1 ? '' : 's'}`)
+    .setMinValues(count)
+    .setMaxValues(count);
+  if (defaultUserIds.length > 0) menu.addDefaultUsers(defaultUserIds);
+  return new ActionRowBuilder().addComponents(menu);
+}
+
+// Shown to an invited player — every *current* teammate (leader + anyone already accepted), name/
+// PR/platform only, per spec ("nothing else about them").
+function buildTeamInviteEmbed(leaderUsername, teammatePlayers, invitedUsername, mode, region) {
+  return new EmbedBuilder()
+    .setTitle('🤝 Team Invite')
+    .setDescription(
+      `**${leaderUsername}** wants **${invitedUsername}** to join their team for **${mode}** (${region}).`
+    )
+    .setColor(CREATIVE_COLOR)
+    .addFields(
+      teammatePlayers.map(p => {
+        const platformIcon = PLATFORM_ICONS[p.platform] ?? '🎮';
+        return {
+          name: `${platformIcon} ${p.epicUsername}`,
+          value: `${p.totalPR} PR • ${p.platform}`,
+          inline: true,
+        };
+      })
+    )
+    .setFooter({ text: 'MatchMaker • Invite expires in 5 minutes' })
+    .setTimestamp();
+}
+
+function buildTeamInviteButtons(inviteId) {
   return new ActionRowBuilder().addComponents(
     new ButtonBuilder()
-      .setCustomId('party_leave_btn')
-      .setLabel('🚪 Leave Party')
-      .setStyle(ButtonStyle.Danger),
+      .setCustomId(`team_invite_accept_${inviteId}`)
+      .setLabel('Accept')
+      .setStyle(ButtonStyle.Success)
+      .setEmoji('✅'),
     new ButtonBuilder()
-      .setCustomId('party_status_btn')
-      .setLabel('ℹ️ Party Status')
-      .setStyle(ButtonStyle.Secondary),
+      .setCustomId(`team_invite_decline_${inviteId}`)
+      .setLabel('Decline')
+      .setStyle(ButtonStyle.Danger)
+      .setEmoji('❌'),
+  );
+}
+
+// Shared status panel for a forming team — visible to the whole channel (not ephemeral) since
+// Accept/Decline happen from separate interactions and need to edit this same message in place;
+// Edit Team/Queue Now are still leader-only, enforced by the button handlers.
+function buildTeamFormingEmbed(leaderUsername, mode, region, bringCount, acceptedUsernames, pendingUsernames) {
+  const acceptedLine = acceptedUsernames.length > 0 ? acceptedUsernames.map(n => `✅ ${n}`).join('\n') : '_none yet_';
+  const pendingLine = pendingUsernames.length > 0 ? pendingUsernames.map(n => `⏳ ${n}`).join('\n') : '_none_';
+
+  return new EmbedBuilder()
+    .setTitle('🤝 Forming a Team')
+    .setDescription(`**${leaderUsername}** is bringing **${bringCount}** teammate(s) for **${mode}** (${region}).`)
+    .setColor(CREATIVE_COLOR)
+    .addFields(
+      { name: 'On the team', value: acceptedLine, inline: true },
+      { name: 'Invited — pending', value: pendingLine, inline: true },
+    )
+    .setFooter({ text: 'MatchMaker • Leader can Edit Team or Queue Now at any time' })
+    .setTimestamp();
+}
+
+function buildTeamFormingButtons(leaderId) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`team_edit_${leaderId}`)
+      .setLabel('Edit Team')
+      .setStyle(ButtonStyle.Secondary)
+      .setEmoji('✏️'),
+    new ButtonBuilder()
+      .setCustomId(`team_queue_now_${leaderId}`)
+      .setLabel('Queue Now')
+      .setStyle(ButtonStyle.Primary)
+      .setEmoji('🔍'),
   );
 }
 
@@ -723,9 +739,9 @@ function buildHowtoEmbed() {
       '**Creative (1v1, 2v2, 6s, 8s)**\n' +
       '• Go to the relevant creative channel\n' +
       '• Pick your mode and region then click Queue\n\n' +
-      '**Parties (Trios/6s/8s only)**\n' +
-      '• Go to #form-party and use `/party-invite @friend`\n' +
-      '• Once accepted, leader queues in the tournament or creative channel\n\n' +
+      '**Bringing Friends (6s/8s only)**\n' +
+      '• Click Queue, choose how many teammates you\'re bringing, then pick them\n' +
+      '• Once they accept, click Queue Now — the bot backfills any open slots\n\n' +
       'Need help? Tag a mod.'
     )
     .setColor(0x4A90D9)
@@ -887,7 +903,7 @@ function buildWelcomeDmEmbed(guildName) {
       '**1.** Run `/matchmaker-setup` as a server admin — this creates all the roles, categories, ' +
       'channels, and starter embeds MatchMaker needs, including a verified role that\'s assigned ' +
       'automatically when a member links their Epic account (new members only see #register until ' +
-      'they have it, then #get-roles/#how-to-use/#form-party/#access unlock automatically).\n\n' +
+      'they have it, then #get-roles/#how-to-use/#access unlock automatically).\n\n' +
       'That\'s it — MatchMaker will be fully live for your server after that.'
     )
     .setColor(0x4A90D9)
@@ -1155,7 +1171,7 @@ function buildDmSubscribeButtons(monthlyUrl, yearlyUrl) {
 
 // ── MOD DEBUG COMMANDS ──────────────────────────────────────────────────────
 
-function buildBotStatusEmbed({ uptimeMs, mongoConnected, epicOAuthConfigured, activeQueues, activeMatches, activeParties }) {
+function buildBotStatusEmbed({ uptimeMs, mongoConnected, epicOAuthConfigured, activeQueues, activeMatches }) {
   return new EmbedBuilder()
     .setTitle('🛠️ Bot Status')
     .setColor(mongoConnected && epicOAuthConfigured ? 0x2ECC71 : 0xE67E22)
@@ -1165,7 +1181,6 @@ function buildBotStatusEmbed({ uptimeMs, mongoConnected, epicOAuthConfigured, ac
       { name: '🔗 Epic OAuth', value: epicOAuthConfigured ? '✅ Configured' : '❌ Not configured', inline: true },
       { name: '🎮 Active Queues', value: `**${activeQueues}**`, inline: true },
       { name: '⚔️ Active Matches', value: `**${activeMatches}**`, inline: true },
-      { name: '🤝 Active Parties', value: `**${activeParties}**`, inline: true },
     )
     .setFooter({ text: 'MatchMaker' })
     .setTimestamp();
@@ -1253,14 +1268,13 @@ module.exports = {
   mentionOrCrossServerName,
   buildMatchButtons,
   buildMatchConfirmedEmbed,
-  buildPartyInviteEmbed,
-  buildPartyInviteButtons,
-  buildPartyStatusEmbed,
-  buildFormPartyInstructionsEmbed,
-  buildPartyInviteOpenButtonRow,
   buildUserSelectRow,
-  buildPartyChannelInstructionsEmbed,
-  buildPartyChannelButtonRow,
+  buildTeamBringCountSelectRow,
+  buildTeamMemberUserSelectRow,
+  buildTeamInviteEmbed,
+  buildTeamInviteButtons,
+  buildTeamFormingEmbed,
+  buildTeamFormingButtons,
   buildCreativeQueueEmbed,
   buildCreativeQueueComponents,
   buildCreativeMatchCard,

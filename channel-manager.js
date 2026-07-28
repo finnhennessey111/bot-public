@@ -1,7 +1,7 @@
 // channel-manager.js - Automated tournament channel creation and deletion
 
 const { ChannelType, PermissionFlagsBits } = require('discord.js');
-const { scrapeUpcomingTournaments } = require('./tournament-scraper');
+const { scrapeUpcomingTournaments, isBareBuildModeLabel } = require('./tournament-scraper');
 const { save: saveStore } = require('./store');
 const { buildTournamentEmbed } = require('./embeds');
 const { getQueueCount } = require('./queue');
@@ -83,8 +83,26 @@ function armDeletionTimer(guild, channelId, pinned, pinnedMessages) {
   console.log(`  ⏲️ Armed deletion timer for ${channelId} (${label}) — fires in ${hrsUntil}hrs${msUntilDelete <= 0 ? ' (overdue, deleting now)' : ''}`);
 }
 
+// Discord channel names need to stay short — abbreviate the common build-mode words wherever they
+// appear in a tournament's name, AND move the abbreviation to the front (e.g. "ZB Typical Gamer
+// Icon Cup", not "Typical Gamer Icon Cup ZB") so it reads as a mode tag rather than getting cut off
+// by (or pushing something else out of) the 40-char slice below. Only affects the generated
+// channel-name string, not the tournament's display name used elsewhere (embed title, pinned
+// message).
+function abbreviateBuildMode(name) {
+  const match = name.match(/\(?\s*\b(battle royale|zero build)\b\s*\)?/i);
+  if (!match) return name;
+
+  const tag = /zero build/i.test(match[1]) ? 'ZB' : 'BR';
+  const withoutTag = (name.slice(0, match.index) + name.slice(match.index + match[0].length))
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+
+  return `${tag} ${withoutTag}`.trim();
+}
+
 function buildChannelName(tournamentName, dateStr = null) {
-  const cleanName = tournamentName
+  const cleanName = abbreviateBuildMode(tournamentName)
     .toLowerCase()
     .replace(/[^a-z0-9\s-]/g, '')
     .trim()
@@ -121,6 +139,17 @@ function refreshPermanentBeginTime(channelId, latestBeginTime, pinnedMessages, g
 
 async function createTournamentChannel(guild, tournament, pinnedMessages) {
   const { name, region, beginTime, lastBeginTime, isTrios, consoleOnly, isPermanent } = tournament;
+
+  // Last-resort guard: tournament-scraper.js's buildTournamentGroups already drops sessions whose
+  // title is nothing but a build-mode label (see isBareBuildModeLabel there) before they ever
+  // become a `tournament` object, but this is the last point before a channel actually gets
+  // created — if some future scrape source ever bypasses that filter, refuse here too rather than
+  // shipping a channel literally named "battle-royale"/"zero-build" with no way for players to
+  // tell which tournament it's for. A build-mode tag alone is never a valid channel name.
+  if (isBareBuildModeLabel(name.toLowerCase())) {
+    console.error(`  ❌ Refused to create channel — tournament name is just a build-mode label with no tournament name at all ("${name}")`);
+    return;
+  }
 
   // Permanent tournaments (FNCS Divisional Cups) must never get a date-suffixed name — 'fncs'
   // also matches PER_DAY_KEYWORDS, but a date suffix keyed off *this* week's beginTime would give
@@ -473,4 +502,4 @@ function startScheduler(client, pinnedMessages) {
   console.log('📅 Tournament scheduler started — 20min tournament check + 60s embed refresh armed');
 }
 
-module.exports = { startScheduler, checkAndCreateChannels, managedChannels };
+module.exports = { startScheduler, checkAndCreateChannels, managedChannels, buildChannelName, abbreviateBuildMode };

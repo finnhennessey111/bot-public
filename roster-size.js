@@ -15,4 +15,23 @@ function inferRosterSize(nameLower) {
   return null;
 }
 
-module.exports = { inferRosterSize };
+// Manually-verified roster sizes for specific recurring tournament/event names that have no
+// team-size keyword in their title at all — confirmed by direct observation of the tournament's
+// actual format, not guessed. Keep this small, and only add an entry once it's actually confirmed;
+// an unconfirmed guess here is exactly the failure mode inferRosterSize's "leave unclassified, log
+// it" behavior was built to avoid. Matched by substring so a name with a build-mode suffix
+// appended (e.g. "PlayStation Typical Gamer Icon Cup (Zero Build)") still resolves correctly.
+const KNOWN_TOURNAMENT_ROSTER_SIZES = {
+  'playstation typical gamer icon cup': 1, // confirmed solo format
+};
+
+// Resolution order: manually-verified override, then keyword inference, then null (unclassified)
+// — callers decide what null means for their own purposes.
+function resolveRosterSize(nameLower) {
+  for (const [knownName, size] of Object.entries(KNOWN_TOURNAMENT_ROSTER_SIZES)) {
+    if (nameLower.includes(knownName)) return size;
+  }
+  return inferRosterSize(nameLower);
+}
+
+module.exports = { inferRosterSize, resolveRosterSize };

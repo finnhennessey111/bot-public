@@ -14,8 +14,8 @@ const { postCreativeQueueChannel } = require('./creative-channel');
 const { QUEUE_CHANNEL_CONFIGS } = require('./creative-channel-configs');
 const {
   buildRolesEmbed, buildRolesComponents, buildBioButtonRow, buildRegisterEmbed, buildEpicLinkButtonRow,
-  buildHowtoEmbed, buildSetupInstructionsEmbed, buildFormPartyInstructionsEmbed,
-  buildPartyInviteOpenButtonRow, buildAccessChannelEmbed, buildAccessChannelButtons,
+  buildHowtoEmbed, buildSetupInstructionsEmbed,
+  buildAccessChannelEmbed, buildAccessChannelButtons,
 } = require('./embeds');
 
 const ROLE_SPECS = [
@@ -30,9 +30,9 @@ const ROLE_SPECS = [
   { key: 'Registered', name: 'Registered' },
   { key: 'mod', name: 'MatchMaker Mod' },
   // Assigned directly by the Epic OAuth callback (webhook-server.js's /epic-callback) on a
-  // successful link — gates #get-roles/#how-to-use/#form-party/#access (permissions.js's
-  // progressive-visibility ladder). Auto-created here like every other role, so setup never needs
-  // an admin to hand us an externally-managed role ID.
+  // successful link — gates #get-roles/#how-to-use/#access (permissions.js's progressive-
+  // visibility ladder). Auto-created here like every other role, so setup never needs an admin to
+  // hand us an externally-managed role ID.
   { key: 'verified', name: 'MatchMaker Verified' },
 ];
 
@@ -52,7 +52,6 @@ const CHANNEL_SPECS = [
   { key: 'register', name: 'register' },
   { key: 'getRoles', name: 'get-roles' },
   { key: 'howto', name: 'how-to-use' },
-  { key: 'formParty', name: 'form-party' },
   { key: 'access', name: 'access' },
 ];
 
@@ -231,10 +230,6 @@ async function runMatchmakerSetup(guild) {
       guild.client, config.setupMessageIds, channelIds, 'howto',
       () => ({ embeds: [buildHowtoEmbed()] })
     );
-    setupMessageIds.formParty = await ensurePosted(
-      guild.client, config.setupMessageIds, channelIds, 'formParty',
-      () => ({ embeds: [buildFormPartyInstructionsEmbed()], components: [buildPartyInviteOpenButtonRow()] })
-    );
     setupMessageIds.register = await ensurePosted(
       guild.client, config.setupMessageIds, channelIds, 'register',
       () => ({ embeds: [buildRegisterEmbed(channelIds.getRoles)], components: [buildEpicLinkButtonRow()] })
@@ -250,7 +245,7 @@ async function runMatchmakerSetup(guild) {
 
     await enforcePermissions(guild);
 
-    const verifiedRoleLine = `Verified role: <@&${roleIds.verified}> — get-roles/how-to-use/form-party/access `
+    const verifiedRoleLine = `Verified role: <@&${roleIds.verified}> — get-roles/how-to-use/access `
       + 'unlock once a member links their Epic account via the Link Epic Account button in #register.';
 
     return {

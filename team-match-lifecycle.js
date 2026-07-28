@@ -14,16 +14,17 @@
 // write the same in-memory matchState, keyed by matchId, not by channel.
 //
 // In-memory only (not persisted), same precedent as matching.js's pendingMatches and
-// party.js's pendingInvites — a restart loses any in-progress lock/ready-check/vote state.
+// team-invite.js's pendingInvites — a restart loses any in-progress lock/ready-check/vote state.
 
 const { ChannelType, PermissionFlagsBits } = require('discord.js');
 const config = require('./config');
 const { toLogPR, getCreativeWideningTier } = require('./creative-queue');
 const creativeTeamQueue = require('./creative-team-queue');
 const channelLifecycle = require('./channel-lifecycle');
+const { bestPartitionByPR } = require('./team-partition');
 const credits = require('./credits');
 const feedback = require('./feedback');
-const { getRoleId } = require('./guild-config');
+const { getRoleId, getCreativeChannelInfo } = require('./guild-config');
 const {
   buildCreativeMatchConfirmedEmbed, buildCloseChannelButton, buildVoteKickOpenButtonRow,
   buildReadyCheckEmbed, buildReadyButton,
@@ -112,6 +113,28 @@ async function forEachChannel(matchState, client, fn) {
   }
 }
 
+// Resolves the category a 6s/8s match channel pair should live under: the *same* category as
+// that mode's own creative queue channel (the "6s"/"8s" channel players click Queue in) — not the
+// generic cross-mode "Matches" category tournament/1v1/2v2 channels share. Falls back to that
+// generic category (channelLifecycle.getOrCreateMatchCategory, same helper tournament match
+// channels already reuse) if the queue channel isn't configured yet or has no parent, so match
+// creation never hard-fails just because that lookup came up empty.
+async function getTeamMatchCategory(guild, mode) {
+  const category = creativeTeamQueue.categoryForMode(mode);
+  const info = getCreativeChannelInfo(guild.id, category);
+
+  if (info?.channelId) {
+    try {
+      const queueChannel = await guild.channels.fetch(info.channelId);
+      if (queueChannel?.parent) return queueChannel.parent;
+    } catch (err) {
+      console.warn(`Could not resolve ${category} queue channel's category, falling back to the generic Matches category:`, err.message);
+    }
+  }
+
+  return channelLifecycle.getOrCreateMatchCategory(guild);
+}
+
 async function createGuildChannelForMatch(guild, localPlayers, category, mode, shortId, client) {
   const modRoleId = getRoleId(guild.id, 'mod');
 
@@ -197,7 +220,7 @@ async function startTeamMatch(units, mode, region, completingGuildId, client) {
 
     let channel, voiceChannel;
     try {
-      const matchCategory = await channelLifecycle.getOrCreateMatchCategory(guild);
+      const matchCategory = await getTeamMatchCategory(guild, mode);
       ({ channel, voiceChannel } = await createGuildChannelForMatch(guild, localPlayers, matchCategory, mode, shortId, client));
     } catch (err) {
       console.error(`Failed to create team match channel(s) in guild ${guildId}:`, err.message);
@@ -252,55 +275,20 @@ async function startTeamMatch(units, mode, region, completingGuildId, client) {
 // immediate PR-balanced split. Always finishes by calling announceTeams, which is what actually
 // starts the pre-existing lock/ready-check flow.
 
-function unitTotalPR(unit) {
-  return unit.players.reduce((sum, p) => sum + p.totalPR, 0);
-}
-
 function teamTotalPR(team) {
   return team.reduce((sum, p) => sum + p.totalPR, 0);
 }
 
-// Places every unit (party or solo) into one of two equal-size teams, keeping each unit
-// together whenever it fits in one team's remaining room. A unit too large to fit whole in
-// either team is split as evenly as possible across both — the only way partied players end up
-// on different teams. seedTeam1/seedTeam2 let callers pre-seed with already-decided placements
-// (e.g. manual picks) and have this only place the remaining units around them.
+// Places every unit (party or solo) into one of two equal-size teams — thin wrapper around
+// team-partition.js's exact search, which always finds a whole-unit (never-split) partition when
+// one exists and picks the PR-balanced one among every partition that does; only falls back to
+// splitting a unit when no whole-unit partition exists at all (see team-partition.js's doc
+// comment — creative-team-queue.js's join/merge gate prevents that from happening except for the
+// one legitimate case, a single unit filling the whole lobby by itself). seedTeam1/seedTeam2 let
+// callers pre-seed with already-decided placements (e.g. manual picks) and have this only place
+// the remaining units around them.
 function assignPartyAwareTeams(units, halfSize, seedTeam1 = [], seedTeam2 = []) {
-  const team1 = [...seedTeam1];
-  const team2 = [...seedTeam2];
-
-  const sortedUnits = [...units].sort((a, b) =>
-    b.players.length - a.players.length || unitTotalPR(b) - unitTotalPR(a)
-  );
-
-  for (const unit of sortedUnits) {
-    const room1 = halfSize - team1.length;
-    const room2 = halfSize - team2.length;
-    const size = unit.players.length;
-    const fitsTeam1 = size <= room1;
-    const fitsTeam2 = size <= room2;
-
-    if (fitsTeam1 && fitsTeam2) {
-      (teamTotalPR(team1) <= teamTotalPR(team2) ? team1 : team2).push(...unit.players);
-    } else if (fitsTeam1) {
-      team1.push(...unit.players);
-    } else if (fitsTeam2) {
-      team2.push(...unit.players);
-    } else {
-      // Doesn't fit whole in either — split across both, filling whatever room remains and
-      // handing the higher-PR half of the party to whichever team is currently lower on PR.
-      const playersDesc = [...unit.players].sort((a, b) => b.totalPR - a.totalPR);
-      for (const p of playersDesc) {
-        const r1 = halfSize - team1.length;
-        const r2 = halfSize - team2.length;
-        if (r1 <= 0) team2.push(p);
-        else if (r2 <= 0) team1.push(p);
-        else (teamTotalPR(team1) <= teamTotalPR(team2) ? team1 : team2).push(p);
-      }
-    }
-  }
-
-  return { team1, team2 };
+  return bestPartitionByPR(units, halfSize, seedTeam1, seedTeam2);
 }
 
 // Last-resort correction for the "Choose Own Teams" path: conflicting individual picks can
@@ -683,7 +671,7 @@ async function backfillVacancies(matchState, client) {
             continue;
           }
           try {
-            const matchCategory = await channelLifecycle.getOrCreateMatchCategory(guild);
+            const matchCategory = await getTeamMatchCategory(guild, matchState.mode);
             const shortId = Math.random().toString(36).slice(2, 7);
             const { channel, voiceChannel } = await createGuildChannelForMatch(
               guild, guildNewPlayers, matchCategory, matchState.mode, shortId, client
@@ -845,4 +833,6 @@ module.exports = {
   broadcastVoteKickStart,
   handleVoteKickButton,
   startVoteResolutionTimer,
+  getTeamMatchCategory,
+  assignPartyAwareTeams,
 };

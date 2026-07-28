@@ -10,8 +10,7 @@
 //   1. #register only (ENTRY_CHANNEL_KEYS) — visible to @everyone, no role needed.
 //   2. The Epic OAuth flow (epic-oauth.js / webhook-server.js's /epic-callback) grants the
 //      verified role (auto-created by /matchmaker-setup, stored as roleIds.verified) directly on
-//      a successful link -> unlocks #get-roles, #how-to-use, #form-party and #access
-//      (verifiedChannels).
+//      a successful link -> unlocks #get-roles, #how-to-use and #access (verifiedChannels).
 //   3. They complete #get-roles and are granted the Registered role (index.js's select_region
 //      handler grants Registered and a region role together) -> unlocks their region's
 //      tournament channels (already gated per-channel by region role at creation time in
@@ -30,15 +29,14 @@ const { getChannelId, getRoleId, getCreativeChannelInfo } = require('./guild-con
 // Visible to a brand new member with no roles at all — the very first thing they see.
 const ENTRY_CHANNEL_KEYS = ['register'];
 
-// Unlocked once Epic OAuth has verified the member (see module doc above). #access and
-// #form-party used to be visible to @everyone unconditionally, which broke the "only #register
-// visible by default" rule for a brand-new, unverified member — folded into this tier instead.
-// `sendMessages: false` keeps #access read-only, since its embed is entirely button-driven; every
-// other channel here defaults to normal posting.
+// Unlocked once Epic OAuth has verified the member (see module doc above). #access used to be
+// visible to @everyone unconditionally, which broke the "only #register visible by default" rule
+// for a brand-new, unverified member — folded into this tier instead. `sendMessages: false` keeps
+// #access read-only, since its embed is entirely button-driven; every other channel here defaults
+// to normal posting.
 const verifiedChannels = [
   { key: 'getRoles' },
   { key: 'howto' },
-  { key: 'formParty' },
   { key: 'access', sendMessages: false },
 ];
 
@@ -113,11 +111,11 @@ async function enforceEntryChannels(guild) {
 // If the guild has no verified role configured yet (roleIds.verified unset — pre-dating the
 // auto-create in /matchmaker-setup), these channels are left exactly as they currently are rather
 // than locked out entirely — an upgrading server shouldn't lose access to
-// get-roles/how-to-use/form-party/access just because /matchmaker-setup hasn't been re-run yet.
+// get-roles/how-to-use/access just because /matchmaker-setup hasn't been re-run yet.
 async function enforceVerifiedChannels(guild) {
   const verifiedRoleId = getRoleId(guild.id, 'verified');
   if (!verifiedRoleId) {
-    console.warn('  ⚠️ No verified role configured for this guild (re-run /matchmaker-setup) — skipping progressive-visibility enforcement for get-roles/how-to-use/form-party/access');
+    console.warn('  ⚠️ No verified role configured for this guild (re-run /matchmaker-setup) — skipping progressive-visibility enforcement for get-roles/how-to-use/access');
     return;
   }
 
