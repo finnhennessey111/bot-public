@@ -6,6 +6,11 @@
 // event times. If the site formats times client-side using the browser's local timezone, the
 // UTC and LA runs will show times exactly 7 hours apart for the same events; if the site bakes in
 // a fixed zone regardless of viewer, all 3 runs will show identical times.
+//
+// Runs standalone (not via index.js, which calls dotenv.config() before requiring anything else),
+// so it must load .env itself — otherwise proxy-config.js's isProxyConfigured() sees an empty
+// process.env and silently runs DIRECT regardless of what's actually in .env on disk.
+require('dotenv').config();
 const puppeteer = require('puppeteer');
 const fs = require('fs');
 const { proxyLaunchArgs, authenticatePage, logProxyMode } = require('./proxy-config');

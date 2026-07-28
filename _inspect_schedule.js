@@ -1,7 +1,10 @@
 // One-off inspector — NOT part of the app, delete after use.
 // Run with: node _inspect_schedule.js EU
-// Requires the same PROXY_HOST/PROXY_PORT/PROXY_USERNAME/PROXY_PASSWORD env vars (or .env via
-// dotenv, if this project loads it elsewhere) that the real scrapers use.
+// Requires the same PROXY_HOST/PROXY_PORT/PROXY_USERNAME/PROXY_PASSWORD env vars as the real
+// scrapers. Unlike scraper.js/tournament-scraper.js, this runs standalone (not via index.js, which
+// calls dotenv.config() before requiring anything else) — so it must load .env itself, or
+// proxy-config.js's isProxyConfigured() sees an empty process.env and silently runs DIRECT.
+require('dotenv').config();
 const puppeteer = require('puppeteer');
 const fs = require('fs');
 const { proxyLaunchArgs, authenticatePage, logProxyMode } = require('./proxy-config');
