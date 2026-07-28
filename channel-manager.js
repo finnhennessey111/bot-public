@@ -442,7 +442,7 @@ async function runEmbedRefreshTick(client, pinnedMessages) {
 }
 
 function startScheduler(client, pinnedMessages) {
-  // Runs immediately on every startup (not just at the next daily tick) so a tournament that
+  // Runs immediately on every startup (not just at the next scheduled tick) so a tournament that
   // entered the 48h window while the bot was offline gets its channel created right away.
   console.log('📅 Running initial tournament check on startup...');
   runTournamentCheckTick(client, pinnedMessages);
@@ -451,26 +451,26 @@ function startScheduler(client, pinnedMessages) {
   // up to a minute's delay.
   runEmbedRefreshTick(client, pinnedMessages);
 
-  // Once a day, not hourly — each tick is a full Puppeteer navigation (scrapeUpcomingTournaments),
-  // and the hourly cadence this used to run at was a real contributor to the Cloudflare IP block
-  // described in tournament-scraper.js's doc comment. A tournament entering the 48h creation
-  // window between daily ticks can now sit unnoticed for up to ~24h before its channel appears —
-  // an accepted tradeoff against scrape volume, still comfortably inside the 48h window itself.
-  // This log fires unconditionally on every tick (independent of whether checkAndCreateChannels
-  // itself finds anything to do) so a live deployment's logs make it obvious the interval is
-  // still alive day to day, rather than only ever seeing evidence when a channel actually gets
-  // created.
+  // Every 20 minutes — briefly dropped to once a day over Cloudflare-IP-block risk (each tick is
+  // a full Puppeteer navigation via scrapeUpcomingTournaments), but a working residential proxy is
+  // now in place (see proxy-config.js), so that risk no longer applies. Daily was too slow anyway:
+  // short-notice skin cups are sometimes posted only 1-2 days out, and a tournament entering the
+  // 48h creation window between daily ticks could sit unnoticed for up to ~24h before its channel
+  // appeared — players would queue elsewhere in the meantime. This log fires unconditionally on
+  // every tick (independent of whether checkAndCreateChannels itself finds anything to do) so a
+  // live deployment's logs make it obvious the interval is still alive, rather than only ever
+  // seeing evidence when a channel actually gets created.
   setInterval(async () => {
     const now = new Date();
     console.log(`⏰ Scheduler tick fired — UTC hour ${now.getUTCHours()} (${now.toISOString()}) — running tournament check`);
     await runTournamentCheckTick(client, pinnedMessages);
-  }, 24 * 60 * 60 * 1000);
+  }, 20 * 60 * 1000);
 
   setInterval(() => {
     runEmbedRefreshTick(client, pinnedMessages).catch(console.error);
   }, EMBED_REFRESH_INTERVAL_MS);
 
-  console.log('📅 Tournament scheduler started — daily tournament check + 60s embed refresh armed');
+  console.log('📅 Tournament scheduler started — 20min tournament check + 60s embed refresh armed');
 }
 
 module.exports = { startScheduler, checkAndCreateChannels, managedChannels };

@@ -67,13 +67,28 @@ function parseProfileData(data) {
     for (const event of data.myEvents) {
       if (!event.isPrEvent) continue;
       const name = event.displayMetadata?.title_line_1?.trim() ?? 'Unknown';
+
+      // Real scrapes show event.rosterSize coming back null across the board — FT Tracker doesn't
+      // populate it on this payload shape — so fall back to a title keyword. If the title has no
+      // team-size word either (e.g. some skin/creator cups like "PlayStation Typical Gamer Icon
+      // Cup Battle Royale"), leave it null rather than guessing a default: soloModifier's
+      // rosterSize === 1 check just won't count this event either way, but a wrong guess could
+      // make it count (or wrongly exclude it) silently. Logged so unclassified titles stay visible.
+      let rosterSize = event.rosterSize ?? null;
+      if (rosterSize == null) {
+        rosterSize = inferRosterSize(name.toLowerCase());
+        if (rosterSize == null) {
+          console.warn(`⚠️ Could not determine roster size for event "${name}" — no rosterSize field and no team-size keyword in title. Leaving unclassified.`);
+        }
+      }
+
       for (const window of event.windows ?? []) {
         recentEvents.push({
           name,
           date: window.beginTime ?? null,
           placement: window.data?.rank ?? null,
           prPoints: window.powerRankingData?.points ?? 0,
-          rosterSize: event.rosterSize ?? null,
+          rosterSize,
           matches: window.data?.matchesPlayed ?? 0,
           wins: window.data?.wins ?? 0,
           elims: window.data?.kills ?? 0,
@@ -90,6 +105,17 @@ function parseProfileData(data) {
   const cappedRecentEvents = recentEvents.slice(0, 20);
 
   return { totalPR, thisSeasonPR, prBand, recentEvents: cappedRecentEvents };
+}
+
+// Keyword-based team-size fallback for when event.rosterSize comes back null (see call site in
+// parseProfileData). Word-boundary match against the lowercased title only — deliberately no
+// attempt to infer a size for titles with no team-size word at all (returns null, caller logs it).
+function inferRosterSize(nameLower) {
+  if (/\bsolos?\b/.test(nameLower)) return 1;
+  if (/\bduos?\b/.test(nameLower)) return 2;
+  if (/\btrios?\b/.test(nameLower)) return 3;
+  if (/\bsquads?\b/.test(nameLower)) return 4;
+  return null;
 }
 
 function extractPowerRank(powerRank) {
