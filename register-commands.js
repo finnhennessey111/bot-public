@@ -1,11 +1,14 @@
 require('dotenv').config();
-const { REST, Routes, SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
+const { REST, Routes, SlashCommandBuilder } = require('discord.js');
 
 const commands = [
+  // No setDefaultMemberPermissions here — same as the "[Mod]" commands below. A Discord-level
+  // permission bit can't express "the MatchMaker Mod role, OR Manage Server if that role doesn't
+  // exist yet" (a static bitfield has no way to reference a per-guild custom role at all), so this
+  // is gated entirely at runtime in index.js's handler instead. See that handler's comment for why.
   new SlashCommandBuilder()
     .setName('matchmaker-setup')
-    .setDescription('Set up all roles, categories, channels and starter embeds MatchMaker needs (admin-only)')
-    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+    .setDescription('Set up all roles, categories, channels and starter embeds MatchMaker needs (mods or Manage Server)'),
 
   new SlashCommandBuilder()
     .setName('setup-tournament')

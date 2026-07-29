@@ -230,4 +230,15 @@ async function enforcePermissions(guild) {
   console.log('🔐 Permission enforcement complete');
 }
 
-module.exports = { enforcePermissions, botAccessOverwrite };
+// Runtime gate for the mod debug commands and /matchmaker-setup — a custom per-guild role
+// (guild-config.js's roleIds.mod), not a Discord permission bit, so it can't be expressed via
+// SlashCommandBuilder#setDefaultMemberPermissions (register-commands.js deliberately sets none
+// for these commands). Lives here (not index.js) purely so it's independently testable without
+// requiring index.js itself, which isn't possible in a test — it calls client.login() as a side
+// effect of loading.
+function isModMember(guildId, interaction) {
+  const modRoleId = getRoleId(guildId, 'mod');
+  return !!modRoleId && !!interaction.member?.roles.cache.has(modRoleId);
+}
+
+module.exports = { enforcePermissions, botAccessOverwrite, isModMember };

@@ -23,7 +23,7 @@ const playerStore = require('./players');
 const epicOAuth = require('./epic-oauth');
 const { startScheduler, checkAndCreateChannels } = require('./channel-manager');
 const { scrapeUpcomingTournaments } = require('./tournament-scraper');
-const { enforcePermissions } = require('./permissions');
+const { enforcePermissions, isModMember } = require('./permissions');
 const guildConfig = require('./guild-config');
 const { getRoleId, getChannelId } = guildConfig;
 const { runMatchmakerSetup } = require('./matchmaker-setup');
@@ -68,14 +68,6 @@ const {
 } = require('./embeds');
 
 const botStartTime = Date.now();
-
-// Runtime gate for the mod debug commands and the setup/admin commands restricted to mods —
-// a custom per-guild role (guild-config.js's roleIds.mod), not a Discord permission bit, so it
-// can't be expressed via SlashCommandBuilder#setDefaultMemberPermissions.
-function isModMember(guildId, interaction) {
-  const modRoleId = getRoleId(guildId, 'mod');
-  return !!modRoleId && !!interaction.member?.roles.cache.has(modRoleId);
-}
 
 async function replyModOnly(interaction) {
   await interaction.editReply({ content: '❌ This command is restricted to the MatchMaker Mod role.' });
@@ -783,11 +775,20 @@ async function handleInteraction(interaction) {
         .catch(console.error);
     }
 
-    // /matchmaker-setup — admin-only (see register-commands.js's setDefaultMemberPermissions).
-    // Creates every role/category/channel MatchMaker needs and posts the starter embeds,
-    // idempotently (safe to re-run — reuses anything already created and still present).
+    // /matchmaker-setup — gated at runtime (register-commands.js deliberately sets no
+    // setDefaultMemberPermissions, same as the "[Mod]" commands below): the MatchMaker Mod role if
+    // this guild already has one configured, otherwise Manage Server as a bootstrap fallback for a
+    // brand new server where /matchmaker-setup is what CREATES that role in the first place — a
+    // guild's owner (who always holds Manage Server) is covered either way. Creates every role/
+    // category/channel MatchMaker needs and posts the starter embeds, idempotently (safe to re-run
+    // — reuses anything already created and still present).
     if (interaction.commandName === 'matchmaker-setup') {
       await interaction.deferReply({ flags: 64 });
+
+      const hasManageGuild = !!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild);
+      if (!isModMember(interaction.guild.id, interaction) && !hasManageGuild) {
+        return interaction.editReply({ content: '❌ This command requires the MatchMaker Mod role or the Manage Server permission.' });
+      }
 
       try {
         const result = await runMatchmakerSetup(interaction.guild);
