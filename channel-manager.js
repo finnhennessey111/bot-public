@@ -137,6 +137,38 @@ function refreshPermanentBeginTime(channelId, latestBeginTime, pinnedMessages, g
   console.log(`  🔄 Refreshed next-event beginTime for permanent channel ${channelId} (${pinned.tournamentName}): ${latestBeginTime}`);
 }
 
+// Finds an already-existing channel for this exact tournament, preferring tournament-scraper.js's
+// stable eventId (Fortnite Tracker's own event identifier — see buildTournamentGroups' comment)
+// over the channel's literal current name. This is what lets a naming-logic change (e.g. today's
+// BR/ZB prefix format, or any future one) rename an existing channel in place instead of creating
+// a second, orphaned one for the same real tournament — every previous naming fix this bot has
+// shipped left its old, now-incorrectly-named channels sitting as duplicates until their own
+// deletion timer eventually cleared them, across every server, each time.
+//
+// Falls back to the old exact-name-in-category match (unchanged from before) when there's no
+// eventId (a raw session that somehow arrived without one) or no pinnedMessages entry matches it
+// yet (e.g. a channel that predates this field, or one created manually via /setup-tournament) —
+// so a genuinely untracked-but-correctly-named channel still isn't duplicated either.
+async function findExistingTournamentChannel(guild, pinnedMessages, tournament, categoryId, channelName) {
+  if (tournament.eventId) {
+    const match = Object.entries(pinnedMessages).find(
+      ([, pinned]) => pinned.guildId === guild.id && pinned.tournamentEventId === tournament.eventId
+    );
+    if (match) {
+      const [channelId, pinnedEntry] = match;
+      const channel = await guild.channels.fetch(channelId).catch(() => null);
+      if (channel) return { channel, pinnedEntry, matchedBy: 'eventId' };
+      // Pinned entry points at a channel that's gone (deleted, naturally or otherwise) — fall
+      // through to the name-based check below rather than treating this as a live match.
+    }
+  }
+
+  const existing = guild.channels.cache.find(c => c.name === channelName && c.parentId === (categoryId ?? null));
+  if (existing) return { channel: existing, pinnedEntry: pinnedMessages[existing.id] ?? null, matchedBy: 'name' };
+
+  return null;
+}
+
 async function createTournamentChannel(guild, tournament, pinnedMessages) {
   const { name, region, beginTime, lastBeginTime, isTrios, consoleOnly, isPermanent } = tournament;
 
@@ -167,9 +199,32 @@ async function createTournamentChannel(guild, tournament, pinnedMessages) {
   // dedup check to this region's category or same-name channels across regions would
   // incorrectly appear as duplicates of each other.
   const categoryId = getCategoryId(guild.id, region);
-  const existing = guild.channels.cache.find(c => c.name === channelName && c.parentId === (categoryId ?? null));
-  if (existing) {
-    console.log(`  ⏭️ Skipped — channel already exists in this region's category: ${channelName}`);
+  const found = await findExistingTournamentChannel(guild, pinnedMessages, tournament, categoryId, channelName);
+  if (found) {
+    const { channel: existing, pinnedEntry, matchedBy } = found;
+
+    if (matchedBy === 'eventId' && existing.name !== channelName) {
+      // Same real tournament (Fortnite Tracker's own event identifier matched), but naming logic
+      // has changed since this channel was created — rename in place rather than leaving the old
+      // name to sit as an orphaned duplicate once a second, correctly-named channel would
+      // otherwise get created here. Captured before setName — Discord.js mutates the channel
+      // object's own .name in place once the rename resolves, so reading it only afterward would
+      // always log the new name on both sides of the arrow.
+      const previousName = existing.name;
+      try {
+        await existing.setName(channelName);
+        console.log(`  ✏️ Renamed channel ${existing.id} "${previousName}" → "${channelName}" (same tournament, eventId ${tournament.eventId} — naming logic changed)`);
+      } catch (err) {
+        console.error(`  ❌ Failed to rename channel ${existing.id} to "${channelName}":`, err.message);
+      }
+      if (pinnedEntry) {
+        pinnedEntry.tournamentName = name;
+        saveStore(guild.id);
+      }
+    } else {
+      console.log(`  ⏭️ Skipped — channel already exists (matched by ${matchedBy}): ${existing.name}`);
+    }
+
     if (isPermanent) refreshPermanentBeginTime(existing.id, beginTime, pinnedMessages, guild.id);
     return;
   }
@@ -229,6 +284,7 @@ async function createTournamentChannel(guild, tournament, pinnedMessages) {
       messageId: msg.id,
       guildId: guild.id,
       tournamentName: name,
+      tournamentEventId: tournament.eventId ?? null,
       region,
       isTrios,
       beginTime,
@@ -502,4 +558,7 @@ function startScheduler(client, pinnedMessages) {
   console.log('📅 Tournament scheduler started — 20min tournament check + 60s embed refresh armed');
 }
 
-module.exports = { startScheduler, checkAndCreateChannels, managedChannels, buildChannelName, abbreviateBuildMode };
+module.exports = {
+  startScheduler, checkAndCreateChannels, managedChannels, buildChannelName, abbreviateBuildMode,
+  createTournamentChannel,
+};

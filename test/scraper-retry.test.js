@@ -1,7 +1,6 @@
-// Verifies scrapePlayer's retry logic (same pattern as tournament-scraper.js's
-// fetchOfficialScheduleRegion): a Puppeteer navigation timeout on one attempt must not fail the
-// whole scrape outright — it should retry (a rotating proxy gets a different exit IP each
-// attempt) and only give up after PLAYER_SCRAPE_MAX_ATTEMPTS genuinely-failed attempts.
+// Verifies scrapePlayer's retry logic: a Puppeteer navigation timeout on one attempt must not
+// fail the whole scrape outright — it should retry (a rotating proxy gets a different exit IP
+// each attempt) and only give up after PLAYER_SCRAPE_MAX_ATTEMPTS genuinely-failed attempts.
 //
 // scrapePlayer delegates through module.exports.scrapePlayerOnce (not a closed-over local
 // reference) specifically so a test can swap in a fake single-attempt implementation here and

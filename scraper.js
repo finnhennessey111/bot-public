@@ -5,11 +5,11 @@ const { resolveRosterSize } = require('./roster-size');
 
 logProxyMode('scraper');
 
-// Same retry shape as tournament-scraper.js's fetchOfficialScheduleRegion — a rotating proxy gets
-// a different exit IP each attempt, and some IPs get through cleanly, so a single Puppeteer
-// navigation timeout (a known, occasional occurrence, not a real failure of the target site) used
-// to fail this player's entire queue attempt outright and surface a raw error. This makes that the
-// rare last-resort after 3 attempts, not the first-attempt norm.
+// Same retry-with-backoff shape used elsewhere in this codebase for rotating-proxy Puppeteer
+// scrapes — a rotating proxy gets a different exit IP each attempt, and some IPs get through
+// cleanly, so a single Puppeteer navigation timeout (a known, occasional occurrence, not a real
+// failure of the target site) used to fail this player's entire queue attempt outright and surface
+// a raw error. This makes that the rare last-resort after 3 attempts, not the first-attempt norm.
 const PLAYER_SCRAPE_MAX_ATTEMPTS = 3;
 const PLAYER_SCRAPE_RETRY_DELAY_MS = 1500;
 
