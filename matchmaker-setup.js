@@ -41,6 +41,11 @@ const CATEGORY_SPECS = [
   { key: 'EU', name: 'EU Tournaments' },
   { key: 'NAC', name: 'NAC Tournaments' },
   { key: 'ME', name: 'ME Tournaments' },
+  // Parent for register/get-roles/how-to-use/access (CHANNEL_SPECS' `category: 'matchmaker'`
+  // entries below) — groups the bot's generically-named, member-facing channels together instead
+  // of scattering them at server root next to a server's own channels, where names like
+  // "register" or "how-to-use" are more likely to clash with something the server already has.
+  { key: 'matchmaker', name: 'MatchMaker' },
   // Parent for the four creative queue channels below — gets the bot's ViewChannel/SendMessages
   // set explicitly at creation (unlike the tournament categories above, which rely on each
   // channel's own per-creation overwrite instead), so any channel placed under it inherits bot
@@ -49,14 +54,17 @@ const CATEGORY_SPECS = [
 ];
 
 const CHANNEL_SPECS = [
+  // Deliberately left out of the MatchMaker category (unlike the member-facing channels below)
+  // — it's mod-only and hidden from regular members entirely (permissions.js's
+  // MOD_ONLY_CHANNEL_KEYS), so grouping it with the member-facing ones isn't the same concern.
   { key: 'setup', name: 'setup' },
-  { key: 'register', name: 'register' },
-  { key: 'getRoles', name: 'get-roles' },
-  { key: 'howto', name: 'how-to-use' },
+  { key: 'register', name: 'register', category: 'matchmaker' },
+  { key: 'getRoles', name: 'get-roles', category: 'matchmaker' },
+  { key: 'howto', name: 'how-to-use', category: 'matchmaker' },
   // Skipped entirely while access gating is disabled (see access.js's ACCESS_GATING_ENABLED) —
   // there's nothing for it to gate right now. Flip that flag back on to have new setups create it
   // again; existing servers that already have #access from before keep it untouched either way.
-  ...(ACCESS_GATING_ENABLED ? [{ key: 'access', name: 'access' }] : []),
+  ...(ACCESS_GATING_ENABLED ? [{ key: 'access', name: 'access', category: 'matchmaker' }] : []),
 ];
 
 // Creative queue channels — separate from CHANNEL_SPECS above because they're tracked in
@@ -95,29 +103,36 @@ async function ensureCategory(guild, existingCategoryIds, spec, { permissionOver
   return created.id;
 }
 
-async function ensureChannel(guild, existingChannelIds, spec) {
+async function ensureChannel(guild, existingChannelIds, spec, { parentId, parentLabel } = {}) {
   const existingId = existingChannelIds[spec.key];
   if (existingId) {
     const existing = await guild.channels.fetch(existingId).catch(() => null);
-    if (existing) return existing.id;
+    if (existing) {
+      await ensureChannelParent(existing, parentId, parentLabel);
+      return existing.id;
+    }
   }
-  const created = await guild.channels.create({ name: spec.name, type: ChannelType.GuildText });
+  const created = await guild.channels.create({
+    name: spec.name,
+    type: ChannelType.GuildText,
+    ...(parentId ? { parent: parentId } : {}),
+  });
   return created.id;
 }
 
-// One-time migration for servers that ran /matchmaker-setup before the Creative category existed
-// (or before a given channel had one) — reparents an already-existing creative channel that's
-// missing its parent or sitting under the wrong one. lockPermissions: false is essential here:
-// Discord's default (true) would sync the channel's overwrites to the new parent, wiping the
-// channel-specific overwrites enforcePermissions() already applied (Registered-role gate, mod
+// One-time migration for servers that ran /matchmaker-setup before a given channel's category
+// existed (or before that particular channel had one assigned) — reparents an already-existing
+// channel that's missing its parent or sitting under the wrong one. lockPermissions: false is
+// essential here: Discord's default (true) would sync the channel's overwrites to the new parent,
+// wiping the channel-specific overwrites enforcePermissions() already applied (role gates, mod
 // role, bot access, attachment lock).
-async function ensureCreativeChannelParent(channel, parentCategoryId) {
+async function ensureChannelParent(channel, parentCategoryId, parentLabel) {
   if (!parentCategoryId || channel.parentId === parentCategoryId) return;
   try {
     await channel.setParent(parentCategoryId, { lockPermissions: false });
-    console.log(`  📁 Moved #${channel.name} into the Creative category`);
+    console.log(`  📁 Moved #${channel.name} into the ${parentLabel} category`);
   } catch (err) {
-    console.error(`  ⚠️ Failed to move #${channel.name} into the Creative category:`, err.message);
+    console.error(`  ⚠️ Failed to move #${channel.name} into the ${parentLabel} category:`, err.message);
   }
 }
 
@@ -133,7 +148,7 @@ async function ensureCreativeChannel(guild, category, spec, existingCreativeChan
       const channel = await guild.channels.fetch(existing.channelId);
       const msg = await channel.messages.fetch(existing.messageId);
       if (channel && msg) {
-        await ensureCreativeChannelParent(channel, parentCategoryId);
+        await ensureChannelParent(channel, parentCategoryId, 'Creative');
         return existing.channelId;
       }
     } catch {
@@ -150,7 +165,7 @@ async function ensureCreativeChannel(guild, category, spec, existingCreativeChan
       permissionOverwrites: [botAccessOverwrite(guild)],
     });
   } else {
-    await ensureCreativeChannelParent(channel, parentCategoryId);
+    await ensureChannelParent(channel, parentCategoryId, 'Creative');
   }
 
   await postCreativeQueueChannel(guild.id, channel, category, QUEUE_CHANNEL_CONFIGS[category]);
@@ -213,7 +228,10 @@ async function runMatchmakerSetup(guild) {
       await setGuildConfig(guild.id, { categoryIds });
 
       channelIds = {};
-      for (const spec of CHANNEL_SPECS) channelIds[spec.key] = await ensureChannel(guild, config.channelIds, spec);
+      for (const spec of CHANNEL_SPECS) {
+        const parentId = spec.category ? categoryIds[spec.category] : undefined;
+        channelIds[spec.key] = await ensureChannel(guild, config.channelIds, spec, { parentId, parentLabel: 'MatchMaker' });
+      }
       await setGuildConfig(guild.id, { channelIds });
 
       creativeChannelIds = {};

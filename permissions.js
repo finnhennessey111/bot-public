@@ -11,13 +11,14 @@
 //   2. The Epic OAuth flow (epic-oauth.js / webhook-server.js's /epic-callback) grants the
 //      verified role (auto-created by /matchmaker-setup, stored as roleIds.verified) directly on
 //      a successful link -> unlocks #get-roles, #how-to-use and #access (verifiedChannels).
-//   3. They complete #get-roles and are granted the Registered role (index.js's select_region
-//      handler grants Registered and a region role together) -> unlocks the creative queue
-//      channels (gated by the Registered role in enforceQueueChannels below). Tournament channels
-//      are NOT part of this ladder — every server member can see every region's tournament
-//      channels (and console-only ones) regardless of role; only actually queueing still requires
-//      Registered (see index.js's queue_duo/lf2 handler) — see channel-manager.js's
-//      createTournamentChannel for the @everyone-visible permission overwrite.
+// Neither tournament nor creative queue channels are part of this ladder — every server member
+// can see every one of them regardless of role state; only actually queueing still requires the
+// Registered role, checked independently at click-time (index.js's queue_duo/lf2 handler for
+// tournaments, creative_queue_/team_queue_ for creative). Tournament channels get this from
+// channel-manager.js's createTournamentChannel (@everyone ViewChannel at creation); creative
+// channels get it from enforceQueueChannels below, which explicitly resets @everyone's ViewChannel
+// to true on every run — necessary (not just "don't deny it") because an older version of this
+// function denied it, and a per-target overwrite edit never un-sets a key it doesn't touch.
 // Because this is pure role-based channel overwrites, unlocking is automatic and instantaneous
 // the moment a member gains the relevant role — no event listener needed, Discord applies it.
 //
@@ -173,27 +174,22 @@ async function enforceModOnlyChannels(guild) {
 }
 
 // Tournament + creative queue channels: nobody can post files/images regardless of who can see
-// the channel, and mods can always see in even though they don't hold the region role. Tournament
-// channels don't touch ViewChannel here at all — channel-manager.js already grants it per-channel
-// to that tournament's region (or console) role at creation time, and this only needs to layer
-// the attachment lock + mod visibility on top. Creative channels DO need ViewChannel touched here
-// — unlike tournament channels they're static and region-agnostic, so there's no per-creation
-// overwrite; registeredRoleId gates them behind the Registered role as part of the progressive-
-// unlock system (step 3 — see module doc comment), replacing what used to be "visible to everyone".
-async function lockQueueChannelAttachments(guild, channelId, { registeredRoleId = null } = {}) {
+// the channel, and mods can always see in even though they don't hold any particular role.
+// Neither channel type gets ViewChannel *denied* here — both stay visible to every server member
+// regardless of registration state (see module doc comment). resetViewChannel is creative-only:
+// tournament channels never had ViewChannel touched by this function to begin with (always
+// visible from channel-manager.js's createTournamentChannel onward), so there's nothing to undo;
+// creative channels did have it denied by an older version of this function, so an explicit
+// ViewChannel: true is needed to actually reopen an already-restricted server's existing channels
+// — omitting the key here would just leave that old deny in place (see editOverwrite's per-target
+// merge doc at the top of this file).
+async function lockQueueChannelAttachments(guild, channelId, { resetViewChannel = false } = {}) {
   const channel = await guild.channels.fetch(channelId).catch(() => null);
   if (!channel) return;
 
   const everyonePerms = { AttachFiles: false, EmbedLinks: false };
-  if (registeredRoleId) everyonePerms.ViewChannel = false;
+  if (resetViewChannel) everyonePerms.ViewChannel = true;
   await editOverwrite(channel, guild.roles.everyone, everyonePerms, '@everyone');
-
-  if (registeredRoleId) {
-    await editOverwrite(channel, registeredRoleId, { ViewChannel: true }, 'Registered role');
-    // @everyone's ViewChannel:false above would otherwise take the bot's own visibility down
-    // with it on a guild where the bot doesn't hold Administrator — see grantBotAccess doc.
-    await grantBotAccess(guild, channel);
-  }
 
   const modRoleId = getRoleId(guild.id, 'mod');
   if (modRoleId) {
@@ -210,13 +206,12 @@ async function enforceQueueChannels(guild) {
     await lockQueueChannelAttachments(guild, channelId);
   }
 
-  const registeredRoleId = getRoleId(guild.id, 'Registered');
   const creativeChannelIds = ['1v1', '2v2', '6s', '8s']
     .map(category => getCreativeChannelInfo(guild.id, category)?.channelId)
     .filter(Boolean);
 
   for (const channelId of creativeChannelIds) {
-    await lockQueueChannelAttachments(guild, channelId, { registeredRoleId });
+    await lockQueueChannelAttachments(guild, channelId, { resetViewChannel: true });
   }
 }
 
