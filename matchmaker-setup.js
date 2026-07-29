@@ -193,63 +193,95 @@ async function runMatchmakerSetup(guild) {
 
   try {
     const config = getGuildConfig(guild.id);
+    let channelIds, creativeChannelIds, roleIds;
 
-    const roleIds = {};
-    for (const spec of ROLE_SPECS) roleIds[spec.key] = await ensureRole(guild, config.roleIds, spec);
+    try {
+      roleIds = {};
+      for (const spec of ROLE_SPECS) roleIds[spec.key] = await ensureRole(guild, config.roleIds, spec);
+      // Saved immediately, not batched with everything else at the end — every step below this
+      // one (categories, channels, embeds) can fail on its own permission gap without the run
+      // "forgetting" roles it already created. Without this, a later failure leaves Discord
+      // holding roles/channels the bot has no record of, so the next run — blind to what already
+      // exists — recreates all of them from scratch, producing duplicates rather than reuse.
+      await setGuildConfig(guild.id, { roleIds });
 
-    const categoryIds = { ...config.categoryIds };
-    for (const spec of CATEGORY_SPECS) {
-      const permissionOverwrites = spec.key === 'creative' ? [botAccessOverwrite(guild)] : undefined;
-      categoryIds[spec.key] = await ensureCategory(guild, config.categoryIds, spec, { permissionOverwrites });
-    }
+      const categoryIds = { ...config.categoryIds };
+      for (const spec of CATEGORY_SPECS) {
+        const permissionOverwrites = spec.key === 'creative' ? [botAccessOverwrite(guild)] : undefined;
+        categoryIds[spec.key] = await ensureCategory(guild, config.categoryIds, spec, { permissionOverwrites });
+      }
+      await setGuildConfig(guild.id, { categoryIds });
 
-    const channelIds = {};
-    for (const spec of CHANNEL_SPECS) channelIds[spec.key] = await ensureChannel(guild, config.channelIds, spec);
+      channelIds = {};
+      for (const spec of CHANNEL_SPECS) channelIds[spec.key] = await ensureChannel(guild, config.channelIds, spec);
+      await setGuildConfig(guild.id, { channelIds });
 
-    const creativeChannelIds = {};
-    for (const spec of CREATIVE_CHANNEL_SPECS) {
-      creativeChannelIds[spec.key] = await ensureCreativeChannel(guild, spec.key, spec, config.creativeChannels, categoryIds.creative);
-    }
+      creativeChannelIds = {};
+      for (const spec of CREATIVE_CHANNEL_SPECS) {
+        creativeChannelIds[spec.key] = await ensureCreativeChannel(guild, spec.key, spec, config.creativeChannels, categoryIds.creative);
+      }
+      // Creative channel IDs are already persisted incrementally, per-channel, inside
+      // postCreativeQueueChannel (creative-channel.js) — no separate save needed here.
 
-    // Persist roles/categories/channels before posting embeds — ensurePosted needs channelIds
-    // (already have them locally) but buildRegisterEmbed needs the *final* getRoles channel ID,
-    // which is already known at this point regardless.
-    const setupMessageIds = { ...config.setupMessageIds };
-    setupMessageIds.setup = await ensurePosted(
-      guild.client, config.setupMessageIds, channelIds, 'setup',
-      () => ({ embeds: [buildSetupInstructionsEmbed()] })
-    );
-    setupMessageIds.getRoles = await ensurePosted(
-      guild.client, config.setupMessageIds, channelIds, 'getRoles',
-      () => ({ embeds: [buildRolesEmbed()], components: buildRolesComponents() })
-    );
-    // Bio button posted as its own message right after — Discord caps a message at 5 action
-    // rows, and buildRolesComponents() already uses all 5 for select menus (a select can't share
-    // a row with a button either), so there's no room left in the same message.
-    setupMessageIds.getRolesBio = await ensurePosted(
-      guild.client, config.setupMessageIds, { ...channelIds, getRolesBio: channelIds.getRoles }, 'getRolesBio',
-      () => ({ components: [buildBioButtonRow()] })
-    );
-    setupMessageIds.howto = await ensurePosted(
-      guild.client, config.setupMessageIds, channelIds, 'howto',
-      () => ({ embeds: [buildHowtoEmbed()] })
-    );
-    setupMessageIds.register = await ensurePosted(
-      guild.client, config.setupMessageIds, channelIds, 'register',
-      () => ({ embeds: [buildRegisterEmbed(channelIds.getRoles)], components: [buildEpicLinkButtonRow()] })
-    );
-    if (ACCESS_GATING_ENABLED) {
-      setupMessageIds.access = await ensurePosted(
-        guild.client, config.setupMessageIds, channelIds, 'access',
-        () => ({ embeds: [buildAccessChannelEmbed()], components: [buildAccessChannelButtons()] })
+      const setupMessageIds = { ...config.setupMessageIds };
+      setupMessageIds.setup = await ensurePosted(
+        guild.client, config.setupMessageIds, channelIds, 'setup',
+        () => ({ embeds: [buildSetupInstructionsEmbed()] })
       );
+      setupMessageIds.getRoles = await ensurePosted(
+        guild.client, config.setupMessageIds, channelIds, 'getRoles',
+        () => ({ embeds: [buildRolesEmbed()], components: buildRolesComponents() })
+      );
+      // Bio button posted as its own message right after — Discord caps a message at 5 action
+      // rows, and buildRolesComponents() already uses all 5 for select menus (a select can't
+      // share a row with a button either), so there's no room left in the same message.
+      setupMessageIds.getRolesBio = await ensurePosted(
+        guild.client, config.setupMessageIds, { ...channelIds, getRolesBio: channelIds.getRoles }, 'getRolesBio',
+        () => ({ components: [buildBioButtonRow()] })
+      );
+      setupMessageIds.howto = await ensurePosted(
+        guild.client, config.setupMessageIds, channelIds, 'howto',
+        () => ({ embeds: [buildHowtoEmbed()] })
+      );
+      setupMessageIds.register = await ensurePosted(
+        guild.client, config.setupMessageIds, channelIds, 'register',
+        () => ({ embeds: [buildRegisterEmbed(channelIds.getRoles)], components: [buildEpicLinkButtonRow()] })
+      );
+      if (ACCESS_GATING_ENABLED) {
+        setupMessageIds.access = await ensurePosted(
+          guild.client, config.setupMessageIds, channelIds, 'access',
+          () => ({ embeds: [buildAccessChannelEmbed()], components: [buildAccessChannelButtons()] })
+        );
+      }
+      await setGuildConfig(guild.id, { setupMessageIds });
+
+      await enforcePermissions(guild);
+    } catch (err) {
+      // Nothing created above is ever deleted on failure — this just reports, from guild-config's
+      // now-incrementally-saved state, exactly how far this run actually got, so a partial
+      // failure is diagnosable instead of a silent "some things are just gone" (or, pre-fix,
+      // silently duplicated on the next retry).
+      const saved = getGuildConfig(guild.id);
+      const missing = (specs, ids) => specs.filter(s => !ids?.[s.key]).map(s => s.name);
+      const missingRoles = missing(ROLE_SPECS, saved.roleIds);
+      const missingCategories = missing(CATEGORY_SPECS, saved.categoryIds);
+      const missingChannels = missing(CHANNEL_SPECS, saved.channelIds);
+      const missingCreative = CREATIVE_CHANNEL_SPECS.filter(s => !saved.creativeChannels?.[s.key]?.channelId).map(s => s.name);
+
+      console.error(`❌ /matchmaker-setup failed partway through for guild ${guild.id}: ${err.message}`);
+      console.error(
+        `   Confirmed so far — roles: ${ROLE_SPECS.length - missingRoles.length}/${ROLE_SPECS.length}, `
+        + `categories: ${CATEGORY_SPECS.length - missingCategories.length}/${CATEGORY_SPECS.length}, `
+        + `channels: ${CHANNEL_SPECS.length - missingChannels.length}/${CHANNEL_SPECS.length}, `
+        + `creative channels: ${CREATIVE_CHANNEL_SPECS.length - missingCreative.length}/${CREATIVE_CHANNEL_SPECS.length}`
+      );
+      if (missingRoles.length) console.error(`   Not yet created: roles [${missingRoles.join(', ')}]`);
+      if (missingCategories.length) console.error(`   Not yet created: categories [${missingCategories.join(', ')}]`);
+      if (missingChannels.length) console.error(`   Not yet created: channels [${missingChannels.join(', ')}]`);
+      if (missingCreative.length) console.error(`   Not yet created: creative channels [${missingCreative.join(', ')}]`);
+      console.error('   Nothing that already existed was deleted or altered — fix the permission gap above and re-run /matchmaker-setup, it will resume from here instead of duplicating what already exists.');
+      throw err;
     }
-
-    await setGuildConfig(guild.id, {
-      roleIds, categoryIds, channelIds, setupMessageIds,
-    });
-
-    await enforcePermissions(guild);
 
     const verifiedRoleLine = `Verified role: <@&${roleIds.verified}> — get-roles/how-to-use/access `
       + 'unlock once a member links their Epic account via the Link Epic Account button in #register.';
