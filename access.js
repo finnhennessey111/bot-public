@@ -12,6 +12,14 @@
 
 const SubscriptionModel = require('./models/Subscription');
 
+// TEMPORARY: going free for an undetermined testing period — trial/credit/subscription gating is
+// fully bypassed while this is false, for every Discord ID, with no per-user data changes needed
+// (checkAccess/getAccessStatus below just short-circuit before touching Subscription docs at
+// all). Flip back to `true` to re-enable — billing.js, the Stripe webhook (webhook-server.js) and
+// the checkout flow (buildAccessSubscribeButtons/billing.js's createCheckoutSession) are untouched
+// and need nothing else to resume working.
+const ACCESS_GATING_ENABLED = false;
+
 // Cost (in credits) of the Nth extra day post-trial — index 0 is "the next unbought day" when
 // creditDaysUsed is 0, etc. 70 credits total buys all 7 rungs.
 const LADDER = [2, 3, 5, 8, 12, 17, 23];
@@ -165,6 +173,8 @@ async function computeAccess(discordId) {
 // cache) and because a blocked result can carry the one-time creditWindowJustStarted signal,
 // which must never be replayed from a stale cache entry.
 async function checkAccess(discordId) {
+  if (!ACCESS_GATING_ENABLED) return { allowed: true, reason: 'free_access_mode' };
+
   const cached = cache.get(discordId);
   if (cached && Date.now() - cached.cachedAt < CACHE_TTL_MS) {
     return cached.result;
@@ -185,6 +195,8 @@ async function checkAccess(discordId) {
 // looking up someone else's status) — a mod's admin lookup isn't "the player interacting with
 // the bot," so it must never silently start that player's 7-day clock on their behalf.
 async function getAccessStatus(discordId, { allowWindowStart = true } = {}) {
+  if (!ACCESS_GATING_ENABLED) return { kind: 'free_access_mode' };
+
   const now = new Date();
   let doc = await SubscriptionModel.findOne({ discordId });
 
@@ -333,4 +345,5 @@ module.exports = {
   LADDER,
   TRIAL_DAYS,
   CREDIT_WINDOW_DAYS,
+  ACCESS_GATING_ENABLED,
 };

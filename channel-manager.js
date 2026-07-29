@@ -225,6 +225,17 @@ async function createTournamentChannel(guild, tournament, pinnedMessages) {
       console.log(`  ⏭️ Skipped — channel already exists (matched by ${matchedBy}): ${existing.name}`);
     }
 
+    // Backfills consoleOnly on every tick (not just at creation) for a channel this process
+    // already knows about — self-heals any pinnedMessages entry written before this field
+    // existed, same as this tournament's own scraped value, every single check. Cheap (a plain
+    // property compare) since createTournamentChannel already re-derives this tournament's
+    // current consoleOnly from tournament-scraper.js on every scheduler tick regardless.
+    if (pinnedEntry && pinnedEntry.consoleOnly !== !!consoleOnly) {
+      pinnedEntry.consoleOnly = !!consoleOnly;
+      saveStore(guild.id);
+      console.log(`  🩹 Backfilled consoleOnly=${!!consoleOnly} for existing channel ${existing.id} (${name})`);
+    }
+
     if (isPermanent) refreshPermanentBeginTime(existing.id, beginTime, pinnedMessages, guild.id);
     return;
   }
@@ -232,27 +243,19 @@ async function createTournamentChannel(guild, tournament, pinnedMessages) {
   // No mobile/solo/FNCS-Major re-check here — tournament-scraper.js's BLOCKED_KEYWORDS already
   // filtered those out before this tournament ever reached us.
 
-  const regionRoleId = getRoleId(guild.id, region);
-  const consoleRoleId = getRoleId(guild.id, 'Console');
-
   if (!categoryId) {
     console.log(`  ⚠️ No ${region} category configured for this guild — channel will be created with no parent category`);
   }
-  if (!(consoleOnly && consoleRoleId) && !regionRoleId) {
-    console.log(`  ⚠️ No ${region} role configured for this guild — channel will have no region role granted view access`);
-  }
 
+  // Every tournament channel (any region, console-only or not) is visible to the whole server —
+  // region/console Discord roles no longer gate ViewChannel here (they still gate whether the
+  // Registered role has been granted at all — see index.js's queue_duo/lf2 handler — just not
+  // which channels a member can see). AttachFiles/EmbedLinks stays denied for @everyone regardless,
+  // matching every other queue channel's no-spam rule.
   const permissionOverwrites = [
-    { id: guild.roles.everyone, deny: [PermissionFlagsBits.ViewChannel] },
+    { id: guild.roles.everyone, allow: [PermissionFlagsBits.ViewChannel], deny: [PermissionFlagsBits.AttachFiles, PermissionFlagsBits.EmbedLinks] },
     { id: guild.client.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages] },
   ];
-
-  const noFiles = [PermissionFlagsBits.AttachFiles, PermissionFlagsBits.EmbedLinks];
-  if (consoleOnly && consoleRoleId) {
-    permissionOverwrites.push({ id: consoleRoleId, allow: [PermissionFlagsBits.ViewChannel], deny: noFiles });
-  } else if (regionRoleId) {
-    permissionOverwrites.push({ id: regionRoleId, allow: [PermissionFlagsBits.ViewChannel], deny: noFiles });
-  }
 
   const modRoleId = getRoleId(guild.id, 'mod');
   if (modRoleId) {
@@ -287,6 +290,11 @@ async function createTournamentChannel(guild, tournament, pinnedMessages) {
       tournamentEventId: tournament.eventId ?? null,
       region,
       isTrios,
+      // Real, scraped platform-eligibility data (tournament-scraper.js: platforms.length === 1 &&
+      // platforms[0] === 'Console') — NOT a Discord-role gate (that was removed separately, see
+      // index.js's queue_duo/lf2 handler). This is what queue.js's isCompatiblePlatform reads to
+      // require every matched member be on Console for a genuinely console-only tournament.
+      consoleOnly: !!consoleOnly,
       beginTime,
       deleteAt: deleteAfter,
       permanent: !!isPermanent,

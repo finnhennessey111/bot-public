@@ -243,16 +243,17 @@ async function refreshTeamFormingMessage(team) {
 // Posts one invite message per newly-created invite (channel message, not ephemeral — Accept/
 // Decline come from the invited player's own interaction) and arms its 5-minute expiry, same
 // timeout value the old party.js used. teammatePlayers is the *current* team roster (leader +
-// anyone already accepted), stats-fetched fresh each time so a newly-added teammate's PR/platform
-// is accurate — small and infrequent enough (at most a handful of invites per forming attempt)
-// that re-fetching (cached in players.js) rather than threading a cache through is fine.
+// anyone already accepted), stats-fetched fresh each time so a newly-added teammate's PR/platform/
+// region is accurate — small and infrequent enough (at most a handful of invites per forming
+// attempt) that re-fetching (cached in players.js) rather than threading a cache through is fine.
 async function sendTeamInvites(channel, guild, team, invites) {
   const teammatePlayers = await Promise.all(team.members.map(async m => {
     const member = await guild.members.fetch(m.discordId);
     const platform = getPlatformFromMember(guild.id, member) ?? 'PC';
     const { epicUsername } = await resolveEpicIdentity(guild, member);
     const playerData = await playerStore.getPlayerStats(guild.id, m.discordId, epicUsername, null, team.region);
-    return { epicUsername, platform, totalPR: playerData.totalPR };
+    const userData = await playerStore.getPlayer(guild.id, m.discordId);
+    return { epicUsername, platform, totalPR: playerData.totalPR, region: userData?.region ?? null };
   }));
 
   for (const invite of invites) {
@@ -606,14 +607,6 @@ async function guardModRoleGrant(oldMember, newMember) {
 }
 
 // ── PLATFORM HELPERS ──────────────────────────────────────────────────────────
-
-function isConsolePlayer(guildId, member) {
-  return member.roles.cache.has(getRoleId(guildId, 'Console'));
-}
-
-function isPCPlayer(guildId, member) {
-  return member.roles.cache.has(getRoleId(guildId, 'PC'));
-}
 
 function getPlatformFromMember(guildId, member) {
   if (member.roles.cache.has(getRoleId(guildId, 'PC'))) return 'PC';
@@ -1249,17 +1242,6 @@ async function handleInteraction(interaction) {
       }
 
       const platform = getPlatformFromMember(guild.id, member);
-
-      if (consoleOnly && isPCPlayer(guild.id, member)) {
-        return replyAndDismiss(interaction, {
-          content: '❌ This is a console-only tournament. PC players cannot queue here.',
-        });
-      }
-      if (consoleOnly && !isConsolePlayer(guild.id, member)) {
-        return replyAndDismiss(interaction, {
-          content: '❌ This is a console-only tournament. You must have the Console role to queue.',
-        });
-      }
 
       const existingTournamentUnit = findUnitByDiscordId(guild.id, user.id);
       if (existingTournamentUnit) {

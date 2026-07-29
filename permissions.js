@@ -12,10 +12,12 @@
 //      verified role (auto-created by /matchmaker-setup, stored as roleIds.verified) directly on
 //      a successful link -> unlocks #get-roles, #how-to-use and #access (verifiedChannels).
 //   3. They complete #get-roles and are granted the Registered role (index.js's select_region
-//      handler grants Registered and a region role together) -> unlocks their region's
-//      tournament channels (already gated per-channel by region role at creation time in
-//      channel-manager.js — nothing more to do here) and the creative queue channels (gated by
-//      the Registered role in enforceQueueChannels below).
+//      handler grants Registered and a region role together) -> unlocks the creative queue
+//      channels (gated by the Registered role in enforceQueueChannels below). Tournament channels
+//      are NOT part of this ladder — every server member can see every region's tournament
+//      channels (and console-only ones) regardless of role; only actually queueing still requires
+//      Registered (see index.js's queue_duo/lf2 handler) — see channel-manager.js's
+//      createTournamentChannel for the @everyone-visible permission overwrite.
 // Because this is pure role-based channel overwrites, unlocking is automatic and instantaneous
 // the moment a member gains the relevant role — no event listener needed, Discord applies it.
 //

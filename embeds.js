@@ -338,7 +338,10 @@ function buildTeamMemberUserSelectRow(customId, count, defaultUserIds = []) {
 }
 
 // Shown to an invited player — every *current* teammate (leader + anyone already accepted), name/
-// PR/platform only, per spec ("nothing else about them").
+// PR/platform/region only, per spec ("nothing else about them"). p.region is each teammate's own
+// registered home region (players.js), not necessarily this team's queue region (team.region,
+// already shown above in the description) — same homeRegion-vs-queueRegion distinction
+// buildMatchCard/buildTournamentPlayerFields draws for tournament matches.
 function buildTeamInviteEmbed(leaderUsername, teammatePlayers, invitedUsername, mode, region) {
   return new EmbedBuilder()
     .setTitle('🤝 Team Invite')
@@ -349,9 +352,10 @@ function buildTeamInviteEmbed(leaderUsername, teammatePlayers, invitedUsername, 
     .addFields(
       teammatePlayers.map(p => {
         const platformIcon = PLATFORM_ICONS[p.platform] ?? '🎮';
+        const flag = REGION_FLAGS[p.region] ?? '🏳️';
         return {
           name: `${platformIcon} ${p.epicUsername}`,
-          value: `${p.totalPR} PR • ${p.platform}`,
+          value: `${p.totalPR} PR • ${p.platform} • ${flag} ${p.region ?? 'Unknown'}`,
           inline: true,
         };
       })
@@ -1011,6 +1015,13 @@ function buildUseCreditsButton() {
 // status comes from access.js's getAccessStatus() — shape varies by status.kind.
 function buildAccessStatusEmbed(status) {
   const embed = new EmbedBuilder().setFooter({ text: 'MatchMaker' }).setTimestamp();
+
+  if (status.kind === 'free_access_mode') {
+    return embed
+      .setTitle('🎉 Free Access')
+      .setColor(ACCESS_ACTIVE_COLOR)
+      .setDescription('MatchMaker is free for everyone right now — no trial, credits, or subscription needed to queue.');
+  }
 
   if (status.kind === 'subscription') {
     const expiryTs = Math.floor(new Date(status.subscriptionExpiry).getTime() / 1000);

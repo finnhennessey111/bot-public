@@ -12,6 +12,7 @@ const { getGuildConfig, setGuildConfig } = require('./guild-config');
 const { enforcePermissions, botAccessOverwrite } = require('./permissions');
 const { postCreativeQueueChannel } = require('./creative-channel');
 const { QUEUE_CHANNEL_CONFIGS } = require('./creative-channel-configs');
+const { ACCESS_GATING_ENABLED } = require('./access');
 const {
   buildRolesEmbed, buildRolesComponents, buildBioButtonRow, buildRegisterEmbed, buildEpicLinkButtonRow,
   buildHowtoEmbed, buildSetupInstructionsEmbed,
@@ -52,7 +53,10 @@ const CHANNEL_SPECS = [
   { key: 'register', name: 'register' },
   { key: 'getRoles', name: 'get-roles' },
   { key: 'howto', name: 'how-to-use' },
-  { key: 'access', name: 'access' },
+  // Skipped entirely while access gating is disabled (see access.js's ACCESS_GATING_ENABLED) —
+  // there's nothing for it to gate right now. Flip that flag back on to have new setups create it
+  // again; existing servers that already have #access from before keep it untouched either way.
+  ...(ACCESS_GATING_ENABLED ? [{ key: 'access', name: 'access' }] : []),
 ];
 
 // Creative queue channels — separate from CHANNEL_SPECS above because they're tracked in
@@ -234,10 +238,12 @@ async function runMatchmakerSetup(guild) {
       guild.client, config.setupMessageIds, channelIds, 'register',
       () => ({ embeds: [buildRegisterEmbed(channelIds.getRoles)], components: [buildEpicLinkButtonRow()] })
     );
-    setupMessageIds.access = await ensurePosted(
-      guild.client, config.setupMessageIds, channelIds, 'access',
-      () => ({ embeds: [buildAccessChannelEmbed()], components: [buildAccessChannelButtons()] })
-    );
+    if (ACCESS_GATING_ENABLED) {
+      setupMessageIds.access = await ensurePosted(
+        guild.client, config.setupMessageIds, channelIds, 'access',
+        () => ({ embeds: [buildAccessChannelEmbed()], components: [buildAccessChannelButtons()] })
+      );
+    }
 
     await setGuildConfig(guild.id, {
       roleIds, categoryIds, channelIds, setupMessageIds,
