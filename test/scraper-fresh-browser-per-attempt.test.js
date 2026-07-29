@@ -33,6 +33,8 @@ test('scrapePlayer: launches a fresh puppeteer.launch() browser per attempt, clo
     const fakePage = {
       async setUserAgent() {},
       async authenticate() {},
+      async setRequestInterception() {},
+      on() {},
       async goto() {
         // Fail the first two attempts (simulating a bad exit IP / timeout), succeed on the third.
         if (record.launchIndex < 3) throw new Error(`simulated navigation timeout (browser #${record.launchIndex})`);
@@ -76,6 +78,8 @@ test('scrapePlayer: even when every attempt fails, each one still gets its own f
         return {
           async setUserAgent() {},
           async authenticate() {},
+          async setRequestInterception() {},
+          on() {},
           async goto() { throw new Error(`always-fails browser #${record.launchIndex}`); },
         };
       },

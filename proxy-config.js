@@ -20,6 +20,29 @@ async function authenticatePage(page) {
   await page.authenticate({ username: process.env.PROXY_USERNAME, password: process.env.PROXY_PASSWORD });
 }
 
+// Resource types the data either scraper needs never lives in — both pull their result from an
+// inline <script> tag's JSON blob in the initial document (scraper.js's `const profile =`,
+// tournament-scraper.js's `var imp_calendar =`), confirmed against real pages, not assumed.
+// Images/fonts/stylesheets/media are pure visual rendering this headless scrape never displays,
+// and every one of them still gets routed (and billed) through the paid Webshare proxy exactly
+// like a request that matters. Document/script/xhr/fetch stay allowed — the data lives in one of
+// those, and blocking script would break page.evaluate() outright.
+const BLOCKED_RESOURCE_TYPES = new Set(['image', 'font', 'stylesheet', 'media']);
+
+// Call right after page creation, before any navigation. Aborting a request here happens before
+// Puppeteer ever sends it over the wire — that's what actually saves proxy bandwidth, as opposed
+// to letting it complete and just not reading the response.
+async function blockUnnecessaryResources(page) {
+  await page.setRequestInterception(true);
+  page.on('request', (req) => {
+    if (BLOCKED_RESOURCE_TYPES.has(req.resourceType())) {
+      req.abort();
+    } else {
+      req.continue();
+    }
+  });
+}
+
 // Called once at module load by each scraper file, so it's obvious from a fresh startup's logs
 // which path each one is actually running on.
 function logProxyMode(label) {
@@ -30,4 +53,4 @@ function logProxyMode(label) {
   }
 }
 
-module.exports = { isProxyConfigured, proxyLaunchArgs, authenticatePage, logProxyMode };
+module.exports = { isProxyConfigured, proxyLaunchArgs, authenticatePage, blockUnnecessaryResources, logProxyMode };

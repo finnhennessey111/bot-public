@@ -92,7 +92,7 @@ function buildTournamentEmbed(tournamentName, region, queueCount, isTrios = fals
       { name: '📍 Region', value: region, inline: true },
       { name: '🎮 Format', value: isTrios ? 'Trios' : 'Duos', inline: true },
     )
-    .setFooter({ text: 'MatchMaker • matchmakerbot.xyz' })
+    .setFooter({ text: 'MatchMaker • www.matchmakerbot.xyz' })
     .setTimestamp();
 
   return embed;
@@ -436,7 +436,7 @@ function buildCreativeQueueEmbed(category, counts = {}, modes = MODES[category])
       modeLines.join('\n\n')
     )
     .setColor(CREATIVE_COLOR)
-    .setFooter({ text: 'MatchMaker Creative • matchmakerbot.xyz' })
+    .setFooter({ text: 'MatchMaker Creative • www.matchmakerbot.xyz' })
     .setTimestamp();
 }
 

@@ -1,5 +1,5 @@
 const puppeteer = require('puppeteer');
-const { proxyLaunchArgs, authenticatePage, logProxyMode } = require('./proxy-config');
+const { proxyLaunchArgs, authenticatePage, blockUnnecessaryResources, logProxyMode } = require('./proxy-config');
 const { resolveRosterSize } = require('./roster-size');
 
 logProxyMode('tournament-scraper');
@@ -208,6 +208,7 @@ async function fetchRawCalendar() {
   try {
     const page = await browser.newPage();
     await authenticatePage(page);
+    await blockUnnecessaryResources(page);
     await page.setUserAgent(
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     );
