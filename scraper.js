@@ -59,7 +59,17 @@ async function scrapePlayerOnce(epicUsername, region = 'EU', epicId = null) {
       .replace('{epicId}', epicId ?? '');
 
     console.log(`Scraping: ${url}`);
-    await page.goto(url, { waitUntil: 'networkidle2', timeout: PLAYER_SCRAPE_NAV_TIMEOUT_MS });
+    // domcontentloaded, not networkidle2: the profile data this scrape needs is server-rendered
+    // into a <script> tag in the initial HTML document (confirmed live — present and fully parseable
+    // immediately at domcontentloaded, before any images/analytics finish), so waiting for it doesn't
+    // require network activity to go fully quiet. networkidle2 additionally waits for every
+    // sub-resource (this page's tournament banner images, analytics beacons, ad-tech calls) to settle
+    // — including ones a rotating residential proxy plan may be unable to reach at all (e.g. Webshare
+    // dashboard evidence showing a real, non-flaky 32.83% client_connect_forbidden_host block rate
+    // specifically for cdn2.unrealengine.com), which would hang the whole navigation until timeout
+    // regardless of exit IP. domcontentloaded only waits on the main document, so a permanently-
+    // blocked unrelated asset can no longer stall a scrape that already has everything it needs.
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: PLAYER_SCRAPE_NAV_TIMEOUT_MS });
 
     const data = await page.evaluate(() => {
       const scripts = Array.from(document.querySelectorAll('script'));
