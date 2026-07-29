@@ -10,8 +10,24 @@ logProxyMode('scraper');
 // cleanly, so a single Puppeteer navigation timeout (a known, occasional occurrence, not a real
 // failure of the target site) used to fail this player's entire queue attempt outright and surface
 // a raw error. This makes that the rare last-resort after 3 attempts, not the first-attempt norm.
+//
+// Investigated a real production failure where all 3 attempts hit the identical 15s timeout
+// despite the paid rotating-residential-proxy plan (Webshare) this should be rare on. Confirmed
+// (with a real test, see test/scraper-fresh-browser-per-attempt.test.js) that each attempt already
+// launches a genuinely fresh puppeteer.launch() browser — the previous one is fully closed before
+// the next launches, no shared browser/page/connection across retries. That rules out the most
+// obvious client-side cause. The likely remaining explanation: rotating-residential-proxy backends
+// commonly apply some form of session/connection affinity for a short window per authenticated
+// user (to avoid needless backend IP churn), independent of the *local* connection being brand
+// new — so repeat attempts using the same static PROXY_USERNAME/PROXY_PASSWORD only 1.5s apart
+// could plausibly land in the same rotation window and get the same exit IP every time. This value
+// was widened from 1.5s specifically to give that window more room to roll over between attempts.
+// Not independently verified against Webshare's actual backend (no live proxy credentials were
+// available to test this against) — if attempts still cluster on the same IP, check Webshare's
+// dashboard/docs for an explicit per-request vs sticky-session rotation setting (or a session-
+// suffix convention for the proxy username) rather than guessing at one here.
 const PLAYER_SCRAPE_MAX_ATTEMPTS = 3;
-const PLAYER_SCRAPE_RETRY_DELAY_MS = 1500;
+const PLAYER_SCRAPE_RETRY_DELAY_MS = 8000;
 
 // Every real successful scrape observed (manual tests and production) finishes in 2-15s — 30s was
 // sized to catch a genuinely hung request, not describe the normal case, and burning the full 30s
