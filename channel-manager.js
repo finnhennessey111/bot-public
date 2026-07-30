@@ -2,7 +2,7 @@
 
 const { ChannelType, PermissionFlagsBits } = require('discord.js');
 const { scrapeUpcomingTournaments, isBareBuildModeLabel } = require('./tournament-scraper');
-const { save: saveStore } = require('./store');
+const { savePinnedMessages } = require('./store');
 const { buildTournamentEmbed } = require('./embeds');
 const { getQueueCount } = require('./queue');
 const { getRoleId, getCategoryId } = require('./guild-config');
@@ -62,7 +62,7 @@ async function deleteManagedChannel(guild, channelId, pinned, pinnedMessages, vi
   } finally {
     delete managedChannels[channelId];
     delete pinnedMessages[channelId];
-    saveStore(guild.id);
+    savePinnedMessages(guild.id);
   }
 }
 
@@ -133,7 +133,7 @@ function refreshPermanentBeginTime(channelId, latestBeginTime, pinnedMessages, g
   const pinned = pinnedMessages[channelId];
   if (!pinned || pinned.beginTime === latestBeginTime) return;
   pinned.beginTime = latestBeginTime;
-  saveStore(guildId);
+  savePinnedMessages(guildId);
   console.log(`  🔄 Refreshed next-event beginTime for permanent channel ${channelId} (${pinned.tournamentName}): ${latestBeginTime}`);
 }
 
@@ -219,7 +219,7 @@ async function createTournamentChannel(guild, tournament, pinnedMessages) {
       }
       if (pinnedEntry) {
         pinnedEntry.tournamentName = name;
-        saveStore(guild.id);
+        savePinnedMessages(guild.id);
       }
     } else {
       console.log(`  ⏭️ Skipped — channel already exists (matched by ${matchedBy}): ${existing.name}`);
@@ -232,7 +232,7 @@ async function createTournamentChannel(guild, tournament, pinnedMessages) {
     // current consoleOnly from tournament-scraper.js on every scheduler tick regardless.
     if (pinnedEntry && pinnedEntry.consoleOnly !== !!consoleOnly) {
       pinnedEntry.consoleOnly = !!consoleOnly;
-      saveStore(guild.id);
+      savePinnedMessages(guild.id);
       console.log(`  🩹 Backfilled consoleOnly=${!!consoleOnly} for existing channel ${existing.id} (${name})`);
     }
 
@@ -299,7 +299,7 @@ async function createTournamentChannel(guild, tournament, pinnedMessages) {
       deleteAt: deleteAfter,
       permanent: !!isPermanent,
     };
-    saveStore(guild.id);
+    savePinnedMessages(guild.id);
 
     if (isPermanent) {
       console.log(`  ♾️ Permanent tournament — no deletion timer armed for ${channel.id}`);
@@ -422,7 +422,7 @@ async function updateActiveTournamentEmbeds(guild, pinnedMessages, backfillTourn
         pinned.beginTimeBackfillAttempted = true;
         console.log(`  🩹 Backfilled ${channelId} (${pinned.tournamentName}, ${pinned.region}) — beginTime=${pinned.beginTime}, deleteAt=${new Date(pinned.deleteAt).toISOString()}${match ? '' : ' (no scrape match — derived from stored beginTime)'}`);
       }
-      saveStore(guild.id);
+      savePinnedMessages(guild.id);
     }
   }
 
@@ -460,7 +460,7 @@ async function updateActiveTournamentEmbeds(guild, pinnedMessages, backfillTourn
     // that's always open.
     if (!pinned.permanent && !pinned.statsRescraped && new Date(pinned.beginTime).getTime() <= Date.now()) {
       pinned.statsRescraped = true;
-      saveStore(guild.id);
+      savePinnedMessages(guild.id);
       console.log(`  🔄 ${channelId} (${pinned.tournamentName}, ${pinned.region}) — tournament has begun, expiring cached stats for registered players in this region`);
       playerStore.rescrapeRegisteredPlayers(guild.id, pinned.region)
         .catch(err => console.error(`  ❌ Cache invalidation failed for ${pinned.tournamentName} (${pinned.region}):`, err.message));

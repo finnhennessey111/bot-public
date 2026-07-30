@@ -43,7 +43,7 @@ const {
   buildEpicAuthorizeLinkRow, buildEpicLinkRequiredReply,
 } = require('./embeds');
 const store = require('./store');
-const { pinnedMessages, save: saveStore } = store;
+const { pinnedMessages, savePinnedMessages, saveQueues } = store;
 const teamInvite = require('./team-invite');
 const {
   REGIONS: CREATIVE_REGIONS, buildCreativePlayer, joinCreativeQueue, requeueCreativeUnit,
@@ -662,7 +662,7 @@ async function handleInteraction(interaction) {
         isTrios,
         consoleOnly: false,
       };
-      saveStore(interaction.guild.id);
+      savePinnedMessages(interaction.guild.id);
 
       await interaction.editReply({
         content: `✅ Tournament embed created for **${tournamentName}** (${region})`,
@@ -761,7 +761,7 @@ async function handleInteraction(interaction) {
 
       await interaction.editReply({ content: `✅ Tournament cancelled. Channel will be deleted in 10 seconds.` });
       delete pinnedMessages[interaction.channelId];
-      saveStore(interaction.guild.id);
+      savePinnedMessages(interaction.guild.id);
       setTimeout(() => interaction.channel.delete().catch(console.error), 10000);
     }
 
@@ -875,7 +875,7 @@ async function handleInteraction(interaction) {
         cleared += getQueueCount(guildId, matchedKey, region);
         store.queues[matchedKey][region] = [];
       }
-      saveStore(guildId);
+      saveQueues();
 
       await interaction.editReply({ content: `✅ Cleared **${matchedKey}** globally — removed ${cleared} player(s) across all regions and servers.` });
     }

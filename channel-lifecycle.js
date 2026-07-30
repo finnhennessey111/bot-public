@@ -12,7 +12,7 @@
 
 const { EventEmitter } = require('events');
 const { ChannelType } = require('discord.js');
-const { matchChannels, save } = require('./store');
+const { matchChannels, saveMatchChannel, deleteMatchChannel } = require('./store');
 const { getCategoryId, setGuildConfig } = require('./guild-config');
 
 const WARNING_MS = 60 * 1000;
@@ -59,7 +59,7 @@ function scheduleChannelDeletion({ client, groupId, channels, deleteAtMs, kind }
     warned: false,
   };
   matchChannels[groupId] = record;
-  save();
+  saveMatchChannel(groupId);
 
   indexRecord(record);
   armTimers(client, record);
@@ -91,7 +91,7 @@ async function sendWarning(client, groupId) {
   if (!record || record.warned) return; // cancelled early, or already warned across a restart
 
   record.warned = true;
-  save();
+  saveMatchChannel(groupId);
 
   for (const c of record.channels) {
     try {
@@ -108,7 +108,7 @@ async function performDeletion(client, groupId) {
   if (!record) return; // cancelled early via the close button
 
   delete matchChannels[groupId];
-  save();
+  deleteMatchChannel(groupId);
 
   for (const c of record.channels) {
     for (const id of [c.textChannelId, c.voiceChannelId].filter(Boolean)) {
@@ -136,7 +136,7 @@ function cancelChannelDeletion(groupId) {
   const record = matchChannels[groupId];
   if (!record) return null;
   delete matchChannels[groupId];
-  save();
+  deleteMatchChannel(groupId);
   for (const c of record.channels) {
     if (c.textChannelId) channelToGroupId.delete(c.textChannelId);
     if (c.voiceChannelId) channelToGroupId.delete(c.voiceChannelId);

@@ -25,7 +25,7 @@
 
 const { EventEmitter } = require('events');
 const { computeMatchScoreBreakdown } = require('./scraper');
-const { queues, save } = require('./store');
+const { queues, saveQueues } = require('./store');
 const config = require('./config');
 const playerStore = require('./players');
 
@@ -57,7 +57,7 @@ function removeFromQueue(guildId, discordId, tournamentName, region) {
   const index = band.findIndex(unit => unit.members.some(p => p.discordId === discordId));
   if (index !== -1) {
     band.splice(index, 1);
-    save(guildId);
+    saveQueues();
     return true;
   }
   return false;
@@ -81,7 +81,7 @@ function removeFromQueueAnywhere(guildId, discordId) {
   const index = band.findIndex(u => u.unitId === found.unit.unitId);
   if (index !== -1) {
     band.splice(index, 1);
-    save(guildId);
+    saveQueues();
     return true;
   }
   return false;
@@ -204,7 +204,7 @@ function attemptMatchingForQueue(tournamentName, region) {
         const unitB = pool[bestJ];
         pool.splice(Math.max(i, bestJ), 1);
         pool.splice(Math.min(i, bestJ), 1);
-        save(unitA.guildId);
+        saveQueues();
         matchEvents.emit('matchFound', { unitA, unitB, tournamentName, region });
         matchedSomething = true;
         break; // pool mutated — restart the scan
@@ -298,7 +298,7 @@ async function joinQueue({ guildId, players, tournamentName, region, queueType, 
   };
 
   getQueue(tournamentName, region).push(unit);
-  save(guildId);
+  saveQueues();
 
   attemptMatchingForQueue(tournamentName, region);
 
@@ -307,7 +307,7 @@ async function joinQueue({ guildId, players, tournamentName, region, queueType, 
 
 function requeueUnit(unit) {
   getQueue(unit.tournamentName, unit.region).push(unit);
-  save(unit.guildId);
+  saveQueues();
   attemptMatchingForQueue(unit.tournamentName, unit.region);
 }
 

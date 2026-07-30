@@ -209,8 +209,14 @@ async function persistGuildScopedData(guildId) {
   );
 }
 
-// The global queue pool has no single "owning" guild, so it's persisted independently of any one
-// guild's save() call, keyed by the constant GLOBAL_QUEUE_KEY.
+// The global queue pool has no single "owning" guild — one shared document, keyed by the constant
+// GLOBAL_QUEUE_KEY, holding both `data` (queues) and `creativeData` (creativeQueues) together
+// (see models/Queue.js: "kept as a single Mixed blob rather than normalized documents since the
+// shape is still evolving"). A join/leave/match only ever changes a few units within one
+// tournament+region band, but this doc is the smallest unit Mongo can address here without a
+// schema change, so persisting it still means writing the current whole blob — the fix below is
+// that a queue mutation now touches ONLY this one document, not pinnedMessages or matchChannels
+// too.
 async function persistGlobalQueue() {
   await QueueModel.updateOne(
     { guildId: GLOBAL_QUEUE_KEY },
@@ -219,40 +225,64 @@ async function persistGlobalQueue() {
   );
 }
 
-// matchChannels groups can span multiple guilds — reconcile scoped to whichever guildIds this
-// particular save() call cares about isn't meaningful, so this always does a full reconcile
-// against every currently-known guild rather than filtering by one.
-async function persistMatchChannels() {
-  const keys = Object.keys(state.matchChannels);
-  await Promise.all(
-    keys.map(groupId => MatchChannelModel.updateOne(
-      { groupId },
-      {
-        $set: {
-          groupId,
-          guildIds: (state.matchChannels[groupId].channels ?? []).map(c => c.guildId),
-          data: state.matchChannels[groupId],
-        },
-      },
-      { upsert: true }
-    ))
+// Exactly one match-channel group (models/MatchChannel.js: one document per groupId) — upserts
+// just that document. Previously this re-upserted EVERY currently-active group on every call
+// (plus ran a deleteMany reconcile scan every time too — see persistMatchChannelDelete below),
+// scaling the cost of e.g. one match's warning timer firing with the total number of active
+// matches across the whole bot, not with the one group that actually changed.
+async function persistMatchChannelUpsert(groupId) {
+  const record = state.matchChannels[groupId];
+  if (!record) return; // deleted again before this async write ran — nothing to upsert
+  await MatchChannelModel.updateOne(
+    { groupId },
+    { $set: { groupId, guildIds: (record.channels ?? []).map(c => c.guildId), data: record } },
+    { upsert: true }
   );
-  await MatchChannelModel.deleteMany({ groupId: { $nin: keys } });
 }
 
-// Every mutation site already knows which guild it's acting on (a Discord interaction always
-// carries one) — save(guildId) persists that guild's pinnedMessages slice, plus the
-// (guild-agnostic) global queue pool and matchChannels every time, since either can change
-// as a side effect of any guild's activity.
-function save(guildId) {
-  saveJson();
-  if (!mongoReady) return;
+// Deletes exactly one match-channel group's document by groupId — a targeted deleteOne, not the
+// deleteMany({ $nin: currentKeys }) full-collection reconcile scan this replaced (that scan re-read
+// intent from "what's missing from in-memory state" instead of "what was just deleted", which is
+// why it had to run against the whole collection on every single call regardless of what changed).
+async function persistMatchChannelDelete(groupId) {
+  await MatchChannelModel.deleteOne({ groupId });
+}
 
-  if (guildId) {
-    persistGuildScopedData(guildId).catch(err => console.error(`[MongoDB] Failed to persist guild ${guildId}:`, err.message));
-  }
+// Every mutation site below already knows exactly which single collection/document it just
+// touched (a queue join only ever changes the queue pool; a pinned-message update only ever
+// changes that one guild's slice; a match-channel group's warn/cancel/delete only ever changes
+// that one group) — each save*() function below persists only that, never a blanket resync of
+// state nothing here actually changed. The (comparatively expensive) synchronous full-state JSON
+// write is the genuine fallback for when MongoDB isn't the backend of record at all — see
+// `mongoReady` above — not a write-through cache kept warm alongside a healthy Mongo on every
+// single mutation regardless of backend health.
+
+// Called by every mutation site that changed pinnedMessages for exactly this guildId.
+function savePinnedMessages(guildId) {
+  if (!mongoReady) return saveJson();
+  persistGuildScopedData(guildId).catch(err => console.error(`[MongoDB] Failed to persist guild ${guildId}:`, err.message));
+}
+
+// Called by every mutation site that changed the shared queues/creativeQueues pool (join, leave,
+// match, requeue, /clear-queue) — both live in one shared global document (see
+// persistGlobalQueue's comment above), so there's no finer-grained Mongo target to persist to.
+function saveQueues() {
+  if (!mongoReady) return saveJson();
   persistGlobalQueue().catch(err => console.error('[MongoDB] Failed to persist global queue:', err.message));
-  persistMatchChannels().catch(err => console.error('[MongoDB] Failed to persist match channels:', err.message));
+}
+
+// Called by every mutation site that created or updated one matchChannels group (schedule a
+// deletion, mark it warned) — never the whole matchChannels collection.
+function saveMatchChannel(groupId) {
+  if (!mongoReady) return saveJson();
+  persistMatchChannelUpsert(groupId).catch(err => console.error(`[MongoDB] Failed to persist match channel group ${groupId}:`, err.message));
+}
+
+// Called by every mutation site that removed one matchChannels group (cancelled or auto-deleted)
+// — never a full-collection reconcile scan.
+function deleteMatchChannel(groupId) {
+  if (!mongoReady) return saveJson();
+  persistMatchChannelDelete(groupId).catch(err => console.error(`[MongoDB] Failed to delete match channel group ${groupId}:`, err.message));
 }
 
 // Attempts the MongoDB connection and, if successful, hydrates every known guild's
@@ -278,11 +308,24 @@ async function init() {
   }
 }
 
+// Test-only escape hatch — flips the mongoReady flag without requiring a real MongoDB connection,
+// so a test can exercise the Mongo-selective-persistence branch (savePinnedMessages/saveQueues/
+// saveMatchChannel/deleteMatchChannel calling their real persistX functions, which hit the
+// Mongoose Model methods directly) without standing up a real database. Never called from
+// production code — init() (the real path) is the only other place mongoReady is ever set.
+function __setMongoReadyForTesting(value) {
+  mongoReady = value;
+}
+
 module.exports = {
   pinnedMessages: state.pinnedMessages,
   queues: state.queues,
   creativeQueues: state.creativeQueues,
   matchChannels: state.matchChannels,
-  save,
+  savePinnedMessages,
+  saveQueues,
+  saveMatchChannel,
+  deleteMatchChannel,
   init,
+  __setMongoReadyForTesting,
 };

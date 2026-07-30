@@ -22,7 +22,7 @@
 // eligibility gate, matchScore just decides which eligible candidate is the closest match.
 
 const { EventEmitter } = require('events');
-const { creativeQueues, save } = require('./store');
+const { creativeQueues, saveQueues } = require('./store');
 const config = require('./config');
 const playerStore = require('./players');
 const { computeMatchScoreBreakdown } = require('./scraper');
@@ -67,7 +67,7 @@ function removeFromCreativeQueueAnywhere(guildId, discordId) {
   const index = band.findIndex(u => u.unitId === found.unit.unitId);
   if (index !== -1) {
     band.splice(index, 1);
-    save(guildId);
+    saveQueues();
     return true;
   }
   return false;
@@ -189,7 +189,7 @@ function attemptMatchingForQueue(mode, region) {
         console.log(`[creative-queue] MATCH: ${describeUnit(unitA)} <-> ${describeUnit(unitB)} (matchScore diff ${bestDiff.toFixed(1)}, logPR diff ${logPRDistance(unitA, unitB).toFixed(1)})`);
         pool.splice(Math.max(i, bestJ), 1);
         pool.splice(Math.min(i, bestJ), 1);
-        save(unitA.guildId);
+        saveQueues();
         creativeMatchEvents.emit('matchFound', { unitA, unitB, mode, region });
         matchedSomething = true;
         break; // pool mutated — restart the scan
@@ -263,7 +263,7 @@ function joinCreativeQueue({ guildId, player, mode, region }) {
 
   const pool = getQueue(mode, region);
   pool.push(unit);
-  save(guildId);
+  saveQueues();
 
   console.log(
     `[creative-queue] JOIN ${describeUnit(unit)} guild=${guildId} mode=${mode} region=${region} `
@@ -278,7 +278,7 @@ function joinCreativeQueue({ guildId, player, mode, region }) {
 
 function requeueCreativeUnit(unit) {
   getQueue(unit.mode, unit.region).push(unit);
-  save(unit.guildId);
+  saveQueues();
   attemptMatchingForQueue(unit.mode, unit.region);
 }
 
