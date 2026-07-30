@@ -459,6 +459,7 @@ const creativeSelections = new Map();
 // ending up with two units for the same player and, in the worst case, a self-match.
 const creativeJoinInProgress = new Set();
 const teamJoinInProgress = new Set();
+const tournamentJoinInProgress = new Set();
 
 // Cross-queue exclusivity: a player can't be queued (or mid-match) in both the tournament
 // system and any creative queue (1v1/2v2 or 6s/8s) at once. Pending matches are tagged by
@@ -1229,6 +1230,7 @@ async function handleInteraction(interaction) {
 
       const { tournamentName, region, isTrios, consoleOnly } = pinned;
       const queueType = customId.replace('queue_', '');
+      const joinKey = `${guild.id}:${user.id}`;
 
       const member = await guild.members.fetch(user.id);
 
@@ -1258,6 +1260,12 @@ async function handleInteraction(interaction) {
         return replyAndDismiss(interaction, { content: '❌ You are already in a creative queue or match. Leave it before queueing for a tournament.' });
       }
 
+      if (tournamentJoinInProgress.has(joinKey)) {
+        return replyAndDismiss(interaction, {
+          content: '❌ You are already mid-join for a tournament queue. Try again once it resolves.',
+        });
+      }
+
       const tournamentAccess = await access.checkAccess(user.id);
       if (!tournamentAccess.allowed) {
         await notifyCreditWindowStartedIfNeeded(client, user.id, tournamentAccess);
@@ -1267,6 +1275,7 @@ async function handleInteraction(interaction) {
         });
       }
 
+      tournamentJoinInProgress.add(joinKey);
       await interaction.editReply({ content: '⏳ Fetching your stats...' });
 
       try {
@@ -1304,6 +1313,8 @@ async function handleInteraction(interaction) {
       } catch (err) {
         console.error('Queue error:', err);
         await replyAndDismiss(interaction, { content: `❌ Error joining queue: ${err.message}` });
+      } finally {
+        tournamentJoinInProgress.delete(joinKey);
       }
     }
 
