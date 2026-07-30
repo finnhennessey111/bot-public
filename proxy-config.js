@@ -132,6 +132,70 @@ async function blockUnnecessaryResources(page) {
   });
 }
 
+// Concurrency limit on live Puppeteer browsers — both scraper.js's scrapePlayerOnce and
+// tournament-scraper.js's fetchRawCalendar launch a brand-new headless Chromium process per call,
+// and nothing anywhere in this codebase previously capped how many could run at once. The
+// realistic worst case: rescrapeRegisteredPlayers (players.js) invalidates cached stats for every
+// registered player in a region the instant a tournament's start time passes, so the natural rush
+// of everyone queueing right as that tournament goes live is exactly when a thundering herd of
+// concurrent Chromium launches is most likely — each getPlayerStats cache miss (players.js) fires
+// its own independent scrapePlayer call with no coordination between them. On a VPS this small
+// (458MB RAM total, most of it already spoken for by Node/Discord.js/MongoDB before a single
+// Chromium process launches), a handful of simultaneous headless Chromium instances is a real path
+// to exhausting memory and taking the whole bot down, not just slowing individual scrapes.
+//
+// 2, not 3: picked at the conservative end of a 2-3 range specifically because 458MB is the WHOLE
+// box, not memory set aside for scraping — headless Chromium alone commonly runs 100-300MB+ RSS
+// per instance depending on page weight, and that's before Node's own process, Discord.js's
+// gateway connection, and (if run locally rather than Atlas) MongoDB. Two concurrent instances
+// already claims a large fraction of what's left; three felt like too little margin for a page
+// that's briefly heavier than usual (or a temporary OS/GC spike) to tip the whole box into swap
+// thrashing rather than just queueing the next launch.
+//
+// Dependency-free by design (no p-limit/bottleneck in package.json) — a small in-process FIFO
+// queue of resolve functions is the whole mechanism.
+const MAX_CONCURRENT_BROWSERS = 2;
+
+let activeBrowserCount = 0;
+const browserSlotQueue = [];
+
+function acquireBrowserSlot() {
+  if (activeBrowserCount < MAX_CONCURRENT_BROWSERS) {
+    activeBrowserCount++;
+    return Promise.resolve();
+  }
+  return new Promise(resolve => browserSlotQueue.push(resolve));
+}
+
+// Hands a freed slot directly to the next FIFO waiter (if any) rather than decrementing the
+// counter and letting a fresh acquireBrowserSlot() race for it — so the slot count invariant
+// (activeBrowserCount <= MAX_CONCURRENT_BROWSERS) holds at every instant, and the queue can never
+// starve: whoever has waited longest is always served next, regardless of how many new callers
+// arrive after them.
+function releaseBrowserSlot() {
+  const next = browserSlotQueue.shift();
+  if (next) {
+    next();
+  } else {
+    activeBrowserCount--;
+  }
+}
+
+// Wraps a full browser lifecycle (launch through close) so no more than MAX_CONCURRENT_BROWSERS
+// headless Chromium processes ever run at once — everything beyond the cap waits its turn instead
+// of launching immediately (or being dropped: the queue only ever grows and drains, nothing times
+// out of it). Call with an async function that does its own puppeteer.launch()/browser.close() —
+// the slot is held for that function's entire lifetime and released in a finally, so it's freed
+// even if the scrape throws.
+async function withBrowserSlot(fn) {
+  await acquireBrowserSlot();
+  try {
+    return await fn();
+  } finally {
+    releaseBrowserSlot();
+  }
+}
+
 // Called once at module load by each scraper file, so it's obvious from a fresh startup's logs
 // which path each one is actually running on.
 function logProxyMode(label) {
@@ -145,4 +209,5 @@ function logProxyMode(label) {
 module.exports = {
   isProxyConfigured, proxyLaunchArgs, authenticatePage, blockUnnecessaryResources, logProxyMode,
   isBlockedDomain, BLOCKED_DOMAINS,
+  withBrowserSlot, MAX_CONCURRENT_BROWSERS,
 };

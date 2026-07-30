@@ -1,5 +1,5 @@
 const puppeteer = require('puppeteer');
-const { proxyLaunchArgs, authenticatePage, blockUnnecessaryResources, logProxyMode } = require('./proxy-config');
+const { proxyLaunchArgs, authenticatePage, blockUnnecessaryResources, logProxyMode, withBrowserSlot } = require('./proxy-config');
 const { resolveRosterSize } = require('./roster-size');
 
 logProxyMode('tournament-scraper');
@@ -198,40 +198,45 @@ function isBareBuildModeLabel(nameLower) {
 // slug-based detection is needed against this source at all.
 // ---------------------------------------------------------------------------------------------
 
-// Loads the events page and pulls out the raw `imp_calendar` JSON blob.
+// Loads the events page and pulls out the raw `imp_calendar` JSON blob. The browser's whole
+// launch-through-close lifetime runs inside withBrowserSlot (proxy-config.js) so no more than
+// MAX_CONCURRENT_BROWSERS headless Chromium processes are ever alive at once across the whole bot
+// — see that function's header comment for why.
 async function fetchRawCalendar() {
-  const browser = await puppeteer.launch({
-    headless: 'new',
-    args: ['--no-sandbox', '--disable-setuid-sandbox', ...proxyLaunchArgs()]
-  });
-
-  try {
-    const page = await browser.newPage();
-    await authenticatePage(page);
-    await blockUnnecessaryResources(page);
-    await page.setUserAgent(
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    );
-
-    await page.goto('https://fortnitetracker.com/events', {
-      waitUntil: 'networkidle2',
-      timeout: 30000,
+  return withBrowserSlot(async () => {
+    const browser = await puppeteer.launch({
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-setuid-sandbox', ...proxyLaunchArgs()]
     });
 
-    return await page.evaluate(() => {
-      const scripts = Array.from(document.querySelectorAll('script'));
-      for (const script of scripts) {
-        const content = script.innerText || script.textContent;
-        if (content.includes('imp_calendar')) {
-          const match = content.match(/var imp_calendar = (\[.*?\]);/s);
-          if (match) return JSON.parse(match[1]);
+    try {
+      const page = await browser.newPage();
+      await authenticatePage(page);
+      await blockUnnecessaryResources(page);
+      await page.setUserAgent(
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+      );
+
+      await page.goto('https://fortnitetracker.com/events', {
+        waitUntil: 'networkidle2',
+        timeout: 30000,
+      });
+
+      return await page.evaluate(() => {
+        const scripts = Array.from(document.querySelectorAll('script'));
+        for (const script of scripts) {
+          const content = script.innerText || script.textContent;
+          if (content.includes('imp_calendar')) {
+            const match = content.match(/var imp_calendar = (\[.*?\]);/s);
+            if (match) return JSON.parse(match[1]);
+          }
         }
-      }
-      return null;
-    });
-  } finally {
-    await browser.close();
-  }
+        return null;
+      });
+    } finally {
+      await browser.close();
+    }
+  });
 }
 
 async function scrapeTrackerCalendar() {

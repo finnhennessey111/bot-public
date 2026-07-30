@@ -1,6 +1,6 @@
 const puppeteer = require('puppeteer');
 const config = require('./config');
-const { proxyLaunchArgs, authenticatePage, blockUnnecessaryResources, logProxyMode } = require('./proxy-config');
+const { proxyLaunchArgs, authenticatePage, blockUnnecessaryResources, logProxyMode, withBrowserSlot } = require('./proxy-config');
 const { resolveRosterSize } = require('./roster-size');
 
 logProxyMode('scraper');
@@ -40,57 +40,64 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+// The browser's whole launch-through-close lifetime runs inside withBrowserSlot (proxy-config.js)
+// so no more than MAX_CONCURRENT_BROWSERS headless Chromium processes are ever alive at once
+// across the whole bot — see that function's header comment for why (a thundering herd of
+// simultaneous scrapes, e.g. every registered player's cache expiring the instant a tournament
+// goes live, is a real path to exhausting a small VPS's memory).
 async function scrapePlayerOnce(epicUsername, region = 'EU', epicId = null) {
-  const browser = await puppeteer.launch({
-    headless: 'new',
-    args: ['--no-sandbox', '--disable-setuid-sandbox', ...proxyLaunchArgs()]
-  });
-
-  try {
-    const page = await browser.newPage();
-    await authenticatePage(page);
-    await blockUnnecessaryResources(page);
-    await page.setUserAgent(
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    );
-
-    const slug = encodeURIComponent(epicUsername);
-    const url = config.ftUrls[region]
-      .replace('{slug}', slug)
-      .replace('{epicId}', epicId ?? '');
-
-    console.log(`Scraping: ${url}`);
-    // domcontentloaded, not networkidle2: the profile data this scrape needs is server-rendered
-    // into a <script> tag in the initial HTML document (confirmed live — present and fully parseable
-    // immediately at domcontentloaded, before any images/analytics finish), so waiting for it doesn't
-    // require network activity to go fully quiet. networkidle2 additionally waits for every
-    // sub-resource (this page's tournament banner images, analytics beacons, ad-tech calls) to settle
-    // — including ones a rotating residential proxy plan may be unable to reach at all (e.g. Webshare
-    // dashboard evidence showing a real, non-flaky 32.83% client_connect_forbidden_host block rate
-    // specifically for cdn2.unrealengine.com), which would hang the whole navigation until timeout
-    // regardless of exit IP. domcontentloaded only waits on the main document, so a permanently-
-    // blocked unrelated asset can no longer stall a scrape that already has everything it needs.
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: PLAYER_SCRAPE_NAV_TIMEOUT_MS });
-
-    const data = await page.evaluate(() => {
-      const scripts = Array.from(document.querySelectorAll('script'));
-      for (const script of scripts) {
-        const content = script.innerText || script.textContent;
-        if (content.includes('const profile =')) {
-          const match = content.match(/const profile = ({.*?});/s);
-          if (match) return JSON.parse(match[1]);
-        }
-      }
-      return null;
+  return withBrowserSlot(async () => {
+    const browser = await puppeteer.launch({
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-setuid-sandbox', ...proxyLaunchArgs()]
     });
 
-    if (!data) throw new Error(`Could not find profile data for: ${epicUsername}`);
+    try {
+      const page = await browser.newPage();
+      await authenticatePage(page);
+      await blockUnnecessaryResources(page);
+      await page.setUserAgent(
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+      );
 
-    return parseProfileData(data);
+      const slug = encodeURIComponent(epicUsername);
+      const url = config.ftUrls[region]
+        .replace('{slug}', slug)
+        .replace('{epicId}', epicId ?? '');
 
-  } finally {
-    await browser.close();
-  }
+      console.log(`Scraping: ${url}`);
+      // domcontentloaded, not networkidle2: the profile data this scrape needs is server-rendered
+      // into a <script> tag in the initial HTML document (confirmed live — present and fully parseable
+      // immediately at domcontentloaded, before any images/analytics finish), so waiting for it doesn't
+      // require network activity to go fully quiet. networkidle2 additionally waits for every
+      // sub-resource (this page's tournament banner images, analytics beacons, ad-tech calls) to settle
+      // — including ones a rotating residential proxy plan may be unable to reach at all (e.g. Webshare
+      // dashboard evidence showing a real, non-flaky 32.83% client_connect_forbidden_host block rate
+      // specifically for cdn2.unrealengine.com), which would hang the whole navigation until timeout
+      // regardless of exit IP. domcontentloaded only waits on the main document, so a permanently-
+      // blocked unrelated asset can no longer stall a scrape that already has everything it needs.
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: PLAYER_SCRAPE_NAV_TIMEOUT_MS });
+
+      const data = await page.evaluate(() => {
+        const scripts = Array.from(document.querySelectorAll('script'));
+        for (const script of scripts) {
+          const content = script.innerText || script.textContent;
+          if (content.includes('const profile =')) {
+            const match = content.match(/const profile = ({.*?});/s);
+            if (match) return JSON.parse(match[1]);
+          }
+        }
+        return null;
+      });
+
+      if (!data) throw new Error(`Could not find profile data for: ${epicUsername}`);
+
+      return parseProfileData(data);
+
+    } finally {
+      await browser.close();
+    }
+  });
 }
 
 // Delegates through module.exports (not a direct call to scrapePlayerOnce) so a test can swap in
