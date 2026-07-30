@@ -238,14 +238,6 @@ function startWebhookServer(client) {
 
   const app = express();
 
-  // Temporary diagnostic — confirms whether requests are reaching this Express app at all before
-  // any route-specific parsing runs. Remove once the Stripe signature verification issue is
-  // resolved.
-  app.use((req, res, next) => {
-    console.log('[express] incoming:', req.method, req.url, 'content-type:', req.headers['content-type']);
-    next();
-  });
-
   if (!stripeEnabled) {
     console.warn('[webhook] STRIPE_SECRET_KEY/STRIPE_WEBHOOK_SECRET not set — /stripe/webhook disabled. Subscriptions are disabled.');
   }
@@ -273,21 +265,6 @@ function startWebhookServer(client) {
     // no purpose other than consuming Stripe webhooks, always reading the raw body regardless of
     // the advertised Content-Type is safe and removes that failure mode entirely.
     app.post('/stripe/webhook', express.raw({ type: '*/*' }), async (req, res) => {
-      // Temporary diagnostic for the "No signatures found matching the expected signature"
-      // failure — confirms whether req.body is still the exact raw Buffer Stripe sent (Nginx is
-      // suspected of rewriting/re-encoding the body before it reaches this process) and whether
-      // the stripe-signature header itself is arriving intact.
-      console.log(
-        `[webhook] Received /stripe/webhook — body is Buffer: ${Buffer.isBuffer(req.body)}, ` +
-        `length: ${Buffer.isBuffer(req.body) ? req.body.length : 'n/a'}, ` +
-        `sha256: ${Buffer.isBuffer(req.body) ? require('crypto').createHash('sha256').update(req.body).digest('hex') : 'n/a'}, ` +
-        `stripe-signature: ${req.headers['stripe-signature'] ?? '(missing)'}, ` +
-        `content-encoding: ${req.headers['content-encoding'] ?? '(none)'}, ` +
-        `transfer-encoding: ${req.headers['transfer-encoding'] ?? '(none)'}, ` +
-        `content-length header: ${req.headers['content-length'] ?? '(none)'}, ` +
-        `all headers: ${JSON.stringify(req.headers)}`
-      );
-
       let event;
       try {
         event = stripe.webhooks.constructEvent(req.body, req.headers['stripe-signature'], process.env.STRIPE_WEBHOOK_SECRET);
