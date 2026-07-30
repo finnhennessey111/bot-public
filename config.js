@@ -3,14 +3,6 @@ require('dotenv').config();
 module.exports = {
   token: process.env.DISCORD_TOKEN,
 
-  // Progressive queue widening — max allowed Total PR difference between two units,
-  // based on how long a unit has been waiting in queue.
-  matchWideningSchedule: [
-    { afterSeconds: 0, maxPRDiff: 150 },
-    { afterSeconds: 45, maxPRDiff: 300 },
-    { afterSeconds: 90, maxPRDiff: Infinity },
-  ],
-
   // Soft PR-distance penalty — inflates the ranking diff (not eligibility) for candidates
   // further apart in Total PR, so closer matches are still preferred once both are eligible.
   prDistancePenalties: [

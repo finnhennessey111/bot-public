@@ -104,11 +104,6 @@ function buildQueueButtons(isTrios = false) {
   if (isTrios) {
     row.addComponents(
       new ButtonBuilder()
-        .setCustomId('queue_lf1')
-        .setLabel('Looking for 1')
-        .setStyle(ButtonStyle.Primary)
-        .setEmoji('🔍'),
-      new ButtonBuilder()
         .setCustomId('queue_lf2')
         .setLabel('Looking for 2')
         .setStyle(ButtonStyle.Success)
@@ -1093,7 +1088,7 @@ function buildAccessStatusEmbed(status) {
 }
 
 // accessResult comes from access.js's checkAccess() when allowed is false — shown at every
-// gating point (queue_duo/lf2/lf1, creative_queue_*, team_queue_*).
+// gating point (queue_duo/lf2, creative_queue_*, team_queue_*).
 function buildNoAccessEmbed(accessResult) {
   const embed = new EmbedBuilder()
     .setTitle('❌ Access Required')
