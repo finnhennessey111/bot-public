@@ -529,6 +529,22 @@ client.once('clientReady', async () => {
     closeMatchChannelCluster(channelsByGuildId, '⌛ This match expired with no response — you have been re-queued automatically.').catch(console.error);
   });
 
+  // Restores any tournament/1v1/2v2 match still awaiting accept/reject when the process last
+  // stopped — must run after the 'expired' listener above is registered, since a restored match
+  // whose window already lapsed expires immediately and needs that listener live to tear its
+  // channel(s) down.
+  matching.restorePendingMatches();
+
+  // 6s/8s team matches carry much richer post-formation state (team-method vote, lock, ready-
+  // check, vote-kick — each with its own timer) than a plain accept/reject window, and none of it
+  // is persisted (see team-match-lifecycle.js's header comment for why restoring it isn't
+  // attempted). Every matchChannels record tagged 'creative-team' is, by definition, orphaned the
+  // instant this process starts — there is no way any of them could have live state yet. Detect
+  // and close them now, before restoreScheduledDeletions below re-arms deletion timers for every
+  // remaining matchChannels record, instead of leaving them sitting silently broken until their
+  // (otherwise up to 2h out) auto-deletion timer eventually fires.
+  await teamMatchLifecycle.cleanupOrphanedMatchesOnStartup(client).catch(console.error);
+
   channelLifecycle.restoreScheduledDeletions(client);
   channelLifecycle.channelLifecycleEvents.on('channelDeleted', ({ channels, kind }) => {
     if (kind === 'creative-team') {

@@ -13,14 +13,27 @@
 // vote, team pick, vote-kick) can be resolved from *any* of these channels — they all read and
 // write the same in-memory matchState, keyed by matchId, not by channel.
 //
-// In-memory only (not persisted), same precedent as matching.js's pendingMatches and
-// team-invite.js's pendingInvites — a restart loses any in-progress lock/ready-check/vote state.
+// In-memory only (not persisted), same precedent as team-invite.js's pendingInvites/pendingTeams
+// and creative-team-queue.js's formingMatches — a restart loses any in-progress lock/ready-check/
+// vote state. Unlike those, though, the private channel(s) DO already exist and are durably
+// tracked by then (channel-lifecycle.js's matchChannels, kind: 'creative-team' — see
+// startTeamMatch's scheduleChannelDeletion call below), so a restart mid-lifecycle doesn't orphan
+// them the way matching.js's pendingMatches used to: the existing auto-deletion timer still
+// re-arms and eventually cleans them up, and the "Close Channel" button already works fine too (it
+// only needs channel-lifecycle.js's own durable state). What's genuinely lost is just the ability
+// to progress through team-vote/lock/ready-check/vote-kick — restoring that safely would mean
+// faithfully reconstructing 5 different sub-phases, each with its own independent timer, which is
+// real complexity/risk this file deliberately isn't taking on right now. Instead,
+// cleanupOrphanedMatchesOnStartup (called once at startup, before restoreScheduledDeletions) closes
+// every 'creative-team' channel group immediately with a clear explanation, rather than leaving it
+// sitting silently broken until its (otherwise up to 2h out) deletion timer eventually fires.
 
 const { ChannelType, PermissionFlagsBits } = require('discord.js');
 const config = require('./config');
 const { toLogPR, getCreativeWideningTier } = require('./creative-queue');
 const creativeTeamQueue = require('./creative-team-queue');
 const channelLifecycle = require('./channel-lifecycle');
+const store = require('./store');
 const { bestPartitionByPR } = require('./team-partition');
 const credits = require('./credits');
 const feedback = require('./feedback');
@@ -76,6 +89,49 @@ function endTeamMatch(channelId) {
     }
   }
   matchesById.delete(matchId);
+}
+
+// Called once at startup, before channelLifecycle.restoreScheduledDeletions re-arms deletion
+// timers for whatever's left. Every matchChannels record tagged 'creative-team' at this exact
+// moment is, by definition, orphaned — matchesById/channelToMatchId above start completely empty
+// on every fresh process start, so none of them can possibly have live state yet. Reuses
+// channelLifecycle.cancelChannelDeletion (the same primitive the "Close Channel" button itself
+// calls) for the actual teardown — proven safe, since that button already works correctly
+// post-restart today.
+async function cleanupOrphanedMatchesOnStartup(client) {
+  const orphanedGroupIds = Object.keys(store.matchChannels)
+    .filter(groupId => store.matchChannels[groupId].kind === 'creative-team');
+
+  if (orphanedGroupIds.length === 0) return;
+
+  for (const groupId of orphanedGroupIds) {
+    const record = channelLifecycle.cancelChannelDeletion(groupId);
+    if (!record) continue;
+
+    for (const c of record.channels) {
+      try {
+        const channel = await client.channels.fetch(c.textChannelId);
+        await channel.send(
+          '⚠️ This match was interrupted by a bot restart and couldn\'t be safely resumed — sorry! '
+          + 'This channel is closing in 10 seconds; please re-queue.'
+        );
+      } catch (err) {
+        console.error(`[team-match] Failed to notify orphaned channel ${c.textChannelId} during restart cleanup:`, err.message);
+      }
+    }
+
+    setTimeout(() => {
+      for (const c of record.channels) {
+        for (const id of [c.textChannelId, c.voiceChannelId].filter(Boolean)) {
+          client.channels.fetch(id).then(ch => ch.delete()).catch(err => {
+            console.error(`[team-match] Failed to delete orphaned channel ${id} during restart cleanup:`, err.message);
+          });
+        }
+      }
+    }, 10000);
+  }
+
+  console.log(`[team-match] Found and closed ${orphanedGroupIds.length} 6s/8s match channel group(s) left over from before this restart.`);
 }
 
 // Count of confirmed 6s/8s matches currently in their post-formation lifecycle (team pick/lock/
@@ -825,6 +881,7 @@ module.exports = {
   getMatchByChannelId,
   isPlayerInActiveTeamMatch,
   endTeamMatch,
+  cleanupOrphanedMatchesOnStartup,
   getActiveTeamMatchCount,
   handleReadyButton,
   handleTeamMethodVoteButton,

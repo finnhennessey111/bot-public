@@ -13,6 +13,14 @@
 //   matchChannels: flat, keyed by groupId (one match's whole channel cluster, possibly spanning
 //     several guilds for a cross-server match) — each record carries a `channels` array of
 //     {guildId, textChannelId, voiceChannelId}.
+//   pendingMatches: flat, keyed by matchId — a plain, JSON-safe snapshot of a match still awaiting
+//     accept/reject (matching.js's own in-memory pendingMatches holds the richer live shape, with
+//     a Set/Map/live requeueFn callback; only matching.js's toPersistableRecord() output ever
+//     lands here). Exists so an in-flight accept/reject window survives a restart instead of
+//     silently vanishing — match-channels.js creates the private channel the moment a match is
+//     found, well before channel-lifecycle.js's matchChannels would otherwise ever know about it
+//     (that only happens once everyone accepts), so without this a mid-restart restart leaves a
+//     channel with no durable record anywhere at all.
 //
 // creativeChannels/settings (per-guild config, not queue/match data) live in guild-config.js /
 // models/Guild.js, not here.
@@ -23,6 +31,7 @@ const db = require('./db');
 const GuildModel = require('./models/Guild');
 const QueueModel = require('./models/Queue');
 const MatchChannelModel = require('./models/MatchChannel');
+const PendingMatchModel = require('./models/PendingMatch');
 
 const DATA_FILE = path.join(__dirname, 'data.json');
 
@@ -75,6 +84,7 @@ function load() {
       queues: flattenAcrossGuilds(parsed.queues ?? {}),
       creativeQueues: flattenAcrossGuilds(parsed.creativeQueues ?? {}),
       matchChannels: parsed.matchChannels ?? {}, // migrated to groupId-keyed on first save
+      pendingMatches: parsed.pendingMatches ?? {},
     };
   } catch (err) {
     return {
@@ -82,6 +92,7 @@ function load() {
       queues: {},
       creativeQueues: {},
       matchChannels: {},
+      pendingMatches: {},
     };
   }
 }
@@ -96,6 +107,7 @@ function saveJson() {
       queues: state.queues,
       creativeQueues: state.creativeQueues,
       matchChannels: state.matchChannels,
+      pendingMatches: state.pendingMatches,
     },
     null,
     2
@@ -195,6 +207,11 @@ async function hydrateFromMongoAll() {
   const matchChannels = {};
   for (const c of channelDocs) matchChannels[c.groupId] = c.data;
   replaceContents(state.matchChannels, matchChannels);
+
+  const pendingMatchDocs = await PendingMatchModel.find({}).lean();
+  const pendingMatches = {};
+  for (const m of pendingMatchDocs) pendingMatches[m.matchId] = m.data;
+  replaceContents(state.pendingMatches, pendingMatches);
 }
 
 // Persists just this guild's slice of pinnedMessages (matchChannels handled separately below,
@@ -248,6 +265,24 @@ async function persistMatchChannelDelete(groupId) {
   await MatchChannelModel.deleteOne({ groupId });
 }
 
+// Exactly one pending match (models/PendingMatch.js: one document per matchId) — upserts just
+// that document, same shape/reasoning as persistMatchChannelUpsert above.
+async function persistPendingMatchUpsert(matchId) {
+  const record = state.pendingMatches[matchId];
+  if (!record) return; // deleted again before this async write ran — nothing to upsert
+  await PendingMatchModel.updateOne(
+    { matchId },
+    { $set: { matchId, data: record } },
+    { upsert: true }
+  );
+}
+
+// Deletes exactly one pending match's document by matchId — called once it's no longer pending
+// (accepted by everyone, rejected, or expired).
+async function persistPendingMatchDelete(matchId) {
+  await PendingMatchModel.deleteOne({ matchId });
+}
+
 // Every mutation site below already knows exactly which single collection/document it just
 // touched (a queue join only ever changes the queue pool; a pinned-message update only ever
 // changes that one guild's slice; a match-channel group's warn/cancel/delete only ever changes
@@ -285,6 +320,19 @@ function deleteMatchChannel(groupId) {
   persistMatchChannelDelete(groupId).catch(err => console.error(`[MongoDB] Failed to delete match channel group ${groupId}:`, err.message));
 }
 
+// Called by matching.js every time a pending match's persistable snapshot changes (created,
+// channels attached, a partial accept) — never a blanket resync of every pending match.
+function savePendingMatch(matchId) {
+  if (!mongoReady) return saveJson();
+  persistPendingMatchUpsert(matchId).catch(err => console.error(`[MongoDB] Failed to persist pending match ${matchId}:`, err.message));
+}
+
+// Called by matching.js once a match stops being pending (confirmed, rejected, or expired).
+function deletePendingMatch(matchId) {
+  if (!mongoReady) return saveJson();
+  persistPendingMatchDelete(matchId).catch(err => console.error(`[MongoDB] Failed to delete pending match ${matchId}:`, err.message));
+}
+
 // Attempts the MongoDB connection and, if successful, hydrates every known guild's
 // pinnedMessages/matchChannels plus the global queue pool from it (every Guild doc that exists,
 // not just guilds the bot is currently in — no client needed here). Call once at startup, before
@@ -301,7 +349,7 @@ async function init() {
   try {
     await hydrateFromMongoAll();
     mongoReady = true;
-    console.log('[Store] Using MongoDB for persistence (pinnedMessages, global queue pool, creativeQueues, matchChannels).');
+    console.log('[Store] Using MongoDB for persistence (pinnedMessages, global queue pool, creativeQueues, matchChannels, pendingMatches).');
   } catch (err) {
     mongoReady = false;
     console.error('[Store] Failed to hydrate from MongoDB — using local JSON file (data.json) for persistence:', err.message);
@@ -322,10 +370,13 @@ module.exports = {
   queues: state.queues,
   creativeQueues: state.creativeQueues,
   matchChannels: state.matchChannels,
+  pendingMatches: state.pendingMatches,
   savePinnedMessages,
   saveQueues,
   saveMatchChannel,
   deleteMatchChannel,
+  savePendingMatch,
+  deletePendingMatch,
   init,
   __setMongoReadyForTesting,
 };

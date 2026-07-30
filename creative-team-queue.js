@@ -22,8 +22,13 @@
 // average matchScore instead (evaluateJoin/queueUnit) — same matchScore-over-logPR ranking switch
 // as creative-queue.js's pairwise matcher, eligibility itself is unaffected.
 //
-// In-memory only (not persisted) — same ephemeral-state precedent as matching.js's
-// pendingMatches and party.js's pendingInvites. A restart loses in-progress forming matches.
+// In-memory only (not persisted) — same ephemeral-state precedent as team-invite.js's
+// pendingTeams/pendingInvites. A restart loses in-progress forming matches, same as it loses
+// anyone's place in queue.js's/creative-queue.js's pairwise queues — no private channel exists yet
+// at this pre-confirmation stage (that only happens once a forming match hits its target size and
+// creativeTeamMatchEvents emits 'matchFormed' — see team-match-lifecycle.js), so unlike
+// matching.js's pendingMatches (which IS persisted — see that file's header comment) losing this
+// on restart can't orphan a channel, just a queue position.
 
 const { EventEmitter } = require('events');
 const { REGIONS, toLogPR, getCreativeWideningTier } = require('./creative-queue');
