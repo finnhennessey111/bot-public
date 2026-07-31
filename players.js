@@ -19,12 +19,47 @@ async function getPlayer(guildId, discordId) {
   return PlayerModel.findOne({ guildId, discordId }).lean();
 }
 
+// Auto-derives epicUsernameLower from epicUsername whenever the latter is part of this update
+// (including clearing it to null on unlink) — every call site that ever sets epicUsername
+// (linkEpicAccount, getPlayerStats/refreshPlayerStats/forceRefreshStats, unlinkEpicAccount) goes
+// through this one function, so none of them need to remember to keep it in sync themselves. See
+// models/Player.js's doc comment on epicUsernameLower for why it exists.
 async function upsertPlayer(guildId, discordId, fields) {
+  const derived = 'epicUsername' in fields
+    ? { epicUsernameLower: fields.epicUsername ? fields.epicUsername.toLowerCase() : null }
+    : {};
+
   return PlayerModel.findOneAndUpdate(
     { guildId, discordId },
-    { $set: fields, $setOnInsert: { guildId, discordId, registeredAt: new Date() } },
+    { $set: { ...fields, ...derived }, $setOnInsert: { guildId, discordId, registeredAt: new Date() } },
     { upsert: true, returnDocument: 'after' }
   ).lean();
+}
+
+// Public, unauthenticated lookup (elo.js's GET /api/elo/:epicUsername) — the same real person can
+// be registered under multiple guilds (one Player doc each), so this resolves via the stable
+// epicId (never the guild-scoped discordId+guildId key every other function here uses) to always
+// land on one consistent result regardless of which guild's record happened to match the searched
+// username. Case-insensitive exact match against the indexed epicUsernameLower field — fast enough
+// for a public, repeatedly-hammerable endpoint without needing a regex scan.
+async function findCanonicalByEpicUsername(epicUsername) {
+  const lower = String(epicUsername ?? '').trim().toLowerCase();
+  if (!lower) return null;
+
+  const candidates = await PlayerModel.find({ epicUsernameLower: lower }).lean();
+  if (candidates.length === 0) return null;
+
+  const epicId = candidates.find(c => c.epicId)?.epicId;
+  const sameAccount = epicId ? await PlayerModel.find({ epicId }).lean() : candidates;
+
+  // Freshest scraped snapshot wins — different guilds' copies of the same real account can have
+  // drifted lastUpdated timestamps depending on when each last actually queued.
+  return sameAccount.reduce((freshest, doc) => {
+    if (!freshest) return doc;
+    const a = doc.lastUpdated ? new Date(doc.lastUpdated).getTime() : 0;
+    const b = freshest.lastUpdated ? new Date(freshest.lastUpdated).getTime() : 0;
+    return a > b ? doc : freshest;
+  }, null);
 }
 
 async function isRegisteredPlayer(guildId, discordId) {
@@ -187,4 +222,5 @@ module.exports = {
   refreshPlayerStats,
   forceRefreshStats,
   rescrapeRegisteredPlayers,
+  findCanonicalByEpicUsername,
 };

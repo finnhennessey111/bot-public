@@ -25,6 +25,8 @@ const discordOAuth = require('./discord-oauth');
 const billing = require('./billing');
 const playerStore = require('./players');
 const { getRoleId, getChannelId } = require('./guild-config');
+const elo = require('./elo');
+const { createRateLimiter } = require('./rate-limit');
 
 function getStripeSdk() {
   if (!process.env.STRIPE_SECRET_KEY) return null;
@@ -230,8 +232,13 @@ function startWebhookServer(client) {
   const epicEnabled = epicOAuth.isConfigured();
   const discordOAuthEnabled = discordOAuth.isConfigured();
   const deployEnabled = !!process.env.DEPLOY_WEBHOOK_SECRET;
+  // Always on — unlike every other route here, the public ELO lookup needs no external API
+  // credentials, just MongoDB (already required for Player records in general). Included in the
+  // "is there anything to serve at all" check below so this alone is enough to bring the server up
+  // even on a deployment with none of Stripe/Epic/Discord OAuth/deploy configured.
+  const eloEnabled = true;
 
-  if (!stripeEnabled && !epicEnabled && !discordOAuthEnabled && !deployEnabled) {
+  if (!stripeEnabled && !epicEnabled && !discordOAuthEnabled && !deployEnabled && !eloEnabled) {
     console.warn('[webhook] Neither Stripe, Epic OAuth, Discord OAuth, nor deploy webhook env vars are set — webhook server not started.');
     return null;
   }
@@ -453,6 +460,32 @@ function startWebhookServer(client) {
     });
   }
 
+  // Public "check your ELO" lookup (elo.js) — reads the STORED Epic username from the last time a
+  // player linked/scraped, never a live Fortnite Tracker scrape at request time, so this stays
+  // cheap enough to be genuinely public and unauthenticated. 20 requests/minute/IP is generous for
+  // a human searching their own (or a friend's) name repeatedly, while still blunting casual
+  // high-volume hammering — see rate-limit.js.
+  const eloRateLimit = createRateLimiter({ windowMs: 60_000, max: 20 });
+  const MAX_EPIC_USERNAME_LENGTH = 64; // generous — real Epic display names are far shorter
+
+  app.get('/api/elo/:epicUsername', eloRateLimit, async (req, res) => {
+    const { epicUsername } = req.params;
+    if (!epicUsername || epicUsername.length > MAX_EPIC_USERNAME_LENGTH) {
+      return res.status(400).json({ error: 'Invalid Epic username.' });
+    }
+
+    try {
+      const result = await elo.getPublicElo(epicUsername);
+      if (!result) {
+        return res.status(404).json({ found: false, error: 'No player found with that Epic username.' });
+      }
+      res.json(result);
+    } catch (err) {
+      console.error(`[elo] Lookup failed for "${epicUsername}":`, err.message);
+      res.status(500).json({ error: 'Something went wrong looking that up — try again shortly.' });
+    }
+  });
+
   const port = process.env.PORT || 3000;
   console.log('[webhook] Express server starting on port', port);
   const server = app.listen(port, () => {
@@ -461,6 +494,7 @@ function startWebhookServer(client) {
       epicEnabled && 'GET /epic-callback',
       discordOAuthEnabled && 'GET /premium/:plan, GET /discord-checkout-callback',
       deployEnabled && 'POST /deploy',
+      'GET /api/elo/:epicUsername',
     ].filter(Boolean);
     console.log(`[webhook] Server listening on port ${port} (${routes.join(', ')})`);
   });

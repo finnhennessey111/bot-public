@@ -21,6 +21,11 @@ const playerSchema = new mongoose.Schema({
   discordId: { type: String, required: true },
   guildId: { type: String, required: true },
   epicUsername: String,
+  // Lowercased mirror of epicUsername, kept in sync by players.js's upsertPlayer/linkEpicAccount —
+  // exists purely so elo.js's public "check your ELO" lookup (players.js's
+  // findCanonicalByEpicUsername) can do a fast, case-insensitive, INDEXED exact match instead of a
+  // regex scan, which matters for an unauthenticated endpoint anyone could search repeatedly.
+  epicUsernameLower: String,
   epicId: String,
   // True once this player has completed the Epic OAuth flow (epic-oauth.js) themselves. Gates
   // resolveEpicIdentity's Epic-OAuth path in index.js: without this flag, a stale epicId sitting
@@ -46,5 +51,10 @@ const playerSchema = new mongoose.Schema({
 });
 
 playerSchema.index({ discordId: 1, guildId: 1 }, { unique: true });
+// Non-unique — the same real Epic account is legitimately registered under one Player doc PER
+// guild it's used in (players.js's findCanonicalByEpicUsername resolves the multiple docs down to
+// one canonical result via epicId).
+playerSchema.index({ epicUsernameLower: 1 });
+playerSchema.index({ epicId: 1 });
 
 module.exports = mongoose.models.Player || mongoose.model('Player', playerSchema);

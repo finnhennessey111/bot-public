@@ -385,6 +385,7 @@ async function scrapeUpcomingTournaments() {
 module.exports = {
   scrapeUpcomingTournaments, buildTournamentGroups, isBareBuildModeLabel, scrapeTrackerCalendar,
   isRankedCupTitle, fetchEventDescriptionRosterSize, enrichWithDescriptionRosterSize,
+  PERMANENT_KEYWORDS,
 };
 
 // Test run

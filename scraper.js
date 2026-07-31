@@ -203,6 +203,21 @@ function getPlacementScore(placement) {
   return 0;
 }
 
+// Extracted from computeMatchScoreBreakdown below so elo.js's public ELO lookup can reuse the
+// EXACT same own-tournament-history formula against a broader match predicate — a permanent
+// tournament TYPE (e.g. "FNCS Division") needs to match whichever numbered division a player
+// actually has recorded history in (e.g. "FNCS Division 2"), not one fixed exact title, unlike
+// every existing real-time caller (queue.js, creative-queue.js), which always matches one exact
+// tournamentName. matchesEvent is `e => boolean` — computeMatchScoreBreakdown below passes
+// `e => e.name === tournamentName`, preserving its exact prior behavior unchanged.
+function computeOwnTournamentModifier(recentEvents, matchesEvent) {
+  const ownTournamentEvents = recentEvents.filter(matchesEvent).slice(0, 3);
+  if (ownTournamentEvents.length === 0) return { modifier: 0, hasHistory: false, matchedEvents: [] };
+
+  const modifier = (ownTournamentEvents.reduce((sum, e) => sum + getPlacementScore(e.placement), 0) / ownTournamentEvents.length / 100) * 0.30;
+  return { modifier, hasHistory: true, matchedEvents: ownTournamentEvents };
+}
+
 // soloModifier deliberately excludes ranked-cup events (name matches /ranked/i) even though
 // they're otherwise eligible (rosterSize === 1): ranked cups have easy lobbies and no real
 // stakes, so strong results there don't indicate real skill and must never feed this signal.
@@ -219,12 +234,9 @@ function getPlacementScore(placement) {
 function computeMatchScoreBreakdown(playerData, tournamentName, homeRegion, queueRegion) {
   const base = (playerData.totalPR * 10) + (playerData.thisSeasonPR * 5);
 
-  const ownTournamentEvents = playerData.recentEvents
-    .filter(e => e.name === tournamentName)
-    .slice(0, 3);
-  const ownTournamentModifier = ownTournamentEvents.length > 0
-    ? (ownTournamentEvents.reduce((sum, e) => sum + getPlacementScore(e.placement), 0) / ownTournamentEvents.length / 100) * 0.30
-    : 0;
+  const { modifier: ownTournamentModifier } = computeOwnTournamentModifier(
+    playerData.recentEvents, e => e.name === tournamentName
+  );
 
   const soloEvents = playerData.recentEvents
     .filter(e => e.rosterSize === 1 && !/ranked/i.test(e.name))
@@ -251,4 +263,7 @@ function calculateMatchScore(playerData, tournamentName, homeRegion, queueRegion
   return computeMatchScoreBreakdown(playerData, tournamentName, homeRegion, queueRegion).matchScore;
 }
 
-module.exports = { scrapePlayer, scrapePlayerOnce, calculateMatchScore, computeMatchScoreBreakdown };
+module.exports = {
+  scrapePlayer, scrapePlayerOnce, calculateMatchScore, computeMatchScoreBreakdown,
+  computeOwnTournamentModifier, getPlacementScore,
+};
