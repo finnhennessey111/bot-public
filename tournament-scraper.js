@@ -1,6 +1,6 @@
 const puppeteer = require('puppeteer');
 const { proxyLaunchArgs, authenticatePage, blockUnnecessaryResources, logProxyMode, withBrowserSlot } = require('./proxy-config');
-const { resolveRosterSize } = require('./roster-size');
+const { resolveRosterSize, inferRosterSize } = require('./roster-size');
 
 logProxyMode('tournament-scraper');
 
@@ -129,7 +129,12 @@ function buildTournamentGroups(rawSessions) {
     // isTrios only matters as a boolean downstream (buildTournamentEmbed/buildQueueButtons only
     // distinguish Trios vs. Duos) — solo is already blocked above, and squads isn't a format this
     // bot's queue system offers at all, so any non-trios survivor defaults to "Duos" same as today.
-    const isTrios = resolveRosterSize(session.titleLower) === 3;
+    // rosterSize (the raw, possibly-null resolution) is kept on the group too — not just the
+    // derived boolean — so enrichWithDescriptionRosterSize below (scrapeTrackerCalendar) knows
+    // exactly which groups the title+override signals actually left unclassified (null) vs.
+    // genuinely resolved to non-trios (1/2/4), and only spends a description fetch on the former.
+    const rosterSize = resolveRosterSize(session.titleLower);
+    const isTrios = rosterSize === 3;
     const isMultiSession = MULTI_SESSION_KEYWORDS.some(k => session.titleLower.includes(k));
     const isPermanent = PERMANENT_KEYWORDS.some(k => session.titleLower.includes(k));
     const isRankedCup = isRankedCupTitle(session.titleLower);
@@ -142,6 +147,7 @@ function buildTournamentGroups(rawSessions) {
         lastBeginTime: session.beginTime,
         consoleOnly: session.consoleOnly,
         isTrios,
+        rosterSize,
         isMultiSession,
         isPermanent,
         isRankedCup,
@@ -251,6 +257,81 @@ async function fetchRawCalendar() {
   });
 }
 
+// THIRD roster-size signal (after title keyword + the manual override map, both in
+// roster-size.js's resolveRosterSize) — a tournament's own Fortnite Tracker event page
+// (https://fortnitetracker.com/events/{eventId}, the same URL embeds.js's tournament embed link
+// already uses) sometimes states team size in plain English in its description even when the
+// title itself doesn't. Confirmed against real data: "Champion Aphrodite FNCS Cup"'s title has no
+// team-size word at all, but its page's <meta name="description"> reads "...Duo up and compete...",
+// while "PlayStation Typical Gamer Icon Cup" (already in the override map) has no such wording in
+// its description either — this signal genuinely doesn't help every unclassified title, it just
+// helps some of them, reducing how often a brand-new title needs a manual override entry added at
+// all. Only ever called for a title that already has no signal from the first two stages (see
+// enrichWithDescriptionRosterSize below) — never on the scraper.js per-player-event hot path,
+// where a network fetch per unclassified event would be far too expensive to do inline.
+async function fetchEventDescriptionRosterSize(eventId) {
+  return withBrowserSlot(async () => {
+    const browser = await puppeteer.launch({
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-setuid-sandbox', ...proxyLaunchArgs()]
+    });
+
+    try {
+      const page = await browser.newPage();
+      await authenticatePage(page);
+      await blockUnnecessaryResources(page);
+      await page.setUserAgent(
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+      );
+
+      await page.goto(`https://fortnitetracker.com/events/${eventId}`, {
+        waitUntil: 'domcontentloaded',
+        timeout: 20000,
+      });
+
+      const description = await page.evaluate(() => {
+        const meta = document.querySelector('meta[name="description"]') ?? document.querySelector('meta[property="og:description"]');
+        return meta?.content ?? null;
+      });
+
+      if (!description) return null;
+      return inferRosterSize(description.toLowerCase());
+    } finally {
+      await browser.close();
+    }
+  });
+}
+
+// Runs fetchEventDescriptionRosterSize for every group the first two signals left unclassified
+// (rosterSize === null) — mutates isTrios/rosterSize in place on the ones it manages to resolve,
+// leaves everything else exactly as buildTournamentGroups produced it (same "leave unclassified,
+// log it" fallback as before this signal existed). One extra Puppeteer navigation per still-
+// unclassified group, not per session/player — bounded by however many distinct tournaments are
+// currently unclassified (typically zero or a small handful), same order of magnitude as the one
+// navigation scrapeTrackerCalendar already does for the calendar itself. A single group's fetch
+// failing (network error, page shape change, etc.) is logged and skipped, never aborts the rest.
+//
+// Calls fetchEventDescriptionRosterSize through module.exports (not a direct local reference) —
+// same delegation precedent as scraper.js's scrapePlayer/scrapePlayerOnce — so a test can swap in
+// a fake implementation without a real Puppeteer/network round trip.
+async function enrichWithDescriptionRosterSize(groups) {
+  for (const group of groups) {
+    if (group.rosterSize != null || !group.eventId) continue;
+
+    try {
+      const rosterSize = await module.exports.fetchEventDescriptionRosterSize(group.eventId);
+      if (rosterSize != null) {
+        group.rosterSize = rosterSize;
+        group.isTrios = rosterSize === 3;
+        console.log(`  📝 Resolved roster size for "${group.name}" (${group.region}) from its event description: ${rosterSize}`);
+      }
+    } catch (err) {
+      console.error(`  ⚠️ Failed to fetch event description for "${group.name}" (${group.eventId}):`, err.message);
+    }
+  }
+  return groups;
+}
+
 async function scrapeTrackerCalendar() {
   const rawCalendar = await fetchRawCalendar();
 
@@ -287,7 +368,8 @@ async function scrapeTrackerCalendar() {
     }
   }
 
-  return buildTournamentGroups(rawSessions);
+  const groups = buildTournamentGroups(rawSessions);
+  return enrichWithDescriptionRosterSize(groups);
 }
 
 // Returns global tournament-calendar data — identical regardless of which guild (if any) asks,
@@ -302,7 +384,7 @@ async function scrapeUpcomingTournaments() {
 
 module.exports = {
   scrapeUpcomingTournaments, buildTournamentGroups, isBareBuildModeLabel, scrapeTrackerCalendar,
-  isRankedCupTitle,
+  isRankedCupTitle, fetchEventDescriptionRosterSize, enrichWithDescriptionRosterSize,
 };
 
 // Test run

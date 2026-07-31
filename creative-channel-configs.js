@@ -31,4 +31,12 @@ function categoryForAnyMode(mode) {
   return Object.keys(QUEUE_CHANNEL_CONFIGS).find(category => QUEUE_CHANNEL_CONFIGS[category].modes.includes(mode));
 }
 
-module.exports = { QUEUE_CHANNEL_CONFIGS, categoryForAnyMode };
+// 6s/8s is a planned premium feature, not available during the current free-for-everyone period —
+// matchmaker-setup.js's ensureCreativeChannel posts embeds.js's buildCreativeComingSoonEmbed (no
+// queue button) into these categories' channels instead of the real queue embed. The channel
+// itself still gets created normally; only the posted content differs. Remove an entry here once
+// that category actually launches — ensureCreativeChannel falls back to the real queue embed for
+// anything not listed.
+const COMING_SOON_CREATIVE_CATEGORIES = ['6s', '8s'];
+
+module.exports = { QUEUE_CHANNEL_CONFIGS, categoryForAnyMode, COMING_SOON_CREATIVE_CATEGORIES };

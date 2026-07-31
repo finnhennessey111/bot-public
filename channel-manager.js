@@ -7,6 +7,7 @@ const { buildTournamentEmbed, buildRankedCupTournamentEmbed, rankedCupPoolName, 
 const { getQueueCount } = require('./queue');
 const { getRoleId, getCategoryId } = require('./guild-config');
 const playerStore = require('./players');
+const tournamentApproval = require('./tournament-approval');
 
 const EMBED_REFRESH_INTERVAL_MS = 60 * 1000;
 
@@ -370,16 +371,40 @@ async function checkAndCreateChannels(guild, tournaments, pinnedMessages) {
       // until the last session. Everything else groups all future occurrences of the same
       // recurring cup under one scraped entry, so lastBeginTime can be weeks/months out —
       // use this occurrence's own beginTime instead.
-      await createTournamentChannel(guild, {
-        ...tournament,
-        lastBeginTime: tournament.isMultiSession ? tournament.lastBeginTime : tournament.beginTime,
-      }, pinnedMessages);
+      await createTournamentChannel(guild, shapeForCreation(tournament), pinnedMessages);
     }
 
     console.log('✅ Tournament check complete');
 
   } catch (err) {
     console.error('Failed to check tournaments:', err.message);
+  }
+}
+
+// Only genuinely multi-session tournaments (e.g. FNCS) should keep their channel open until the
+// last session. Everything else groups all future occurrences of the same recurring cup under one
+// scraped entry, so lastBeginTime can be weeks/months out — use this occurrence's own beginTime
+// instead. Shared by checkAndCreateChannels' per-guild loop above and
+// createTournamentChannelsAcrossGuilds below (the tournament-approval.js approve path), so an
+// approved tournament gets created with exactly the same deletion timing a normal same-tick
+// creation would have gotten.
+function shapeForCreation(tournament) {
+  return {
+    ...tournament,
+    lastBeginTime: tournament.isMultiSession ? tournament.lastBeginTime : tournament.beginTime,
+  };
+}
+
+// Called once by index.js's tournament_approve_ button handler after tournament-approval.js
+// settles a record as 'approved' — creates the channel in EVERY guild the bot is currently in,
+// mirroring what a normal scheduled tick would have done had this tournament been pre-approved
+// (or not gated at all). Errors in one guild are logged and don't stop the rest — same
+// per-guild-isolation precedent as forEachGuild below.
+async function createTournamentChannelsAcrossGuilds(client, tournament, pinnedMessages) {
+  const shaped = shapeForCreation(tournament);
+  for (const guild of client.guilds.cache.values()) {
+    await createTournamentChannel(guild, shaped, pinnedMessages)
+      .catch(err => console.error(`[tournament-approval] Failed to create channel in guild ${guild.id} for ${tournament.eventId}:`, err.message));
   }
 }
 
@@ -521,7 +546,10 @@ async function forEachGuild(client, action) {
 }
 
 // Scrapes exactly once (never per-guild — see tournament-scraper.js's doc comment on
-// scrapeUpcomingTournaments), then fans the single result out to every guild's
+// scrapeUpcomingTournaments), gates the result through tournament-approval.js's manual-approval
+// check ONCE (before the per-guild loop — critical, since gating per-guild would DM the owner once
+// per server for the same brand-new tournament and race duplicate 'pending' records against each
+// other), then fans only the already-approved tournaments out to every guild's
 // checkAndCreateChannels call. This is what keeps each tick at O(1) Puppeteer navigations
 // regardless of guild count, instead of the O(guilds) it used to be.
 async function runTournamentCheckTick(client, pinnedMessages) {
@@ -532,7 +560,11 @@ async function runTournamentCheckTick(client, pinnedMessages) {
     console.error('Failed to scrape tournaments for this check:', err.message);
     return;
   }
-  await forEachGuild(client, guild => checkAndCreateChannels(guild, tournaments, pinnedMessages));
+
+  const approvedTournaments = await tournamentApproval.gateTournaments(client, tournaments, pinnedMessages);
+  await forEachGuild(client, guild => checkAndCreateChannels(guild, approvedTournaments, pinnedMessages));
+
+  await tournamentApproval.expirePendingApprovals(client).catch(err => console.error('[tournament-approval] Failed to sweep expired approvals:', err.message));
 }
 
 // Scrapes at most once per tick, and only if at least one guild actually has a pinned entry
@@ -593,5 +625,5 @@ function startScheduler(client, pinnedMessages) {
 
 module.exports = {
   startScheduler, checkAndCreateChannels, managedChannels, buildChannelName, abbreviateBuildMode,
-  createTournamentChannel,
+  createTournamentChannel, createTournamentChannelsAcrossGuilds,
 };

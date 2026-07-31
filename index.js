@@ -21,8 +21,9 @@ const { createMatchChannelsForMatch } = require('./match-channels');
 // name for arrays of built player objects, which would otherwise shadow this module import.
 const playerStore = require('./players');
 const epicOAuth = require('./epic-oauth');
-const { startScheduler, checkAndCreateChannels } = require('./channel-manager');
+const { startScheduler, checkAndCreateChannels, createTournamentChannelsAcrossGuilds } = require('./channel-manager');
 const { scrapeUpcomingTournaments } = require('./tournament-scraper');
+const tournamentApproval = require('./tournament-approval');
 const { enforcePermissions, isModMember } = require('./permissions');
 const guildConfig = require('./guild-config');
 const { getRoleId, getChannelId } = guildConfig;
@@ -34,6 +35,7 @@ const { BOT_OWNER_DISCORD_ID } = suggestions;
 const {
   buildTournamentEmbed, buildQueueButtons, buildLeaveQueueButton,
   RANK_TIERS, rankTierByKey, rankedCupPoolName, buildRankedCupTournamentEmbed,
+  buildTournamentApprovalEmbed,
   buildMatchConfirmedEmbed,
   buildUserSelectRow,
   buildTeamBringCountSelectRow, buildTeamMemberUserSelectRow,
@@ -800,7 +802,12 @@ async function handleInteraction(interaction) {
       }
       await interaction.reply({ content: '🔍 Checking tournaments in background... check #master-tournaments shortly.', flags: 64 });
       scrapeUpcomingTournaments()
-        .then(tournaments => checkAndCreateChannels(interaction.guild, tournaments, pinnedMessages))
+        // Same approval gate the scheduled tick uses (channel-manager.js's runTournamentCheckTick)
+        // — a brand-new tournament still gets DMed for approval here, not created immediately,
+        // even though this command is guild-scoped (the gate itself is global, see
+        // tournament-approval.js's doc comment on why it can't run per-guild).
+        .then(tournaments => tournamentApproval.gateTournaments(client, tournaments, pinnedMessages))
+        .then(approvedTournaments => checkAndCreateChannels(interaction.guild, approvedTournaments, pinnedMessages))
         .catch(console.error);
     }
 
@@ -1238,6 +1245,43 @@ async function handleInteraction(interaction) {
   // ── BUTTON INTERACTIONS ──────────────────────────────────────────────────────
   if (interaction.isButton()) {
     const { customId, user, channelId, guild } = interaction;
+
+    // ── TOURNAMENT APPROVAL (owner DM — approve/reject a brand-new tournament) ────────────────
+    // Clicked from a DM, not a guild channel — deliberately the first branch in this block, before
+    // anything below that assumes `guild` is set. See tournament-approval.js's doc comment for the
+    // full gate design.
+    if (customId.startsWith('tournament_approve_') || customId.startsWith('tournament_reject_')) {
+      await interaction.deferUpdate();
+
+      if (user.id !== tournamentApproval.BOT_OWNER_DISCORD_ID) {
+        // Shouldn't be reachable (only the owner was ever DMed this message), but never let a
+        // forwarded/leaked DM let anyone else decide — silently ignored rather than an error
+        // reply, since a non-owner clicking this has no legitimate action to take here at all.
+        return;
+      }
+
+      const isApprove = customId.startsWith('tournament_approve_');
+      const eventId = customId.replace(isApprove ? 'tournament_approve_' : 'tournament_reject_', '');
+
+      const result = await tournamentApproval.decide(eventId, isApprove ? 'approve' : 'reject');
+
+      if (!result.applied) {
+        // Already decided (double-click) or expired out from under this click between the DM
+        // being sent and the button being pressed — the embed already reflects whichever settled
+        // state won; just leave it as-is rather than overwriting a real decision with nothing.
+        return;
+      }
+
+      if (result.status === 'approved') {
+        await createTournamentChannelsAcrossGuilds(client, result.tournament, pinnedMessages);
+      }
+
+      await interaction.editReply({
+        embeds: [buildTournamentApprovalEmbed(result.tournament, result.status)],
+        components: [],
+      });
+      return;
+    }
 
     // ── BIO BUTTON ───────────────────────────────────────────────────────────
     if (customId === 'set_bio') {

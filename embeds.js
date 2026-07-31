@@ -105,7 +105,7 @@ function tournamentDescription(region, eventId) {
   const trackerUrl = eventId ? `https://fortnitetracker.com/events/${eventId}` : null;
   return (
     `**Region:** ${region}\n\nQueue up to find a teammate for this tournament.` +
-    (trackerUrl ? `\n\n🔗 [View this event on Fortnite Tracker](${trackerUrl})` : '') +
+    (trackerUrl ? `\n\n🔗 [Check if you're eligible](${trackerUrl})` : '') +
     '\n\n⚠️ **Make sure you\'re actually registered for this event** through Epic\'s own ' +
     'competitive system before queueing here — queueing on MatchMaker only finds you a teammate, ' +
     'it does not register you for the tournament itself.'
@@ -214,6 +214,57 @@ function buildRankedCupQueueButtons(isTrios = false) {
     rows.push(row);
   }
   return rows;
+}
+
+// ── TOURNAMENT APPROVAL (owner DM) ────────────────────────────────────────────
+// A genuinely new tournament (by Fortnite Tracker's own eventId) gets DMed to the developer
+// (tournament-approval.js) with these before any channel is created anywhere — see that module's
+// doc comment for the full gate design. decision is null while still pending, or
+// 'approved'/'rejected'/'expired' once settled — settled DMs show a status line and no buttons
+// (tournament-approval.js edits the same message in place rather than sending a new one).
+function buildTournamentApprovalEmbed(tournament, decision = null) {
+  const startMs = new Date(tournament.beginTime).getTime();
+  const startTs = Math.floor(startMs / 1000);
+
+  const tags = [
+    tournament.isPermanent ? 'Permanent channel (FNCS Division / Victory Cup)' : null,
+    tournament.isRankedCup ? 'Ranked Cup (per-rank queues)' : null,
+    tournament.consoleOnly ? 'Console only' : null,
+  ].filter(Boolean);
+
+  const statusLine = {
+    approved: '✅ **Approved** — channel created across every server.',
+    rejected: '❌ **Rejected** — no channel was created.',
+    expired: '⌛ **Expired** — the tournament\'s start time passed with no decision, so it was skipped.',
+  }[decision];
+
+  return new EmbedBuilder()
+    .setTitle(decision ? '🆕 Tournament review — settled' : '🆕 New tournament detected — approval needed')
+    .setDescription(
+      `**${tournament.name}**\n` +
+      `Region: ${tournament.region}\n` +
+      `Format: ${tournament.isTrios ? 'Trios' : 'Duos'}\n` +
+      `Starts: <t:${startTs}:F> (<t:${startTs}:R>)\n` +
+      (tags.length ? `${tags.join(' • ')}\n` : '') +
+      `Event ID: \`${tournament.eventId}\`` +
+      (statusLine ? `\n\n${statusLine}` : '')
+    )
+    .setColor(decision === 'rejected' ? 0xE74C3C : decision === 'expired' ? 0x95A5A6 : 0x4A90D9);
+}
+
+function buildTournamentApprovalButtons(eventId) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`tournament_approve_${eventId}`)
+      .setLabel('Approve')
+      .setStyle(ButtonStyle.Success)
+      .setEmoji('✅'),
+    new ButtonBuilder()
+      .setCustomId(`tournament_reject_${eventId}`)
+      .setLabel('Reject')
+      .setStyle(ButtonStyle.Danger)
+      .setEmoji('❌'),
+  );
 }
 
 function buildQueueButtons(isTrios = false) {
@@ -529,6 +580,27 @@ function buildTeamFormingButtons(leaderId) {
 // ── CREATIVE QUEUE ────────────────────────────────────────────────────────────
 
 const CREATIVE_COLOR = 0x9B59B6;
+
+const COMING_SOON_CATEGORY_LABEL = { '6s': '3v3', '8s': '4v4' };
+
+// Posted in creative-6s/creative-8s instead of the real queue embed (creative-channel.js's
+// postComingSoonCreativeChannel) — 6s/8s is planned as a paid feature, not available during the
+// current free-for-everyone period. No components/buttons at all, unlike buildCreativeQueueEmbed —
+// there's nothing to queue for yet. The channel itself still gets created by /matchmaker-setup (so
+// launching the real feature later is just swapping this embed's content in place, not creating/
+// deleting channels retroactively) — see matchmaker-setup.js's CREATIVE_CHANNEL_SPECS comment.
+function buildCreativeComingSoonEmbed(category) {
+  const formatLabel = COMING_SOON_CATEGORY_LABEL[category] ?? category;
+  return new EmbedBuilder()
+    .setTitle(`🎮 Creative ${category} (${formatLabel}) — Coming Soon`)
+    .setDescription(
+      `Creative ${category} matchmaking is a planned premium feature and isn't available yet ` +
+      'during the current free-for-everyone period. Check back later — this channel will switch ' +
+      'over to the real queue automatically once it launches.'
+    )
+    .setColor(CREATIVE_COLOR)
+    .setFooter({ text: 'MatchMaker Creative • www.matchmakerbot.xyz' });
+}
 
 // counts: { [mode]: { EU: n, NAC: n } } — computed by the caller (creative-channel.js) so this
 // stays a pure presentation function, same pattern as buildTournamentEmbed's queueCount param.
@@ -1462,6 +1534,8 @@ module.exports = {
   rankedCupPoolName,
   buildRankedCupTournamentEmbed,
   buildRankedCupQueueButtons,
+  buildTournamentApprovalEmbed,
+  buildTournamentApprovalButtons,
   buildSuggestionsChannelEmbed,
   buildSuggestionButtonRow,
   buildMatchCard,
@@ -1476,6 +1550,7 @@ module.exports = {
   buildTeamInviteButtons,
   buildTeamFormingEmbed,
   buildTeamFormingButtons,
+  buildCreativeComingSoonEmbed,
   buildCreativeQueueEmbed,
   buildCreativeQueueComponents,
   buildCreativeMatchCard,

@@ -10,8 +10,8 @@
 const { ChannelType } = require('discord.js');
 const { getGuildConfig, setGuildConfig } = require('./guild-config');
 const { enforcePermissions, botAccessOverwrite } = require('./permissions');
-const { postCreativeQueueChannel } = require('./creative-channel');
-const { QUEUE_CHANNEL_CONFIGS } = require('./creative-channel-configs');
+const { postCreativeQueueChannel, postComingSoonCreativeChannel } = require('./creative-channel');
+const { QUEUE_CHANNEL_CONFIGS, COMING_SOON_CREATIVE_CATEGORIES } = require('./creative-channel-configs');
 const { ACCESS_GATING_ENABLED } = require('./access');
 const changelog = require('./changelog');
 const {
@@ -77,16 +77,17 @@ const CHANNEL_SPECS = [
 // guild-config's `creativeChannels` map (channelId + pinned messageId together), not
 // `channelIds`, matching creative-channel.js's existing storage shape.
 //
-// 6s/8s deliberately excluded — planned as a paid feature, not available during the current
-// free-for-everyone period. This only stops NEW servers' /matchmaker-setup from creating them;
-// servers that already have creative-6s/creative-8s channels from before this change keep them
-// untouched (still tracked in guild-config, still fully functional) — nothing here deletes or
-// disables what already exists. QUEUE_CHANNEL_CONFIGS (creative-channel-configs.js) still
-// includes '6s'/'8s' so those existing channels keep working. Re-add the two specs below to
-// resume creating them once 6s/8s ships as a real premium feature.
+// 6s/8s ARE still created here (unlike an earlier version of this change, which skipped creating
+// them entirely) — but ensureCreativeChannel below posts embeds.js's buildCreativeComingSoonEmbed
+// (no queue button) into them instead of the real queue embed, since 6s/8s is a planned premium
+// feature not available during the current free-for-everyone period. Creating the channel now and
+// swapping its embed content later (once the feature ships) avoids ever needing to create/delete
+// channels retroactively — see creative-channel-configs.js's COMING_SOON_CREATIVE_CATEGORIES.
 const CREATIVE_CHANNEL_SPECS = [
   { key: '1v1', name: 'creative-1v1' },
   { key: '2v2', name: 'creative-2v2' },
+  { key: '6s', name: 'creative-6s' },
+  { key: '8s', name: 'creative-8s' },
 ];
 
 const runningGuilds = new Set();
@@ -152,6 +153,8 @@ async function ensureChannelParent(channel, parentCategoryId, parentLabel) {
 // embed via creative-channel.js's postCreativeQueueChannel — which persists {channelId,
 // messageId} into guild-config's creativeChannels map itself, so no separate save is needed
 // here. Only re-posts the embed if the channel and/or its pinned message are actually missing.
+// COMING_SOON_CREATIVE_CATEGORIES (6s/8s right now) get postComingSoonCreativeChannel instead —
+// same channel-creation/idempotency behavior either way, just different posted content.
 async function ensureCreativeChannel(guild, category, spec, existingCreativeChannels, parentCategoryId) {
   const existing = existingCreativeChannels[category];
 
@@ -180,7 +183,11 @@ async function ensureCreativeChannel(guild, category, spec, existingCreativeChan
     await ensureChannelParent(channel, parentCategoryId, 'Creative');
   }
 
-  await postCreativeQueueChannel(guild.id, channel, category, QUEUE_CHANNEL_CONFIGS[category]);
+  if (COMING_SOON_CREATIVE_CATEGORIES.includes(category)) {
+    await postComingSoonCreativeChannel(guild.id, channel, category);
+  } else {
+    await postCreativeQueueChannel(guild.id, channel, category, QUEUE_CHANNEL_CONFIGS[category]);
+  }
   return channel.id;
 }
 

@@ -8,7 +8,7 @@
 // mode-name list for this category) and `countFn(guildId, mode, region)` explicitly, since
 // 1v1/2v2 are backed by creative-queue.js and 6s/8s by creative-team-queue.js.
 
-const { buildCreativeQueueEmbed, buildCreativeQueueComponents } = require('./embeds');
+const { buildCreativeQueueEmbed, buildCreativeQueueComponents, buildCreativeComingSoonEmbed } = require('./embeds');
 const { REGIONS } = require('./creative-queue');
 const { getCreativeChannelInfo, setGuildConfig } = require('./guild-config');
 
@@ -34,6 +34,20 @@ async function postCreativeQueueChannel(guildId, channel, category, { modes, cou
   return msg;
 }
 
+// 6s/8s during the current free period (embeds.js's buildCreativeComingSoonEmbed) — no
+// components, no queue button, nothing to join yet. Persists {channelId, messageId} into
+// guild-config the same way postCreativeQueueChannel does, so the future real-launch change just
+// has to edit this same message in place rather than create/delete anything.
+async function postComingSoonCreativeChannel(guildId, channel, category) {
+  const embed = buildCreativeComingSoonEmbed(category);
+  const msg = await channel.send({ embeds: [embed] });
+  await msg.pin();
+
+  await setGuildConfig(guildId, { creativeChannels: { [category]: { channelId: channel.id, messageId: msg.id } } });
+
+  return msg;
+}
+
 async function updateCreativeQueueEmbed(guildId, client, category, { modes, countFn }) {
   const stored = getCreativeChannelInfo(guildId, category);
   if (!stored?.channelId || !stored?.messageId) return;
@@ -48,4 +62,4 @@ async function updateCreativeQueueEmbed(guildId, client, category, { modes, coun
   }
 }
 
-module.exports = { postCreativeQueueChannel, updateCreativeQueueEmbed };
+module.exports = { postCreativeQueueChannel, postComingSoonCreativeChannel, updateCreativeQueueEmbed };
