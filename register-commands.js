@@ -42,13 +42,16 @@ const commands = [
     .setName('setup-creative-2v2')
     .setDescription('Post the pinned Creative 2v2 queue embed in this channel (run once)'),
 
+  // Still registered (so the commands don't just vanish/error confusingly), but blocked at the
+  // handler level in index.js — 6s/8s is a planned premium feature, not available during the
+  // current free-for-everyone period.
   new SlashCommandBuilder()
     .setName('setup-creative-6s')
-    .setDescription('Post the pinned Creative 6s (3v3) queue embed in this channel (run once)'),
+    .setDescription('[Coming soon — premium] Post the pinned Creative 6s (3v3) queue embed'),
 
   new SlashCommandBuilder()
     .setName('setup-creative-8s')
-    .setDescription('Post the pinned Creative 8s (4v4) queue embed in this channel (run once)'),
+    .setDescription('[Coming soon — premium] Post the pinned Creative 8s (4v4) queue embed'),
 
   new SlashCommandBuilder()
     .setName('setup-howto')
@@ -95,6 +98,11 @@ const commands = [
     .setName('grant-mod')
     .setDescription('[Owner only] Grant the MatchMaker Mod role to a user')
     .addUserOption(o => o.setName('user').setDescription('User to grant MatchMaker Mod').setRequired(true)),
+
+  new SlashCommandBuilder()
+    .setName('post-update')
+    .setDescription('[Owner only] Post a "Recent Updates" changelog entry, shown in every server\'s #setup')
+    .addStringOption(o => o.setName('entry').setDescription('The changelog entry text').setRequired(true)),
 
   new SlashCommandBuilder()
     .setName('test-webhook')

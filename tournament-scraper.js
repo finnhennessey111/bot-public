@@ -132,6 +132,7 @@ function buildTournamentGroups(rawSessions) {
     const isTrios = resolveRosterSize(session.titleLower) === 3;
     const isMultiSession = MULTI_SESSION_KEYWORDS.some(k => session.titleLower.includes(k));
     const isPermanent = PERMANENT_KEYWORDS.some(k => session.titleLower.includes(k));
+    const isRankedCup = isRankedCupTitle(session.titleLower);
 
     if (!groups[session.key]) {
       groups[session.key] = {
@@ -143,6 +144,7 @@ function buildTournamentGroups(rawSessions) {
         isTrios,
         isMultiSession,
         isPermanent,
+        isRankedCup,
         platforms: session.platforms,
         // Stable identity independent of the rendered title — Fortnite Tracker's own event
         // identifier for this tournament+region+build-mode (e.g. "epicgames_S41_PSTypicalGamer_EU"
@@ -166,6 +168,16 @@ function buildTournamentGroups(rawSessions) {
   console.log(`📋 Grouped into ${Object.keys(groups).length} tournament/region entries`);
 
   return Object.values(groups);
+}
+
+// Ranked Cup tournaments span 6 separate in-game rank tiers (Bronze/Silver/Gold/Platinum/Diamond/
+// Elite) under ONE Fortnite Tracker event listing — confirmed against live scrape data, real
+// titles never mention a rank tier at all ("Duos Ranked Cup (Battle Royale)"/"(Zero Build)"/
+// "(Reload)" is the full set observed, one per build mode per region). embeds.js's
+// buildRankedCupQueueButtons/buildRankedCupTournamentEmbed use this to give the channel one queue
+// button per rank instead of the single generic one every other tournament gets.
+function isRankedCupTitle(nameLower) {
+  return nameLower.includes('ranked cup');
 }
 
 // True if, once every build-mode word/abbreviation is stripped out, nothing recognizable is left —
@@ -290,6 +302,7 @@ async function scrapeUpcomingTournaments() {
 
 module.exports = {
   scrapeUpcomingTournaments, buildTournamentGroups, isBareBuildModeLabel, scrapeTrackerCalendar,
+  isRankedCupTitle,
 };
 
 // Test run

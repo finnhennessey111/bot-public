@@ -13,10 +13,12 @@ const { enforcePermissions, botAccessOverwrite } = require('./permissions');
 const { postCreativeQueueChannel } = require('./creative-channel');
 const { QUEUE_CHANNEL_CONFIGS } = require('./creative-channel-configs');
 const { ACCESS_GATING_ENABLED } = require('./access');
+const changelog = require('./changelog');
 const {
   buildRolesEmbed, buildRolesComponents, buildBioButtonRow, buildRegisterEmbed, buildEpicLinkButtonRow,
   buildHowtoEmbed, buildSetupInstructionsEmbed,
   buildAccessChannelEmbed, buildAccessChannelButtons,
+  buildSuggestionsChannelEmbed, buildSuggestionButtonRow,
 } = require('./embeds');
 
 const ROLE_SPECS = [
@@ -61,6 +63,10 @@ const CHANNEL_SPECS = [
   { key: 'register', name: 'register', category: 'matchmaker' },
   { key: 'getRoles', name: 'get-roles', category: 'matchmaker' },
   { key: 'howto', name: 'how-to-use', category: 'matchmaker' },
+  // Centralized suggest-a-feature (suggestions.js) — one button+modal, forwarded straight to the
+  // developer and stored centrally, rather than free-form messages scattered across dozens of
+  // separate servers' channels. Verified-member-visible (permissions.js's verifiedChannels).
+  { key: 'suggestions', name: 'suggestions', category: 'matchmaker' },
   // Skipped entirely while access gating is disabled (see access.js's ACCESS_GATING_ENABLED) —
   // there's nothing for it to gate right now. Flip that flag back on to have new setups create it
   // again; existing servers that already have #access from before keep it untouched either way.
@@ -70,11 +76,17 @@ const CHANNEL_SPECS = [
 // Creative queue channels — separate from CHANNEL_SPECS above because they're tracked in
 // guild-config's `creativeChannels` map (channelId + pinned messageId together), not
 // `channelIds`, matching creative-channel.js's existing storage shape.
+//
+// 6s/8s deliberately excluded — planned as a paid feature, not available during the current
+// free-for-everyone period. This only stops NEW servers' /matchmaker-setup from creating them;
+// servers that already have creative-6s/creative-8s channels from before this change keep them
+// untouched (still tracked in guild-config, still fully functional) — nothing here deletes or
+// disables what already exists. QUEUE_CHANNEL_CONFIGS (creative-channel-configs.js) still
+// includes '6s'/'8s' so those existing channels keep working. Re-add the two specs below to
+// resume creating them once 6s/8s ships as a real premium feature.
 const CREATIVE_CHANNEL_SPECS = [
   { key: '1v1', name: 'creative-1v1' },
   { key: '2v2', name: 'creative-2v2' },
-  { key: '6s', name: 'creative-6s' },
-  { key: '8s', name: 'creative-8s' },
 ];
 
 const runningGuilds = new Set();
@@ -241,10 +253,12 @@ async function runMatchmakerSetup(guild) {
       // Creative channel IDs are already persisted incrementally, per-channel, inside
       // postCreativeQueueChannel (creative-channel.js) — no separate save needed here.
 
+      const changelogEntries = await changelog.getRecentEntries();
+
       const setupMessageIds = { ...config.setupMessageIds };
       setupMessageIds.setup = await ensurePosted(
         guild.client, config.setupMessageIds, channelIds, 'setup',
-        () => ({ embeds: [buildSetupInstructionsEmbed()] })
+        () => ({ embeds: [buildSetupInstructionsEmbed(changelogEntries)] })
       );
       setupMessageIds.getRoles = await ensurePosted(
         guild.client, config.setupMessageIds, channelIds, 'getRoles',
@@ -264,6 +278,10 @@ async function runMatchmakerSetup(guild) {
       setupMessageIds.register = await ensurePosted(
         guild.client, config.setupMessageIds, channelIds, 'register',
         () => ({ embeds: [buildRegisterEmbed(channelIds.getRoles)], components: [buildEpicLinkButtonRow()] })
+      );
+      setupMessageIds.suggestions = await ensurePosted(
+        guild.client, config.setupMessageIds, channelIds, 'suggestions',
+        () => ({ embeds: [buildSuggestionsChannelEmbed()], components: [buildSuggestionButtonRow()] })
       );
       if (ACCESS_GATING_ENABLED) {
         setupMessageIds.access = await ensurePosted(
@@ -318,8 +336,37 @@ async function runMatchmakerSetup(guild) {
   }
 }
 
+// Pushes a fresh #setup embed (with the latest changelog) to every guild's already-posted setup
+// message, live — called once by index.js's /post-update right after a new changelog entry is
+// saved, so "Recent Updates" reaches every server immediately instead of only the next time each
+// server's admins happen to re-run /matchmaker-setup themselves. Guilds with no #setup message yet
+// (never ran /matchmaker-setup) are silently skipped — nothing to push to.
+async function refreshAllSetupEmbeds(client) {
+  const changelogEntries = await changelog.getRecentEntries();
+  const embed = buildSetupInstructionsEmbed(changelogEntries);
+
+  let refreshed = 0;
+  for (const guild of client.guilds.cache.values()) {
+    const config = getGuildConfig(guild.id);
+    const channelId = config.channelIds?.setup;
+    const messageId = config.setupMessageIds?.setup;
+    if (!channelId || !messageId) continue;
+
+    try {
+      const channel = await guild.channels.fetch(channelId);
+      const msg = await channel.messages.fetch(messageId);
+      await msg.edit({ embeds: [embed] });
+      refreshed++;
+    } catch (err) {
+      console.error(`[changelog] Failed to refresh #setup embed for guild ${guild.id}:`, err.message);
+    }
+  }
+  return refreshed;
+}
+
 module.exports = {
   runMatchmakerSetup,
+  refreshAllSetupEmbeds,
   // Specs exported for testing (e.g. a regression guard confirming no "general" text/voice
   // channel is ever added back) — runMatchmakerSetup itself needs a live Discord guild object to
   // exercise, so asserting against these directly is how that's verified without one.

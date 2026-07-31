@@ -49,7 +49,19 @@ function formatDuration(ms) {
 // progress"/"ending soon" states below — a channel that never auto-deletes has no "ending" state
 // that makes sense to show — but still uses beginTime for an informational "Next event" line, if
 // one is known and still in the future (channel-manager.js keeps this fresh every hourly tick).
-function buildTournamentEmbed(tournamentName, region, queueCount, isTrios = false, beginTime = null, endTime = null, isPermanent = false) {
+//
+// eventId is Fortnite Tracker's own event identifier (tournament-scraper.js's eventId — see
+// buildTournamentGroups' doc comment), null for manually-created channels (/setup-tournament has
+// no scraped schedule to pull one from). When present, https://fortnitetracker.com/events/{eventId}
+// is a real, working per-tournament event page — confirmed against live Fortnite Tracker data
+// (the calendar's own event links resolve there, e.g. /events/epicgames_S41_PSTypicalGamer_EU
+// returns the actual "PlayStation Typical Gamer Icon Cup" event page). The raw calendar JSON this
+// bot scrapes never included a URL/slug field itself, but the eventId it already captures for
+// dedup/rename purposes doubles as the path segment, so no extra scraping was needed for this.
+// Shared by buildTournamentEmbed and buildRankedCupTournamentEmbed below — the countdown/"in
+// progress"/"ending soon"/permanent status logic is identical for both, they just render the
+// result into a different field layout (one queue count vs. a per-rank breakdown).
+function computeTournamentStatus(beginTime, endTime, isPermanent) {
   let color = COLOR_DEFAULT;
   let statusText = null;
 
@@ -82,9 +94,38 @@ function buildTournamentEmbed(tournamentName, region, queueCount, isTrios = fals
     }
   }
 
+  return { color, statusText };
+}
+
+// eventId -> a real, working per-tournament Fortnite Tracker event page, confirmed against live
+// data (e.g. /events/epicgames_S41_PSTypicalGamer_EU resolves to the actual "PlayStation Typical
+// Gamer Icon Cup" page) — see buildTournamentEmbed's doc comment below for the full story on why
+// this needed no extra scraping. Shared with buildRankedCupTournamentEmbed.
+function tournamentDescription(region, eventId) {
+  const trackerUrl = eventId ? `https://fortnitetracker.com/events/${eventId}` : null;
+  return (
+    `**Region:** ${region}\n\nQueue up to find a teammate for this tournament.` +
+    (trackerUrl ? `\n\n🔗 [View this event on Fortnite Tracker](${trackerUrl})` : '') +
+    '\n\n⚠️ **Make sure you\'re actually registered for this event** through Epic\'s own ' +
+    'competitive system before queueing here — queueing on MatchMaker only finds you a teammate, ' +
+    'it does not register you for the tournament itself.'
+  );
+}
+
+// eventId is Fortnite Tracker's own event identifier (tournament-scraper.js's eventId — see
+// buildTournamentGroups' doc comment), null for manually-created channels (/setup-tournament has
+// no scraped schedule to pull one from). When present, https://fortnitetracker.com/events/{eventId}
+// is a real, working per-tournament event page — confirmed against live Fortnite Tracker data
+// (the calendar's own event links resolve there, e.g. /events/epicgames_S41_PSTypicalGamer_EU
+// returns the actual "PlayStation Typical Gamer Icon Cup" event page). The raw calendar JSON this
+// bot scrapes never included a URL/slug field itself, but the eventId it already captures for
+// dedup/rename purposes doubles as the path segment, so no extra scraping was needed for this.
+function buildTournamentEmbed(tournamentName, region, queueCount, isTrios = false, beginTime = null, endTime = null, isPermanent = false, eventId = null) {
+  const { color, statusText } = computeTournamentStatus(beginTime, endTime, isPermanent);
+
   const embed = new EmbedBuilder()
     .setTitle(`🏆 ${tournamentName}`)
-    .setDescription(`**Region:** ${region}\n\nQueue up to find a teammate for this tournament.`)
+    .setDescription(tournamentDescription(region, eventId))
     .setColor(color)
     .addFields(
       ...(statusText ? [{ name: '⏱️ Status', value: statusText }] : []),
@@ -96,6 +137,83 @@ function buildTournamentEmbed(tournamentName, region, queueCount, isTrios = fals
     .setTimestamp();
 
   return embed;
+}
+
+// ── RANKED CUP (per-rank-tier queues) ───────────────────────────────────────
+// Ranked Cup tournaments (tournament-scraper.js's isRankedCupTitle) span 6 separate in-game rank
+// tiers under ONE Fortnite Tracker event listing — confirmed against live scrape data, real titles
+// never mention a rank tier at all ("Duos Ranked Cup (Battle Royale)"/"(Zero Build)"/"(Reload)" is
+// the full set, one per build mode per region). A Bronze player and an Elite player shouldn't be
+// matched together, so this channel type gets one queue button per rank instead of buildQueueButtons'
+// single generic one. Discord buttons only have 5 fixed ButtonStyle values — no custom colors — so
+// a leading emoji is what visually distinguishes each rank's button instead.
+const RANK_TIERS = [
+  { key: 'bronze', label: 'Bronze', emoji: '🟫' },
+  { key: 'silver', label: 'Silver', emoji: '⬜' },
+  { key: 'gold', label: 'Gold', emoji: '🟨' },
+  { key: 'platinum', label: 'Platinum', emoji: '🟦' },
+  { key: 'diamond', label: 'Diamond', emoji: '💠' },
+  { key: 'elite', label: 'Elite', emoji: '⬛' },
+];
+
+function rankTierByKey(key) {
+  return RANK_TIERS.find(r => r.key === key) ?? null;
+}
+
+// The queue POOL name for one rank tier — deliberately different from the real, unmodified
+// tournament name (which stays untouched everywhere scoring/history lookups need Fortnite
+// Tracker's literal name, e.g. buildTournamentPlayerFields' recentEvents match below) so each
+// rank's matching pool (queue.js's queues[key][region]) is a genuinely separate array — a Bronze
+// unit and an Elite unit are never even candidates for each other, since attemptMatchingForQueue
+// only ever compares units within the same pool key.
+function rankedCupPoolName(tournamentName, rankKey) {
+  const tier = rankTierByKey(rankKey);
+  return tier ? `${tournamentName} [${tier.label}]` : tournamentName;
+}
+
+function buildRankedCupTournamentEmbed(tournamentName, region, rankCounts, isTrios = false, beginTime = null, endTime = null, isPermanent = false, eventId = null) {
+  const { color, statusText } = computeTournamentStatus(beginTime, endTime, isPermanent);
+
+  const rankFieldValue = RANK_TIERS
+    .map(tier => `${tier.emoji} **${tier.label}:** ${rankCounts[tier.key] ?? 0}`)
+    .join('\n');
+
+  const embed = new EmbedBuilder()
+    .setTitle(`🏆 ${tournamentName}`)
+    .setDescription(tournamentDescription(region, eventId))
+    .setColor(color)
+    .addFields(
+      ...(statusText ? [{ name: '⏱️ Status', value: statusText }] : []),
+      { name: '🟢 Players Queuing (by rank)', value: rankFieldValue },
+      { name: '📍 Region', value: region, inline: true },
+      { name: '🎮 Format', value: isTrios ? 'Trios' : 'Duos', inline: true },
+    )
+    .setFooter({ text: 'MatchMaker • www.matchmakerbot.xyz' })
+    .setTimestamp();
+
+  return embed;
+}
+
+// customId shape: queue_rank_<duo|lf2>_<rankKey> — queueType mirrors buildQueueButtons' existing
+// duo/lf2 split (Ranked Cups are duos in every real title observed so far, but this stays
+// queueType-generic rather than duo-only in case a trios Ranked Cup ever appears). 3-per-row so
+// all 6 fit across two rows.
+function buildRankedCupQueueButtons(isTrios = false) {
+  const queueType = isTrios ? 'lf2' : 'duo';
+  const rows = [];
+  for (let i = 0; i < RANK_TIERS.length; i += 3) {
+    const row = new ActionRowBuilder().addComponents(
+      RANK_TIERS.slice(i, i + 3).map(tier =>
+        new ButtonBuilder()
+          .setCustomId(`queue_rank_${queueType}_${tier.key}`)
+          .setLabel(tier.label)
+          .setStyle(ButtonStyle.Secondary)
+          .setEmoji(tier.emoji)
+      )
+    );
+    rows.push(row);
+  }
+  return rows;
 }
 
 function buildQueueButtons(isTrios = false) {
@@ -752,8 +870,11 @@ function buildHowtoEmbed() {
 // #setup is mod-role-only (see permissions.js's enforceModOnlyChannels) — this is admin/mod
 // onboarding, never shown to regular members.
 
-function buildSetupInstructionsEmbed() {
-  return new EmbedBuilder()
+// changelogEntries: newest-first, already capped to the last ~5 (changelog.js's getRecentEntries)
+// — one shared global feed across every guild, not per-server. Optional/omittable so every
+// existing call site (and any future one) that doesn't have entries handy still works unchanged.
+function buildSetupInstructionsEmbed(changelogEntries = []) {
+  const embed = new EmbedBuilder()
     .setTitle('🛠️ Admin Setup')
     .setDescription(
       '• Run `/matchmaker-setup` — creates every role, category, channel and starter embed ' +
@@ -774,9 +895,43 @@ function buildSetupInstructionsEmbed() {
         'needs a couple of retries behind the scenes; it should resolve on its own. If it errors ' +
         'outright, have them try again in a minute.\n' +
         '• Still stuck after re-running setup? — contact personalediting2@gmail.com',
-    })
+    });
+
+  if (changelogEntries.length > 0) {
+    const value = changelogEntries
+      .map(e => `• ${e.text} — <t:${Math.floor(new Date(e.createdAt).getTime() / 1000)}:R>`)
+      .join('\n');
+    embed.addFields({ name: '📢 Recent Updates', value });
+  }
+
+  return embed.setColor(0x4A90D9).setFooter({ text: 'MatchMaker' });
+}
+
+// ── SUGGESTIONS ──────────────────────────────────────────────────────────────
+// #suggestions is verified-member-visible (permissions.js's verifiedChannels), one persistent
+// embed with a single button that opens a modal (index.js's suggestion_open/suggestion_modal) —
+// see suggestions.js for the centralized storage + developer-DM forwarding this feeds into.
+function buildSuggestionsChannelEmbed() {
+  return new EmbedBuilder()
+    .setTitle('💡 Suggest a Feature')
+    .setDescription(
+      'Got an idea to make MatchMaker better? Click the button below and it goes straight to the ' +
+      'developer.\n\n' +
+      'This is for feature suggestions only, and goes to MatchMaker\'s developer — not this ' +
+      'server\'s mods. For gameplay help or account issues, check #how-to-use or tag a mod instead.'
+    )
     .setColor(0x4A90D9)
     .setFooter({ text: 'MatchMaker' });
+}
+
+function buildSuggestionButtonRow() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId('suggestion_open')
+      .setLabel('Submit Suggestion')
+      .setStyle(ButtonStyle.Primary)
+      .setEmoji('💡'),
+  );
 }
 
 // ── ROLES ──────────────────────────────────────────────────────────────────
@@ -1302,6 +1457,13 @@ module.exports = {
   buildTournamentEmbed,
   buildQueueButtons,
   buildLeaveQueueButton,
+  RANK_TIERS,
+  rankTierByKey,
+  rankedCupPoolName,
+  buildRankedCupTournamentEmbed,
+  buildRankedCupQueueButtons,
+  buildSuggestionsChannelEmbed,
+  buildSuggestionButtonRow,
   buildMatchCard,
   buildCrossServerPlayerCard,
   mentionOrCrossServerName,

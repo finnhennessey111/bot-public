@@ -10,7 +10,7 @@
 //   1. #register only (ENTRY_CHANNEL_KEYS) — visible to @everyone, no role needed.
 //   2. The Epic OAuth flow (epic-oauth.js / webhook-server.js's /epic-callback) grants the
 //      verified role (auto-created by /matchmaker-setup, stored as roleIds.verified) directly on
-//      a successful link -> unlocks #get-roles, #how-to-use and #access (verifiedChannels).
+//      a successful link -> unlocks #get-roles, #how-to-use, #access, and #suggestions (verifiedChannels).
 // Neither tournament nor creative queue channels are part of this ladder — every server member
 // can see every one of them regardless of role state; only actually queueing still requires the
 // Registered role, checked independently at click-time (index.js's queue_duo/lf2 handler for
@@ -41,6 +41,7 @@ const verifiedChannels = [
   { key: 'getRoles' },
   { key: 'howto' },
   { key: 'access', sendMessages: false },
+  { key: 'suggestions' },
 ];
 
 // Visible only to the MatchMaker Mod role — admin/setup onboarding, never shown to regular

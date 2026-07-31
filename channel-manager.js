@@ -3,7 +3,7 @@
 const { ChannelType, PermissionFlagsBits } = require('discord.js');
 const { scrapeUpcomingTournaments, isBareBuildModeLabel } = require('./tournament-scraper');
 const { savePinnedMessages } = require('./store');
-const { buildTournamentEmbed } = require('./embeds');
+const { buildTournamentEmbed, buildRankedCupTournamentEmbed, rankedCupPoolName, RANK_TIERS } = require('./embeds');
 const { getQueueCount } = require('./queue');
 const { getRoleId, getCategoryId } = require('./guild-config');
 const playerStore = require('./players');
@@ -169,8 +169,16 @@ async function findExistingTournamentChannel(guild, pinnedMessages, tournament, 
   return null;
 }
 
+function computeRankCounts(guildId, tournamentName, region) {
+  const counts = {};
+  for (const tier of RANK_TIERS) {
+    counts[tier.key] = getQueueCount(guildId, rankedCupPoolName(tournamentName, tier.key), region);
+  }
+  return counts;
+}
+
 async function createTournamentChannel(guild, tournament, pinnedMessages) {
-  const { name, region, beginTime, lastBeginTime, isTrios, consoleOnly, isPermanent } = tournament;
+  const { name, region, beginTime, lastBeginTime, isTrios, consoleOnly, isPermanent, isRankedCup } = tournament;
 
   // Last-resort guard: tournament-scraper.js's buildTournamentGroups already drops sessions whose
   // title is nothing but a build-mode label (see isBareBuildModeLabel there) before they ever
@@ -277,10 +285,12 @@ async function createTournamentChannel(guild, tournament, pinnedMessages) {
     // design (see the class-level comment on PERMANENT_KEYWORDS in tournament-scraper.js).
     const deleteAfter = isPermanent ? null : new Date(lastBeginTime).getTime() + CHANNEL_DELETE_BUFFER_MS;
 
-    const { buildQueueButtons } = require('./embeds');
-    const embed = buildTournamentEmbed(name, region, 0, isTrios, beginTime, deleteAfter, isPermanent);
-    const buttons = buildQueueButtons(isTrios);
-    const msg = await channel.send({ embeds: [embed], components: [buttons] });
+    const { buildQueueButtons, buildRankedCupQueueButtons } = require('./embeds');
+    const embed = isRankedCup
+      ? buildRankedCupTournamentEmbed(name, region, computeRankCounts(guild.id, name, region), isTrios, beginTime, deleteAfter, isPermanent, tournament.eventId ?? null)
+      : buildTournamentEmbed(name, region, 0, isTrios, beginTime, deleteAfter, isPermanent, tournament.eventId ?? null);
+    const components = isRankedCup ? buildRankedCupQueueButtons(isTrios) : [buildQueueButtons(isTrios)];
+    const msg = await channel.send({ embeds: [embed], components });
     await msg.pin();
 
     pinnedMessages[channel.id] = {
@@ -290,6 +300,11 @@ async function createTournamentChannel(guild, tournament, pinnedMessages) {
       tournamentEventId: tournament.eventId ?? null,
       region,
       isTrios,
+      // See tournament-scraper.js's isRankedCupTitle — Ranked Cups get one queue button/pool per
+      // in-game rank tier (embeds.js's buildRankedCupQueueButtons/buildRankedCupTournamentEmbed)
+      // instead of the single generic one. index.js's queue_rank_ handler and
+      // updateActiveTournamentEmbeds below both branch on this.
+      isRankedCup: !!isRankedCup,
       // Real, scraped platform-eligibility data (tournament-scraper.js: platforms.length === 1 &&
       // platforms[0] === 'Console') — NOT a Discord-role gate (that was removed separately, see
       // index.js's queue_duo/lf2 handler). This is what queue.js's isCompatiblePlatform reads to
@@ -474,10 +489,20 @@ async function updateActiveTournamentEmbeds(guild, pinnedMessages, backfillTourn
       }
 
       const msg = await channel.messages.fetch(pinned.messageId);
-      const count = getQueueCount(guild.id, pinned.tournamentName, pinned.region);
-      const newEmbed = buildTournamentEmbed(
-        pinned.tournamentName, pinned.region, count, pinned.isTrios, pinned.beginTime, pinned.deleteAt, pinned.permanent
-      );
+      // isRankedCup is only ever set at fresh-creation time (createTournamentChannel above) —
+      // never backfilled onto a pre-existing entry, since that entry's already-sent message still
+      // has the old single generic button, not the per-rank ones this embed layout expects. A
+      // pre-existing Ranked Cup channel just keeps its old plain embed until it's naturally
+      // recreated (these are non-permanent — 2hrs after the tournament begins) with the new logic.
+      const newEmbed = pinned.isRankedCup
+        ? buildRankedCupTournamentEmbed(
+            pinned.tournamentName, pinned.region, computeRankCounts(guild.id, pinned.tournamentName, pinned.region), pinned.isTrios,
+            pinned.beginTime, pinned.deleteAt, pinned.permanent, pinned.tournamentEventId ?? null
+          )
+        : buildTournamentEmbed(
+            pinned.tournamentName, pinned.region, getQueueCount(guild.id, pinned.tournamentName, pinned.region), pinned.isTrios,
+            pinned.beginTime, pinned.deleteAt, pinned.permanent, pinned.tournamentEventId ?? null
+          );
       await msg.edit({ embeds: [newEmbed], components: msg.components });
       console.log(`  ✅ ${channelId} (${pinned.tournamentName}) — embed refreshed`);
     } catch (err) {

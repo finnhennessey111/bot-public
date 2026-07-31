@@ -26,10 +26,14 @@ const { scrapeUpcomingTournaments } = require('./tournament-scraper');
 const { enforcePermissions, isModMember } = require('./permissions');
 const guildConfig = require('./guild-config');
 const { getRoleId, getChannelId } = guildConfig;
-const { runMatchmakerSetup } = require('./matchmaker-setup');
+const { runMatchmakerSetup, refreshAllSetupEmbeds } = require('./matchmaker-setup');
 const { registerCommands } = require('./register-commands');
+const changelog = require('./changelog');
+const suggestions = require('./suggestions');
+const { BOT_OWNER_DISCORD_ID } = suggestions;
 const {
   buildTournamentEmbed, buildQueueButtons, buildLeaveQueueButton,
+  RANK_TIERS, rankTierByKey, rankedCupPoolName, buildRankedCupTournamentEmbed,
   buildMatchConfirmedEmbed,
   buildUserSelectRow,
   buildTeamBringCountSelectRow, buildTeamMemberUserSelectRow,
@@ -693,13 +697,21 @@ async function handleInteraction(interaction) {
       await interaction.editReply({ content: '✅ Roles embed posted.' });
     }
 
-    // /setup-creative-1v1, /setup-creative-2v2, /setup-creative-6s, /setup-creative-8s — all
-    // post wherever the command is run (6s/8s used to target a fixed env-var channel; there's
-    // no per-guild equivalent of that now that config lives in Mongo, so they match 1v1/2v2's
-    // existing "post wherever run" behavior instead).
-    if ([
-      'setup-creative-1v1', 'setup-creative-2v2', 'setup-creative-6s', 'setup-creative-8s',
-    ].includes(interaction.commandName)) {
+    // /setup-creative-6s, /setup-creative-8s — blocked for now. 6s/8s is planned as a paid
+    // feature, not available during the current free-for-everyone period (matchmaker-setup.js's
+    // CREATIVE_CHANNEL_SPECS stopped creating these automatically for the same reason). Existing
+    // creative-6s/creative-8s channels from before this change are untouched and still work —
+    // this only blocks standing up a NEW one via this manual command.
+    if (['setup-creative-6s', 'setup-creative-8s'].includes(interaction.commandName)) {
+      await interaction.reply({
+        content: '🚧 6s/8s creative queues are a planned premium feature and aren\'t available right now.',
+        flags: 64,
+      });
+      return;
+    }
+
+    // /setup-creative-1v1, /setup-creative-2v2 — post wherever the command is run.
+    if (['setup-creative-1v1', 'setup-creative-2v2'].includes(interaction.commandName)) {
       await interaction.deferReply({ flags: 64 });
       if (!isModMember(interaction.guild.id, interaction)) return replyModOnly(interaction);
       const category = interaction.commandName.replace('setup-creative-', '');
@@ -880,20 +892,31 @@ async function handleInteraction(interaction) {
 
       const guildId = interaction.guild.id;
       const tournamentName = interaction.options.getString('tournament');
-      const matchedKey = Object.keys(store.queues).find(k => k.toLowerCase() === tournamentName.toLowerCase());
+      const needle = tournamentName.toLowerCase();
+      // Exact match, OR any Ranked Cup per-rank pool for this tournament — those are stored under
+      // "<tournamentName> [<Rank>]" (embeds.js's rankedCupPoolName), so a mod typing just the
+      // plain tournament name clears every rank's queue in one go instead of needing to know/type
+      // each "[Bronze]"-suffixed pool key individually.
+      const matchedKeys = Object.keys(store.queues).filter(
+        k => k.toLowerCase() === needle || k.toLowerCase().startsWith(`${needle} [`)
+      );
 
-      if (!matchedKey) {
+      if (matchedKeys.length === 0) {
         return interaction.editReply({ content: `❌ No active queue found for "${tournamentName}".` });
       }
 
       let cleared = 0;
-      for (const region of Object.keys(store.queues[matchedKey])) {
-        cleared += getQueueCount(guildId, matchedKey, region);
-        store.queues[matchedKey][region] = [];
+      for (const matchedKey of matchedKeys) {
+        for (const region of Object.keys(store.queues[matchedKey])) {
+          cleared += getQueueCount(guildId, matchedKey, region);
+          store.queues[matchedKey][region] = [];
+        }
       }
       saveQueues();
 
-      await interaction.editReply({ content: `✅ Cleared **${matchedKey}** globally — removed ${cleared} player(s) across all regions and servers.` });
+      await interaction.editReply({
+        content: `✅ Cleared **${tournamentName}** globally (${matchedKeys.length} queue${matchedKeys.length > 1 ? 's' : ''}) — removed ${cleared} player(s) across all regions and servers.`,
+      });
     }
 
     // /force-refresh
@@ -947,6 +970,32 @@ async function handleInteraction(interaction) {
       }
     }
 
+    // /post-update — bot-developer-only (BOT_OWNER_DISCORD_ID, not any per-guild concept — unlike
+    // /grant-mod's server-owner check above, this is the same identity across every server the bot
+    // is in). Appends a global changelog entry (changelog.js) and immediately pushes a refreshed
+    // #setup embed to every server, rather than waiting for each server's admins to happen to
+    // re-run /matchmaker-setup on their own.
+    if (interaction.commandName === 'post-update') {
+      await interaction.deferReply({ flags: 64 });
+
+      if (!BOT_OWNER_DISCORD_ID) {
+        return interaction.editReply({ content: '❌ BOT_OWNER_DISCORD_ID is not configured — this command is disabled.' });
+      }
+      if (interaction.user.id !== BOT_OWNER_DISCORD_ID) {
+        return interaction.editReply({ content: '❌ Only the MatchMaker developer can post changelog updates.' });
+      }
+
+      const text = interaction.options.getString('entry');
+      try {
+        await changelog.postUpdate(text, interaction.user.id);
+        const refreshed = await refreshAllSetupEmbeds(client);
+        await interaction.editReply({ content: `✅ Posted changelog update and refreshed #setup in ${refreshed} server(s).` });
+      } catch (err) {
+        console.error('post-update error:', err);
+        await interaction.editReply({ content: `❌ Failed to post update: ${err.message}` });
+      }
+    }
+
     // /test-webhook — manually runs the same DB-write + cache-invalidation path a real Stripe
     // checkout.session.completed webhook would, with a fabricated expiry instead of a real
     // Stripe subscription (see webhook-server.js's simulateCheckoutCompleted). Lets mods verify
@@ -978,6 +1027,30 @@ async function handleInteraction(interaction) {
       await interaction.reply({ content: `✅ Bio saved: "${bio}"`, flags: 64 });
     }
 
+    // ── SUGGESTION MODAL SUBMIT ────────────────────────────────────────────────
+    // Stores centrally (models/Suggestion.js) AND forwards to the developer via a DM regardless of
+    // which server it came from — see suggestions.js's doc comment. Storage happens first and
+    // independently of the DM succeeding, so a closed-DMs/offline developer never loses a
+    // submission — it's already in Mongo by the time forwardSuggestionToOwner is even attempted.
+    if (interaction.customId === 'suggestion_modal') {
+      await interaction.deferReply({ flags: 64 });
+      const text = interaction.fields.getTextInputValue('suggestion_text');
+      const { guild, user } = interaction;
+
+      try {
+        await suggestions.recordSuggestion({
+          guildId: guild.id, guildName: guild.name, discordId: user.id, discordTag: user.tag, text,
+        });
+      } catch (err) {
+        console.error('Failed to store suggestion:', err);
+        return interaction.editReply({ content: '❌ Failed to save your suggestion — try again in a moment.' });
+      }
+
+      await suggestions.forwardSuggestionToOwner(client, { guildName: guild.name, discordId: user.id, discordTag: user.tag, text })
+        .catch(err => console.error('Failed to DM suggestion to developer (suggestion is still saved):', err.message));
+
+      await interaction.editReply({ content: '✅ Thanks! Your suggestion has been sent to the developer.' });
+    }
   }
 
   // ── SELECT MENUS ─────────────────────────────────────────────────────────────
@@ -1184,6 +1257,24 @@ async function handleInteraction(interaction) {
       await interaction.showModal(modal);
     }
 
+    // ── SUGGESTION BUTTON (posted in #suggestions) ────────────────────────────
+    if (customId === 'suggestion_open') {
+      const modal = new ModalBuilder()
+        .setCustomId('suggestion_modal')
+        .setTitle('Suggest a Feature');
+
+      const suggestionInput = new TextInputBuilder()
+        .setCustomId('suggestion_text')
+        .setLabel('What should MatchMaker add or change?')
+        .setStyle(TextInputStyle.Paragraph)
+        .setPlaceholder('Be as specific as you can — this goes straight to the developer.')
+        .setMaxLength(1000)
+        .setRequired(true);
+
+      modal.addComponents(new ActionRowBuilder().addComponents(suggestionInput));
+      await interaction.showModal(modal);
+    }
+
     // ── EPIC ACCOUNT LINK (posted in #register) ───────────────────────────────
     if (customId === 'epic_link_open') {
       if (channelId !== getChannelId(guild.id, 'register')) {
@@ -1334,6 +1425,124 @@ async function handleInteraction(interaction) {
       }
     }
 
+    // ── RANKED CUP RANK-TIER QUEUE BUTTONS ────────────────────────────────────
+    // customId shape: queue_rank_<duo|lf2>_<rankKey> (embeds.js's buildRankedCupQueueButtons —
+    // only posted on channels where pinned.isRankedCup is true, see tournament-scraper.js's
+    // isRankedCupTitle). Mirrors the queue_duo/queue_lf2 block above almost exactly, except every
+    // queue-management call below (joinQueue/findUnitByDiscordId/removeFromQueue/getQueueCount)
+    // uses the rank-scoped POOL name (embeds.js's rankedCupPoolName) instead of the plain
+    // tournament name — that's what makes each rank's matching pool (queue.js's
+    // queues[poolName][region]) a genuinely separate array, so a Bronze unit is never even a
+    // matching candidate against an Elite one. buildPlayer still gets the REAL tournamentName (for
+    // correct PR/history-based scoring, and so buildTournamentPlayerFields' recentEvents lookup —
+    // which matches on the literal Fortnite Tracker event name — still finds this player's real
+    // history for this tournament instead of falling back to "no history" every time).
+    if (customId.startsWith('queue_rank_')) {
+      await interaction.deferReply({ flags: 64 });
+
+      const pinned = pinnedMessages[channelId];
+      if (!pinned || !pinned.isRankedCup) {
+        return replyAndDismiss(interaction, { content: '❌ Could not find tournament info for this channel.' });
+      }
+
+      const [queueType, rankKey] = customId.replace('queue_rank_', '').split('_');
+      const tier = rankTierByKey(rankKey);
+      if (!tier) {
+        return replyAndDismiss(interaction, { content: '❌ Unknown rank tier.' });
+      }
+
+      const { tournamentName: realTournamentName, region, isTrios, consoleOnly } = pinned;
+      const poolTournamentName = rankedCupPoolName(realTournamentName, rankKey);
+      const joinKey = `${guild.id}:${user.id}`;
+
+      const member = await guild.members.fetch(user.id);
+
+      if (!member.roles.cache.has(getRoleId(guild.id, 'Registered'))) {
+        return replyAndDismiss(interaction, {
+          content: `❌ Complete your profile in <#${getChannelId(guild.id, 'getRoles')}> first (set your region).`,
+        });
+      }
+
+      if (!(await isEpicLinked(guild.id, user.id))) {
+        return replyAndDismiss(interaction, buildEpicLinkRequiredReply(guild.id, user.id));
+      }
+
+      const platform = getPlatformFromMember(guild.id, member);
+
+      const existingTournamentUnit = findUnitByDiscordId(guild.id, user.id);
+      if (existingTournamentUnit) {
+        if (existingTournamentUnit.tournamentName === poolTournamentName && existingTournamentUnit.region === region) {
+          return sendQueueStatusMessage(
+            interaction, `${realTournamentName} (${tier.label})`, existingTournamentUnit.unit.joinedAt, `leave_queue_rank_${rankKey}`
+          );
+        }
+        return replyAndDismiss(interaction, {
+          content: `❌ You are already queued for **${existingTournamentUnit.tournamentName}** (${existingTournamentUnit.region}) — leave that queue before joining another.`,
+        });
+      }
+
+      if (isInCreativeActivity(guild.id, user.id)) {
+        return replyAndDismiss(interaction, { content: '❌ You are already in a creative queue or match. Leave it before queueing for a tournament.' });
+      }
+
+      if (tournamentJoinInProgress.has(joinKey)) {
+        return replyAndDismiss(interaction, {
+          content: '❌ You are already mid-join for a tournament queue. Try again once it resolves.',
+        });
+      }
+
+      const tournamentAccess = await access.checkAccess(user.id);
+      if (!tournamentAccess.allowed) {
+        await notifyCreditWindowStartedIfNeeded(client, user.id, tournamentAccess);
+        return replyAndDismiss(interaction, {
+          embeds: [buildNoAccessEmbed(tournamentAccess)],
+          components: [buildAccessSubscribeButtons()],
+        });
+      }
+
+      tournamentJoinInProgress.add(joinKey);
+      await interaction.editReply({ content: '⏳ Fetching your stats...' });
+
+      try {
+        const { epicUsername, epicId } = await resolveEpicIdentity(guild, member);
+
+        const userData = await playerStore.getPlayer(guild.id, user.id);
+        const homeRegion = userData?.region ?? region;
+
+        const player = await buildPlayer({
+          guildId: guild.id,
+          guildName: guild.name,
+          discordId: user.id,
+          discordUsername: user.username,
+          discordTag: user.tag,
+          epicUsername,
+          epicId,
+          tournamentName: realTournamentName,
+          homeRegion,
+          queueRegion: region,
+          queueType,
+          platform,
+          consoleOnly,
+          ingameRoles: userData?.ingameRoles ?? [],
+          languages: userData?.languages ?? [],
+          ageBracket: userData?.ageBracket ?? null,
+          bio: userData?.bio ?? null,
+        });
+
+        const { unit } = await joinQueue({ guildId: guild.id, players: [player], tournamentName: poolTournamentName, region, queueType });
+
+        await updateRankedCupQueueEmbed(guild.id, channelId);
+
+        await sendQueueStatusMessage(interaction, `${realTournamentName} (${tier.label})`, unit.joinedAt, `leave_queue_rank_${rankKey}`);
+
+      } catch (err) {
+        console.error('Ranked cup queue error:', err);
+        await replyAndDismiss(interaction, { content: `❌ Error joining queue: ${err.message}` });
+      } finally {
+        tournamentJoinInProgress.delete(joinKey);
+      }
+    }
+
     // ── LEAVE QUEUE ──────────────────────────────────────────────────────────
     if (customId === 'leave_queue') {
       await interaction.deferReply({ flags: 64 });
@@ -1346,6 +1555,25 @@ async function handleInteraction(interaction) {
 
       if (removed) {
         await updateQueueEmbed(guild.id, channelId, tournamentName, region, isTrios);
+        await replyAndDismiss(interaction, { content: '✅ You have left the queue.' });
+      } else {
+        await replyAndDismiss(interaction, { content: '❌ You were not in the queue.' });
+      }
+    }
+
+    // ── LEAVE QUEUE (Ranked Cup rank-tier) ─────────────────────────────────────
+    if (customId.startsWith('leave_queue_rank_')) {
+      await interaction.deferReply({ flags: 64 });
+
+      const pinned = pinnedMessages[channelId];
+      if (!pinned) return replyAndDismiss(interaction, { content: '❌ Could not find tournament info.' });
+
+      const rankKey = customId.replace('leave_queue_rank_', '');
+      const poolTournamentName = rankedCupPoolName(pinned.tournamentName, rankKey);
+      const removed = removeFromQueue(guild.id, user.id, poolTournamentName, pinned.region);
+
+      if (removed) {
+        await updateRankedCupQueueEmbed(guild.id, channelId);
         await replyAndDismiss(interaction, { content: '✅ You have left the queue.' });
       } else {
         await replyAndDismiss(interaction, { content: '❌ You were not in the queue.' });
@@ -2037,10 +2265,38 @@ async function updateQueueEmbed(guildId, channelId, tournamentName, region, isTr
 
     const msg = await channel.messages.fetch(pinned.messageId);
     const count = getQueueCount(guildId, tournamentName, region);
-    const newEmbed = buildTournamentEmbed(tournamentName, region, count, isTrios, pinned.beginTime, pinned.deleteAt, pinned.permanent);
+    const newEmbed = buildTournamentEmbed(
+      tournamentName, region, count, isTrios, pinned.beginTime, pinned.deleteAt, pinned.permanent, pinned.tournamentEventId ?? null
+    );
     await msg.edit({ embeds: [newEmbed], components: msg.components });
   } catch (err) {
     console.error('Failed to update queue embed:', err);
+  }
+}
+
+// ── HELPER: UPDATE RANKED CUP QUEUE EMBED ─────────────────────────────────────
+// Same job as updateQueueEmbed above, for Ranked Cup channels — rebuilds the per-rank count
+// breakdown (embeds.js's buildRankedCupTournamentEmbed) instead of a single queueCount, reading
+// each rank tier's own pool via rankedCupPoolName. Components are left untouched (same as
+// updateQueueEmbed) — the 6 rank buttons never change, only the embed's counts do.
+async function updateRankedCupQueueEmbed(guildId, channelId) {
+  try {
+    const channel = await client.channels.fetch(channelId);
+    const pinned = pinnedMessages[channelId];
+    if (!pinned) return;
+
+    const msg = await channel.messages.fetch(pinned.messageId);
+    const rankCounts = {};
+    for (const tier of RANK_TIERS) {
+      rankCounts[tier.key] = getQueueCount(guildId, rankedCupPoolName(pinned.tournamentName, tier.key), pinned.region);
+    }
+    const newEmbed = buildRankedCupTournamentEmbed(
+      pinned.tournamentName, pinned.region, rankCounts, pinned.isTrios, pinned.beginTime, pinned.deleteAt, pinned.permanent,
+      pinned.tournamentEventId ?? null
+    );
+    await msg.edit({ embeds: [newEmbed], components: msg.components });
+  } catch (err) {
+    console.error('Failed to update ranked cup queue embed:', err);
   }
 }
 
