@@ -10,7 +10,7 @@
 const { ChannelType } = require('discord.js');
 const { getGuildConfig, setGuildConfig } = require('./guild-config');
 const { enforcePermissions, botAccessOverwrite } = require('./permissions');
-const { postCreativeQueueChannel, postComingSoonCreativeChannel } = require('./creative-channel');
+const { postCreativeQueueChannel, postComingSoonCreativeChannel, ensureComingSoonCreativeChannel } = require('./creative-channel');
 const { QUEUE_CHANNEL_CONFIGS, COMING_SOON_CREATIVE_CATEGORIES } = require('./creative-channel-configs');
 const { ACCESS_GATING_ENABLED } = require('./access');
 const changelog = require('./changelog');
@@ -157,6 +157,7 @@ async function ensureChannelParent(channel, parentCategoryId, parentLabel) {
 // same channel-creation/idempotency behavior either way, just different posted content.
 async function ensureCreativeChannel(guild, category, spec, existingCreativeChannels, parentCategoryId) {
   const existing = existingCreativeChannels[category];
+  const isComingSoon = COMING_SOON_CREATIVE_CATEGORIES.includes(category);
 
   if (existing?.channelId && existing?.messageId) {
     try {
@@ -164,6 +165,13 @@ async function ensureCreativeChannel(guild, category, spec, existingCreativeChan
       const msg = await channel.messages.fetch(existing.messageId);
       if (channel && msg) {
         await ensureChannelParent(channel, parentCategoryId, 'Creative');
+
+        // Repairs a channel that predates the coming-soon change and still shows the old real
+        // queue embed+buttons — without this, "already exists" would leave it exactly as it was
+        // forever, which is exactly the bug this closes. creative-channel.js's
+        // ensureComingSoonCreativeChannel is a no-op if it's already showing coming-soon content.
+        if (isComingSoon) await ensureComingSoonCreativeChannel(guild.id, channel, category, msg.id);
+
         return existing.channelId;
       }
     } catch {
@@ -183,7 +191,7 @@ async function ensureCreativeChannel(guild, category, spec, existingCreativeChan
     await ensureChannelParent(channel, parentCategoryId, 'Creative');
   }
 
-  if (COMING_SOON_CREATIVE_CATEGORIES.includes(category)) {
+  if (isComingSoon) {
     await postComingSoonCreativeChannel(guild.id, channel, category);
   } else {
     await postCreativeQueueChannel(guild.id, channel, category, QUEUE_CHANNEL_CONFIGS[category]);

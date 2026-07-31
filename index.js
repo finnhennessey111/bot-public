@@ -56,7 +56,7 @@ const {
   removeFromCreativeQueueAnywhere, findCreativeUnitByDiscordId, isInCreativeQueue,
   startCreativeMatchSweep, creativeMatchEvents, getCreativeQueueCount,
 } = require('./creative-queue');
-const { postCreativeQueueChannel, updateCreativeQueueEmbed } = require('./creative-channel');
+const { postCreativeQueueChannel, updateCreativeQueueEmbed, repairComingSoonCreativeChannels } = require('./creative-channel');
 const creativeTeamQueue = require('./creative-team-queue');
 const teamMatchLifecycle = require('./team-match-lifecycle');
 const channelLifecycle = require('./channel-lifecycle');
@@ -510,6 +510,12 @@ client.once('clientReady', async () => {
   for (const guild of client.guilds.cache.values()) {
     enforcePermissions(guild).catch(console.error);
   }
+
+  // One-time self-heal for a guild whose 6s/8s creative channel was set up before the coming-soon
+  // change shipped — without this, such a channel would keep showing its old real queue
+  // embed+buttons forever, since nothing else proactively re-visits it (an admin would have to
+  // remember to manually re-run /matchmaker-setup). See creative-channel.js's doc comment.
+  repairComingSoonCreativeChannels(client).catch(err => console.error('Failed to repair coming-soon creative channels on startup:', err.message));
 
   startScheduler(client, pinnedMessages);
   startMatchSweep();

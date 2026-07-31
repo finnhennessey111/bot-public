@@ -594,9 +594,8 @@ function buildCreativeComingSoonEmbed(category) {
   return new EmbedBuilder()
     .setTitle(`🎮 Creative ${category} (${formatLabel}) — Coming Soon`)
     .setDescription(
-      `Creative ${category} matchmaking is a planned premium feature and isn't available yet ` +
-      'during the current free-for-everyone period. Check back later — this channel will switch ' +
-      'over to the real queue automatically once it launches.'
+      `🎉 Free trial coming soon! Creative ${category} matchmaking isn't open yet — check back soon. ` +
+      'This channel will switch over to the real queue automatically once it launches.'
     )
     .setColor(CREATIVE_COLOR)
     .setFooter({ text: 'MatchMaker Creative • www.matchmakerbot.xyz' });

@@ -1,15 +1,33 @@
 // Verifies the revised 6s/8s handling: /matchmaker-setup creates creative-6s/creative-8s channels
-// (unlike the previous version of this change, which skipped creating them entirely), but posts
+// (unlike an earlier version of this change, which skipped creating them entirely), but posts
 // embeds.js's buildCreativeComingSoonEmbed — no queue button, nothing to join — instead of the
 // real queue embed, since 6s/8s is a planned premium feature not available during the current
-// free-for-everyone period. 1v1/2v2 must be completely unaffected (real embed + buttons, as
-// always). Same withFakeGuildConfig/makeFakeGuild harness as
-// test/matchmaker-category-grouping.test.js, extended so channel.send captures its payload (that
-// test only needed create-call tracking, not the actual embeds/components sent).
+// free-for-everyone period. 1v1/2v2 must be completely unaffected (real embed + buttons, as always).
+//
+// Also verifies the fix for the real deployed bug: a channel that was ALREADY set up before the
+// coming-soon change shipped (still showing the old real queue embed + select-menu/button
+// components) must get REPAIRED — its pinned message edited in place to the coming-soon embed with
+// no components — both when /matchmaker-setup is re-run, AND via the one-time startup self-heal
+// (creative-channel.js's repairComingSoonCreativeChannels, called from index.js's clientReady).
+// Before this fix, ensureCreativeChannel's "already exists" branch returned early without ever
+// touching an existing message's content, so a pre-existing 6s/8s channel kept its old real
+// select-menus/buttons forever — clicking them still attempted a real queue join.
+//
+// Same withFakeGuildConfig/makeFakeGuild harness as test/matchmaker-category-grouping.test.js,
+// extended so channels can be seeded with a pre-existing message (simulating "already set up
+// before this feature shipped") and so channel.send/message.edit capture their payloads.
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-function withFakeGuildConfig(fn) {
+// async + awaiting fn(...) below (rather than `return fn(...)`) is deliberate, not a style choice:
+// `try { return somePromise; } finally { ... }` runs the finally block IMMEDIATELY once the
+// (still-pending) promise is returned, NOT once it settles — so a bare `return fn(...)` restores
+// require.cache while fn's own awaits (multiple runMatchmakerSetup calls, each with real
+// microtask-level async work) are still in flight. Confirmed via a live repro: this let a LATER
+// test's seeded "real queue" message data bleed into an EARLIER, already-finished-looking test's
+// still-executing internals, producing a spurious repair log for a channel that test never touched.
+// Awaiting here ensures the cache is only ever restored after fn has fully completed.
+async function withFakeGuildConfig(fn) {
   const guildConfigPath = require.resolve('../guild-config');
   const dependents = ['../matchmaker-setup', '../permissions', '../creative-channel'].map(require.resolve);
   const previousGuildConfig = require.cache[guildConfigPath];
@@ -44,7 +62,8 @@ function withFakeGuildConfig(fn) {
 
   try {
     const { runMatchmakerSetup, CREATIVE_CHANNEL_SPECS } = require('../matchmaker-setup');
-    return fn(runMatchmakerSetup, () => current, CREATIVE_CHANNEL_SPECS);
+    const { repairComingSoonCreativeChannels } = require('../creative-channel');
+    return await fn(runMatchmakerSetup, () => current, CREATIVE_CHANNEL_SPECS, stub.setGuildConfig, repairComingSoonCreativeChannels);
   } finally {
     delete require.cache[guildConfigPath];
     for (const p of dependents) delete require.cache[p];
@@ -60,19 +79,60 @@ function makeFakeGuild() {
   const channelsById = {};
   const createCalls = [];
   const sentPayloadsByChannelName = {};
+  const editCalls = [];
 
   function makeChannel(name, type, parentId) {
     const id = nextId('chan');
+    let currentMessage = null;
+
     const channel = {
       id, name, type, parentId: parentId ?? null,
       permissionOverwrites: { edit: async () => {} },
-      messages: { fetch: async () => { throw new Error('Unknown Message'); } },
+      messages: {
+        fetch: async (msgId) => {
+          if (currentMessage && currentMessage.id === msgId) return currentMessage;
+          throw new Error('Unknown Message');
+        },
+      },
       send: async (payload) => {
         sentPayloadsByChannelName[name] = payload;
-        return { id: nextId('msg'), pin: async () => {}, edit: async () => {} };
+        currentMessage = {
+          id: nextId('msg'),
+          // Resolved to plain JSON, same as a REAL fetched discord.js Message's .embeds[] (whose
+          // Embed.title is a direct getter, unlike EmbedBuilder — which only exposes .data.title)
+          // — critical for ensureComingSoonCreativeChannel's alreadyComingSoon check below to be
+          // exercised faithfully against this fake the same way it behaves against a real fetch.
+          embeds: (payload.embeds ?? []).map(e => (e.toJSON ? e.toJSON() : e)),
+          components: payload.components ?? [],
+          async pin() {},
+          async edit(editPayload) {
+            editCalls.push({ channelName: name, payload: editPayload });
+            currentMessage.embeds = (editPayload.embeds ?? currentMessage.embeds).map(e => (e.toJSON ? e.toJSON() : e));
+            currentMessage.components = editPayload.components ?? currentMessage.components;
+          },
+        };
+        return currentMessage;
       },
       setParent: async (pid) => { channel.parentId = pid; },
       delete: async () => { throw new Error('unexpected delete'); },
+      // Test-only seam: directly plants a pre-existing pinned message on this channel, bypassing
+      // send() — simulates "this channel was already set up before the coming-soon feature
+      // existed" without polluting sentPayloadsByChannelName/createCalls (which the tests use to
+      // assert what NEW actions happened during the run under test).
+      _seedExistingMessage(payload) {
+        currentMessage = {
+          id: nextId('msg'),
+          embeds: (payload.embeds ?? []).map(e => (e.toJSON ? e.toJSON() : e)),
+          components: payload.components ?? [],
+          async pin() {},
+          async edit(editPayload) {
+            editCalls.push({ channelName: name, payload: editPayload });
+            currentMessage.embeds = (editPayload.embeds ?? currentMessage.embeds).map(e => (e.toJSON ? e.toJSON() : e));
+            currentMessage.components = editPayload.components ?? currentMessage.components;
+          },
+        };
+        return currentMessage.id;
+      },
     };
     return channel;
   }
@@ -97,11 +157,18 @@ function makeFakeGuild() {
     client: { channels: { fetch: async (id) => channelsById[id] ?? null } },
   };
 
-  return { guild, rolesById, channelsById, createCalls, sentPayloadsByChannelName };
+  return { guild, rolesById, channelsById, createCalls, sentPayloadsByChannelName, editCalls, makeChannel };
+}
+
+function fakeRealQueuePayload() {
+  return {
+    embeds: [{ toJSON: () => ({ title: '🎮 Creative 6s Queue' }) }],
+    components: [{ type: 1, components: [{ type: 3, custom_id: 'creative_mode_6s' }] }],
+  };
 }
 
 test('matchmaker-setup: CREATIVE_CHANNEL_SPECS includes 6s and 8s again (channels are created, not skipped)', () => {
-  withFakeGuildConfig((runMatchmakerSetup, getCurrent, CREATIVE_CHANNEL_SPECS) => {
+  return withFakeGuildConfig((runMatchmakerSetup, getCurrent, CREATIVE_CHANNEL_SPECS) => {
     const keys = CREATIVE_CHANNEL_SPECS.map(s => s.key);
     assert.ok(keys.includes('6s'), 'creative-6s must be created (not skipped) during /matchmaker-setup');
     assert.ok(keys.includes('8s'), 'creative-8s must be created (not skipped) during /matchmaker-setup');
@@ -125,7 +192,7 @@ test('a fresh /matchmaker-setup run: creative-6s/creative-8s get created with a 
       assert.equal(payload.components, undefined, `#${name} must have no components (no queue button) — coming soon, nothing to join yet`);
       const embed = payload.embeds[0].toJSON();
       assert.match(embed.title, /coming soon/i, `#${name}'s embed should say Coming Soon`);
-      assert.match(embed.description, /premium/i, `#${name}'s embed should explain it's a planned premium feature`);
+      assert.match(embed.description, /free trial coming soon/i, `#${name}'s embed should use the "Free trial coming soon" wording`);
     }
 
     for (const name of ['creative-1v1', 'creative-2v2']) {
@@ -155,5 +222,65 @@ test('re-running /matchmaker-setup does not re-post or duplicate the coming-soon
     await runMatchmakerSetup(guild);
     const secondRunCreateCount = createCalls.filter(c => c.name === 'creative-6s').length;
     assert.equal(secondRunCreateCount, 1, 're-running setup must not create a second creative-6s channel');
+  });
+});
+
+test('THE ACTUAL BUG: an existing 6s channel from before the coming-soon change (real embed + real components already posted) gets REPAIRED to coming-soon when /matchmaker-setup is re-run', () => {
+  return withFakeGuildConfig(async (runMatchmakerSetup, getCurrent, CREATIVE_CHANNEL_SPECS, setGuildConfig) => {
+    const { guild, editCalls } = makeFakeGuild();
+
+    // Simulate a channel that was already fully set up back when 6s/8s still had the real queue
+    // flow — created directly (bypassing runMatchmakerSetup) with a real embed+components message
+    // already pinned, exactly like a live server hit by this bug would have.
+    const existingChannel = await guild.channels.create({ name: 'creative-6s', type: 0, parent: null });
+    const existingMessageId = existingChannel._seedExistingMessage(fakeRealQueuePayload());
+    await setGuildConfig(guild.id, { creativeChannels: { '6s': { channelId: existingChannel.id, messageId: existingMessageId } } });
+
+    await runMatchmakerSetup(guild);
+
+    const repairEdit = editCalls.find(e => e.channelName === 'creative-6s');
+    assert.ok(repairEdit, 'the pre-existing message must have been edited in place, not left untouched');
+    assert.deepEqual(repairEdit.payload.components, [], 'the edit must strip the old real components — this is what stops the old select-menus/buttons from still working');
+    const embed = repairEdit.payload.embeds[0].toJSON();
+    assert.match(embed.title, /coming soon/i);
+
+    // Fetch the (now-edited) message directly to confirm the channel's actual current state.
+    const finalMsg = await existingChannel.messages.fetch(existingMessageId);
+    assert.deepEqual(finalMsg.components, [], 'no components left on the message — nothing left to click that would attempt a real queue join');
+  });
+});
+
+test('a SECOND /matchmaker-setup re-run does not re-edit a channel that is already showing the coming-soon embed (no needless API churn)', () => {
+  return withFakeGuildConfig(async (runMatchmakerSetup, getCurrent, CREATIVE_CHANNEL_SPECS, setGuildConfig) => {
+    const { guild, editCalls } = makeFakeGuild();
+    // Scoped to creative-6s/8s only — several OTHER channels (setup/getRoles/howto/register/
+    // suggestions) are edited on EVERY /matchmaker-setup re-run by design (ensurePosted's existing,
+    // unrelated "roll out wording changes" behavior), so a raw total editCalls.length would always
+    // grow between runs regardless of whether this fix works.
+    const creativeEditCount = () => editCalls.filter(e => e.channelName === 'creative-6s' || e.channelName === 'creative-8s').length;
+
+    await runMatchmakerSetup(guild); // first run: creates creative-6s/8s fresh with the coming-soon embed already
+    const creativeEditsAfterFirstRun = creativeEditCount();
+
+    await runMatchmakerSetup(guild); // second run: should be a no-op for an already-correct channel
+    assert.equal(creativeEditCount(), creativeEditsAfterFirstRun, 'a channel already showing coming-soon content must not be re-edited on every re-run');
+  });
+});
+
+test('repairComingSoonCreativeChannels (startup self-heal): fixes an already-deployed 6s channel WITHOUT needing an admin to re-run /matchmaker-setup', () => {
+  return withFakeGuildConfig(async (runMatchmakerSetup, getCurrent, CREATIVE_CHANNEL_SPECS, setGuildConfig, repairComingSoonCreativeChannels) => {
+    const { guild, editCalls } = makeFakeGuild();
+
+    const existingChannel = await guild.channels.create({ name: 'creative-8s', type: 0, parent: null });
+    const existingMessageId = existingChannel._seedExistingMessage(fakeRealQueuePayload());
+    await setGuildConfig(guild.id, { creativeChannels: { '8s': { channelId: existingChannel.id, messageId: existingMessageId } } });
+
+    const fakeClient = { guilds: { cache: new Map([[guild.id, guild]]) } };
+    await repairComingSoonCreativeChannels(fakeClient);
+
+    const repairEdit = editCalls.find(e => e.channelName === 'creative-8s');
+    assert.ok(repairEdit, 'the startup self-heal must edit the pre-existing real-queue message in place');
+    assert.deepEqual(repairEdit.payload.components, []);
+    assert.match(repairEdit.payload.embeds[0].toJSON().title, /coming soon/i);
   });
 });

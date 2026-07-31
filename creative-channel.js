@@ -11,6 +11,7 @@
 const { buildCreativeQueueEmbed, buildCreativeQueueComponents, buildCreativeComingSoonEmbed } = require('./embeds');
 const { REGIONS } = require('./creative-queue');
 const { getCreativeChannelInfo, setGuildConfig } = require('./guild-config');
+const { COMING_SOON_CREATIVE_CATEGORIES } = require('./creative-channel-configs');
 
 function buildCounts(guildId, modes, countFn) {
   const counts = {};
@@ -48,6 +49,61 @@ async function postComingSoonCreativeChannel(guildId, channel, category) {
   return msg;
 }
 
+// Ensures a COMING_SOON_CREATIVE_CATEGORIES channel's pinned message actually shows the coming-
+// soon embed — EDITS an existing message in place if it doesn't already (rather than only ever
+// posting fresh ones), so a channel that predates the coming-soon change and still shows the old
+// real queue embed+buttons gets fixed too. Without this, matchmaker-setup.js's ensureCreativeChannel
+// would find the channel+message already exist and leave them exactly as they were forever — this
+// is what actually closes that gap, called both from ensureCreativeChannel's re-run path and
+// repairComingSoonCreativeChannels' one-time startup sweep below.
+async function ensureComingSoonCreativeChannel(guildId, channel, category, existingMessageId) {
+  const embed = buildCreativeComingSoonEmbed(category);
+
+  if (existingMessageId) {
+    try {
+      const msg = await channel.messages.fetch(existingMessageId);
+      // Skip the edit if it's already showing coming-soon content with no components — avoids a
+      // needless API call on every single /matchmaker-setup re-run once a channel is fixed.
+      const alreadyComingSoon = msg.embeds[0]?.title?.includes('Coming Soon') && (msg.components?.length ?? 0) === 0;
+      if (!alreadyComingSoon) {
+        await msg.edit({ embeds: [embed], components: [] });
+        console.log(`  🩹 Repaired #${channel.name} (creative-${category}) — switched to the Coming Soon embed`);
+      }
+      await setGuildConfig(guildId, { creativeChannels: { [category]: { channelId: channel.id, messageId: msg.id } } });
+      return msg;
+    } catch {
+      // Pinned message is gone — fall through and post a fresh one below.
+    }
+  }
+
+  const msg = await channel.send({ embeds: [embed] });
+  await msg.pin();
+  await setGuildConfig(guildId, { creativeChannels: { [category]: { channelId: channel.id, messageId: msg.id } } });
+  return msg;
+}
+
+// One-time startup self-heal (index.js's clientReady, same placement/precedent as guild-config.js's
+// runGuildConfigMigrations) — fixes every already-deployed 6s/8s channel that was set up before the
+// coming-soon change shipped, WITHOUT needing an admin to manually re-run /matchmaker-setup. Only
+// touches channels guild-config already knows about; a guild with no 6s/8s channel at all is
+// untouched (nothing to repair).
+async function repairComingSoonCreativeChannels(client) {
+  for (const guild of client.guilds.cache.values()) {
+    for (const category of COMING_SOON_CREATIVE_CATEGORIES) {
+      const info = getCreativeChannelInfo(guild.id, category);
+      if (!info?.channelId) continue;
+
+      try {
+        const channel = await guild.channels.fetch(info.channelId).catch(() => null);
+        if (!channel) continue;
+        await ensureComingSoonCreativeChannel(guild.id, channel, category, info.messageId);
+      } catch (err) {
+        console.error(`Failed to repair coming-soon creative channel (${category}) for guild ${guild.id}:`, err.message);
+      }
+    }
+  }
+}
+
 async function updateCreativeQueueEmbed(guildId, client, category, { modes, countFn }) {
   const stored = getCreativeChannelInfo(guildId, category);
   if (!stored?.channelId || !stored?.messageId) return;
@@ -62,4 +118,7 @@ async function updateCreativeQueueEmbed(guildId, client, category, { modes, coun
   }
 }
 
-module.exports = { postCreativeQueueChannel, postComingSoonCreativeChannel, updateCreativeQueueEmbed };
+module.exports = {
+  postCreativeQueueChannel, postComingSoonCreativeChannel, ensureComingSoonCreativeChannel,
+  repairComingSoonCreativeChannels, updateCreativeQueueEmbed,
+};
