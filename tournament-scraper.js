@@ -1,5 +1,5 @@
 const puppeteer = require('puppeteer');
-const { proxyLaunchArgs, authenticatePage, blockUnnecessaryResources, logProxyMode, withBrowserSlot } = require('./proxy-config');
+const { proxyLaunchArgs, authenticatePage, blockUnnecessaryResources, logProxyMode, withBrowserSlot, closeBrowserSafely } = require('./proxy-config');
 const { resolveRosterSize, inferRosterSize } = require('./roster-size');
 
 logProxyMode('tournament-scraper');
@@ -252,7 +252,7 @@ async function fetchRawCalendar() {
         return null;
       });
     } finally {
-      await browser.close();
+      await closeBrowserSafely(browser);
     }
   });
 }
@@ -297,7 +297,7 @@ async function fetchEventDescriptionRosterSize(eventId) {
       if (!description) return null;
       return inferRosterSize(description.toLowerCase());
     } finally {
-      await browser.close();
+      await closeBrowserSafely(browser);
     }
   });
 }

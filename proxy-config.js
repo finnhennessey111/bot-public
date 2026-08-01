@@ -52,6 +52,21 @@ const BLOCKED_RESOURCE_TYPES = new Set(['image', 'font', 'stylesheet', 'media'])
 //     imgsvc.trackercdn.com serving real first-party images (player badges, premium icons), and
 //     this endpoint (/api/notifications/fortnite) is a first-party notifications API, not an
 //     ad/tracking call. Stays allowed.
+//   - accounts.google.com, content-autofill.googleapis.com: raised as blocklist candidates after
+//     both showed up repeating every 4-8s in live Webshare traffic. Checked for real, the same way
+//     as everything else here — a fresh Puppeteer capture of both fortnitetracker.com/events and a
+//     real profile page (10s settle window each) shows ZERO requests to either host, and neither
+//     string appears anywhere in either page's rendered HTML (no <link>/<script> reference, unlike
+//     www.google-analytics.com below). Nothing in this codebase's own pages calls them. That's the
+//     opposite of "safe to block, confirmed ad-tech" — it means the traffic pattern that surfaced
+//     them isn't explained by a normal page load at all. Both are well-known signatures of a
+//     Chrome tab that's been left open (Chrome's own background autofill-prediction pings, and a
+//     Google account/session-related periodic call) rather than something a fresh scrape's page
+//     script requests once and finishes with. Left OFF the blocklist deliberately — see the
+//     browser-close investigation in test/tournament-scraper-browser-close.test.js and this
+//     session's findings: this is stronger evidence of a leaked/orphaned Chromium process
+//     somewhere than it is evidence of missing ad-tech blocking, and blocking the symptom here
+//     would only obscure that if it recurs.
 const BLOCKED_DOMAINS = new Set([
   'ad.doubleclick.net',
   'securepubads.g.doubleclick.net',
@@ -96,6 +111,11 @@ const BLOCKED_DOMAINS = new Set([
   'gum.criteo.com',
   'match.adsrvr.org',
   'www.google.com',
+  // Confirmed via a fresh real capture of fortnitetracker.com/events: the page's own HTML has
+  // `<link rel="preconnect" href="//www.google-analytics.com">` — a genuine analytics preconnect
+  // hint the page ships, same category as region1.google-analytics.com above (the actual GA4
+  // beacon collector), just the preconnect target rather than the collector endpoint itself.
+  'www.google-analytics.com',
 ]);
 
 // Exact-hostname match against BLOCKED_DOMAINS — deliberately not a suffix/subdomain match: the
@@ -196,6 +216,46 @@ async function withBrowserSlot(fn) {
   }
 }
 
+// Confirmed via a real production incident (a headless Chromium process still alive ~2 hours
+// after the scrape that launched it should have finished) AND by reading Puppeteer's own
+// BrowserLauncher.closeBrowser: when the CDP `Browser.close` command is acknowledged promptly (so
+// its own ~180s protocolTimeout never fires), Puppeteer falls through to
+// `await browserProcess.hasClosed()` — a promise that only resolves on the underlying OS
+// process's own 'exit' event, with NO timeout anywhere in that path. If Chrome's actual shutdown
+// stalls (e.g. it's still busy with background page activity — matches what was observed: the
+// same ~15 background hostnames continuing to fire every 4-8s the whole ~2 hours), that wait is
+// genuinely unbounded — none of this codebase's own timeouts (page.goto's, or protocolTimeout)
+// cover this specific step.
+//
+// This races EVERY real browser.close() call in this codebase against a short timeout, force-
+// killing the underlying OS process directly via SIGKILL (bypassing Puppeteer's own close
+// sequence entirely, which is exactly what's stuck) if it doesn't resolve in time. 8s — within the
+// 5-10s range a healthy close should comfortably finish inside, while bounding the worst case to
+// single-digit seconds instead of hours.
+//
+// Deliberately does NOT add its own kill-fallback for a REJECTED browser.close() (as opposed to
+// one that never settles) — Puppeteer's own closeBrowser already force-kills internally before
+// rejecting in that case (see its catch branch), so a second kill here would be redundant; only
+// the "never settles at all" case has no existing safety net, which is what this adds.
+const BROWSER_CLOSE_TIMEOUT_MS = 8000;
+
+async function closeBrowserSafely(browser, timeoutMs = BROWSER_CLOSE_TIMEOUT_MS) {
+  let timer;
+  try {
+    const timedOut = await Promise.race([
+      browser.close().then(() => false),
+      new Promise(resolve => { timer = setTimeout(() => resolve(true), timeoutMs); }),
+    ]);
+
+    if (timedOut) {
+      console.warn(`⚠️ browser.close() did not resolve within ${timeoutMs}ms — force-killing the underlying Chromium process directly (SIGKILL) instead of continuing to wait on it`);
+      browser.process()?.kill('SIGKILL');
+    }
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // Called once at module load by each scraper file, so it's obvious from a fresh startup's logs
 // which path each one is actually running on.
 function logProxyMode(label) {
@@ -210,4 +270,5 @@ module.exports = {
   isProxyConfigured, proxyLaunchArgs, authenticatePage, blockUnnecessaryResources, logProxyMode,
   isBlockedDomain, BLOCKED_DOMAINS,
   withBrowserSlot, MAX_CONCURRENT_BROWSERS,
+  closeBrowserSafely, BROWSER_CLOSE_TIMEOUT_MS,
 };

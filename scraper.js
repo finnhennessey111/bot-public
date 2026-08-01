@@ -1,6 +1,6 @@
 const puppeteer = require('puppeteer');
 const config = require('./config');
-const { proxyLaunchArgs, authenticatePage, blockUnnecessaryResources, logProxyMode, withBrowserSlot } = require('./proxy-config');
+const { proxyLaunchArgs, authenticatePage, blockUnnecessaryResources, logProxyMode, withBrowserSlot, closeBrowserSafely } = require('./proxy-config');
 const { resolveRosterSize } = require('./roster-size');
 
 logProxyMode('scraper');
@@ -117,7 +117,7 @@ async function scrapePlayerOnce(epicUsername, region = 'EU', epicId = null) {
       return parseProfileData(profile, domThisSeasonPR);
 
     } finally {
-      await browser.close();
+      await closeBrowserSafely(browser);
     }
   });
 }
