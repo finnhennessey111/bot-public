@@ -40,7 +40,9 @@ test('scrapePlayer: launches a fresh puppeteer.launch() browser per attempt, clo
         if (record.launchIndex < 3) throw new Error(`simulated navigation timeout (browser #${record.launchIndex})`);
       },
       async evaluate() {
-        return { powerRank: { points: 500 }, prSegments: [], currentSeason: 1, myEvents: [] };
+        // Mirrors the real page.evaluate() contract in scraper.js: { profile, thisSeasonPR }, where
+        // thisSeasonPR is whatever the (here: simulated) DOM "This Season" stat read back.
+        return { profile: { powerRank: { points: 500 }, prSegments: [], currentSeason: 1, myEvents: [] }, thisSeasonPR: 120 };
       },
     };
 
@@ -57,6 +59,7 @@ test('scrapePlayer: launches a fresh puppeteer.launch() browser per attempt, clo
     assert.deepEqual(browserRecords.map(r => r.launchIndex), [1, 2, 3]);
     assert.ok(browserRecords.every(r => r.closed), 'every launched browser (including the two failed attempts) must end up closed');
     assert.equal(result.totalPR, 500);
+    assert.equal(result.thisSeasonPR, 120, 'thisSeasonPR must come from the DOM-extracted value, not prSegments (which is empty here)');
   } finally {
     puppeteer.launch = originalLaunch;
   }

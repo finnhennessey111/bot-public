@@ -78,21 +78,43 @@ async function scrapePlayerOnce(epicUsername, region = 'EU', epicId = null) {
       // blocked unrelated asset can no longer stall a scrape that already has everything it needs.
       await page.goto(url, { waitUntil: 'domcontentloaded', timeout: PLAYER_SCRAPE_NAV_TIMEOUT_MS });
 
-      const data = await page.evaluate(() => {
+      const { profile, thisSeasonPR: domThisSeasonPR } = await page.evaluate(() => {
         const scripts = Array.from(document.querySelectorAll('script'));
+        let profile = null;
         for (const script of scripts) {
           const content = script.innerText || script.textContent;
           if (content.includes('const profile =')) {
             const match = content.match(/const profile = ({.*?});/s);
-            if (match) return JSON.parse(match[1]);
+            if (match) { profile = JSON.parse(match[1]); break; }
           }
         }
-        return null;
+
+        // The live "This Season" PR figure is a continuously-decayed number Fortnite Tracker only
+        // ever server-renders as display text (e.g. "40,262") — confirmed absent from `profile`
+        // above (and every other <script> tag) via a full-payload search against a real, live
+        // account. profile.prSegments' matching season entry is a DIFFERENT, static, non-decaying
+        // historical total that meaningfully OVERSTATES the real current value — confirmed ~16-18%
+        // high on two independent real accounts — so it's read from the rendered DOM instead.
+        // Structure confirmed live: a `.profile-stat__label` div whose text is exactly "This
+        // Season", sharing a `.profile-stat__container` parent with a sibling `.profile-stat__value`
+        // div holding the formatted number (both as its title attribute and its text content).
+        function extractStatValue(label) {
+          const labelEl = Array.from(document.querySelectorAll('.profile-stat__label'))
+            .find(el => el.textContent.trim() === label);
+          if (!labelEl) return null; // confirmed: this whole block doesn't render at all for a player with no competitive/PR history
+          const valueEl = labelEl.parentElement?.querySelector('.profile-stat__value');
+          if (!valueEl) return null;
+          const raw = (valueEl.getAttribute('title') || valueEl.textContent || '').trim();
+          const num = Number(raw.replace(/,/g, ''));
+          return Number.isFinite(num) ? num : null;
+        }
+
+        return { profile, thisSeasonPR: extractStatValue('This Season') };
       });
 
-      if (!data) throw new Error(`Could not find profile data for: ${epicUsername}`);
+      if (!profile) throw new Error(`Could not find profile data for: ${epicUsername}`);
 
-      return parseProfileData(data);
+      return parseProfileData(profile, domThisSeasonPR);
 
     } finally {
       await browser.close();
@@ -118,21 +140,19 @@ async function scrapePlayer(epicUsername, region = 'EU', epicId = null) {
   }
 }
 
-function parseProfileData(data) {
+function parseProfileData(data, domThisSeasonPR) {
   const totalPR = extractPowerRank(data.powerRank);
   const prBand = extractPRBand(data.powerRank);
 
-  // Match the player's segment for the site's authoritative current season — not just
-  // whichever season segment they happen to have the highest number for. A player who
-  // hasn't played the current season has no segment for it, and should show 0, not fall
-  // back to their last-active season's points.
-  let thisSeasonPR = 0;
-  if (data.prSegments && data.currentSeason != null) {
-    const currentSeasonSegment = data.prSegments.find(
-      s => s.segmentType === 'season' && Number(s.segmentValue) === Number(data.currentSeason)
-    );
-    thisSeasonPR = currentSeasonSegment?.points ?? 0;
-  }
+  // domThisSeasonPR comes from the rendered page's own "This Season" stat (scrapePlayerOnce's
+  // page.evaluate) — the real, live, decayed figure. data.prSegments' season-matching entry is
+  // deliberately NOT used, even as a fallback: it's a different, static, non-decaying historical
+  // total confirmed to meaningfully OVERSTATE the real current value (~16-18% high on two
+  // independent real accounts), so falling back to it on a failed DOM read would silently
+  // reintroduce the exact bug this fixes. null (DOM block genuinely absent — confirmed true for a
+  // player with no competitive/PR history at all, not a markup-change false negative in the cases
+  // checked) defaults to 0, same as "hasn't played this season" always meant here.
+  const thisSeasonPR = domThisSeasonPR ?? 0;
 
   const recentEvents = [];
   if (data.myEvents) {
