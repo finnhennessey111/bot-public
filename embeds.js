@@ -267,6 +267,80 @@ function buildTournamentApprovalButtons(eventId) {
   );
 }
 
+// ── TOURNAMENT CHANNEL DELETION UNDO (deleter DM + /restore-channel fallback) ────────────────
+// channel-deletion-undo.js's accidental-deletion flow — see that module's doc comment for the full
+// design. decision is null while still pending (has a Restore button), or
+// 'restored'/'permanently_deleted' once settled (status line, no buttons — the same message is
+// edited in place rather than replaced, same precedent as buildTournamentApprovalEmbed above).
+function buildChannelDeletionUndoEmbed(record, decision = null) {
+  const deletedByLine = record.deletedBy?.tag
+    ? `Deleted by: ${record.deletedBy.tag}`
+    : 'Deleted by: could not be determined from the audit log';
+
+  const expiresTs = Math.floor(new Date(record.expiresAt).getTime() / 1000);
+
+  const statusLine = {
+    restored: '✅ **Restored** — the channel is back, exactly as it was.',
+    permanently_deleted: '🗑️ **Staying deleted** — treated as intentional, the scraper won\'t recreate it.',
+  }[decision];
+
+  return new EmbedBuilder()
+    .setTitle(decision ? '🗑️ Tournament channel deletion — settled' : '🗑️ Tournament channel deleted — was this intentional?')
+    .setDescription(
+      `You just deleted the channel for **${record.tournamentName}** (${record.region}).\n` +
+      `${deletedByLine}\n\n` +
+      (decision
+        ? statusLine
+        : 'If this was accidental, click **Restore** below to recreate it exactly as it was.\n\n' +
+          `If nothing happens by <t:${expiresTs}:F> (<t:${expiresTs}:R>), it'll be treated as intentional ` +
+          'and the scraper won\'t recreate it.')
+    )
+    .setColor(decision === 'restored' ? 0x2ECC71 : decision === 'permanently_deleted' ? 0x95A5A6 : 0xE74C3C);
+}
+
+function buildChannelDeletionUndoButton(recordId) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`restore_channel_${recordId}`)
+      .setLabel('Restore')
+      .setStyle(ButtonStyle.Success)
+      .setEmoji('♻️'),
+  );
+}
+
+// /restore-channel's fallback listing (index.js) — every tournament in this guild still within its
+// restore window, for when the DM was missed or the deleter has DMs disabled. Same
+// restore_channel_<recordId> customId as the DM button above, so index.js's button handler covers
+// both entry points with no special-casing.
+function buildRestoreChannelListEmbed(records) {
+  const lines = records.map(r => {
+    const expiresTs = Math.floor(new Date(r.expiresAt).getTime() / 1000);
+    const deletedByLine = r.deletedBy?.tag ? `deleted by ${r.deletedBy.tag}` : 'deleter unknown';
+    return `**${r.tournamentName}** (${r.region}) — ${deletedByLine} — window closes <t:${expiresTs}:R>`;
+  });
+
+  return new EmbedBuilder()
+    .setTitle('🗑️ Deleted tournament channels — restore window open')
+    .setDescription(lines.join('\n'))
+    .setColor(0xE74C3C)
+    .setFooter({ text: 'MatchMaker' });
+}
+
+function buildRestoreChannelButtons(records) {
+  // Discord caps a message at 5 action rows — records beyond that aren't clickable from this
+  // listing (re-running the command after acting on the first few would surface the rest). In
+  // practice there's realistically never more than one or two pending at once.
+  return records.slice(0, 5).map(r =>
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`restore_channel_${r._id}`)
+        .setLabel(`Restore: ${r.tournamentName}`.slice(0, 80))
+        .setStyle(ButtonStyle.Success)
+        .setEmoji('♻️')
+    )
+  );
+}
+
 function buildQueueButtons(isTrios = false) {
   const row = new ActionRowBuilder();
 
@@ -954,6 +1028,9 @@ function buildSetupInstructionsEmbed(changelogEntries = []) {
       '• Members link their Epic account with the **Link Epic Account** button in #register — ' +
       'that\'s it, everything else is automatic\n' +
       '• Tournament channels appear automatically 48hrs before each tournament\n' +
+      '• Deleted a tournament channel by accident? You\'ll get a DM with a Restore button (24h ' +
+      'window). Missed the DM, or DMs are off? Run `/restore-channel` to see and restore anything ' +
+      'still within its window\n' +
       '• For help: personalediting2@gmail.com'
     )
     .addFields({
@@ -1535,6 +1612,10 @@ module.exports = {
   buildRankedCupQueueButtons,
   buildTournamentApprovalEmbed,
   buildTournamentApprovalButtons,
+  buildChannelDeletionUndoEmbed,
+  buildChannelDeletionUndoButton,
+  buildRestoreChannelListEmbed,
+  buildRestoreChannelButtons,
   buildSuggestionsChannelEmbed,
   buildSuggestionButtonRow,
   buildMatchCard,

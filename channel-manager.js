@@ -8,6 +8,8 @@ const { getQueueCount } = require('./queue');
 const { getRoleId, getCategoryId } = require('./guild-config');
 const playerStore = require('./players');
 const tournamentApproval = require('./tournament-approval');
+const { markSelfDeletion } = require('./self-deletion-tracker');
+const DeletedTournamentChannelModel = require('./models/DeletedTournamentChannel');
 
 const EMBED_REFRESH_INTERVAL_MS = 60 * 1000;
 
@@ -45,6 +47,12 @@ async function deleteManagedChannel(guild, channelId, pinned, pinnedMessages, vi
   try {
     const channel = await guild.channels.fetch(channelId).catch(() => null);
     if (channel) {
+      // Marked BEFORE the actual delete call — channel-deletion-undo.js's channelDelete listener
+      // checks this to tell this expected, bot-initiated deletion apart from a mod manually
+      // deleting the channel in Discord's UI, which is what that flow exists to catch. See
+      // self-deletion-tracker.js's doc comment for why this (not a require cycle between this file
+      // and that one) is the shared signal.
+      markSelfDeletion(channelId);
       await channel.delete();
       console.log(viaSafetyNet
         ? `  🧹 Safety net: deleted overdue channel ${channel.name} (${label}) — no timer had been armed for it`
@@ -190,6 +198,25 @@ async function createTournamentChannel(guild, tournament, pinnedMessages) {
   if (isBareBuildModeLabel(name.toLowerCase())) {
     console.error(`  ❌ Refused to create channel — tournament name is just a build-mode label with no tournament name at all ("${name}")`);
     return;
+  }
+
+  // A mod deleted this exact tournament's channel in this exact guild before, and that deletion is
+  // either still within its 24h confirmation window (channel-deletion-undo.js) or was confirmed
+  // permanent — either way, recreating it here would defeat the whole point of asking. Scoped to
+  // (guild.id, eventId), not eventId alone: the same real tournament's channel in a DIFFERENT guild
+  // is unaffected (see models/DeletedTournamentChannel.js's doc comment). A 'restored' record (or
+  // no record at all) falls through to normal creation — restoring flips status to 'restored'
+  // *before* calling back into this same function to recreate the channel, so that path isn't
+  // blocked by its own gate.
+  if (tournament.eventId) {
+    const deletionRecord = await DeletedTournamentChannelModel.findOne({ guildId: guild.id, eventId: tournament.eventId }).lean();
+    if (deletionRecord && deletionRecord.status !== 'restored') {
+      const reason = deletionRecord.status === 'permanently_deleted'
+        ? 'was permanently deleted here'
+        : 'is awaiting restore-window confirmation';
+      console.log(`  🚫 Skipped — "${name}" (${region}) ${reason} in this server (eventId ${tournament.eventId})`);
+      return;
+    }
   }
 
   // Permanent tournaments (FNCS Divisional Cups) must never get a date-suffixed name — 'fncs'
@@ -625,5 +652,5 @@ function startScheduler(client, pinnedMessages) {
 
 module.exports = {
   startScheduler, checkAndCreateChannels, managedChannels, buildChannelName, abbreviateBuildMode,
-  createTournamentChannel, createTournamentChannelsAcrossGuilds,
+  createTournamentChannel, createTournamentChannelsAcrossGuilds, CHANNEL_DELETE_BUFFER_MS,
 };

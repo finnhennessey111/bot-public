@@ -47,7 +47,12 @@ const CATEGORY_SPECS = [
   // entries below) — groups the bot's generically-named, member-facing channels together instead
   // of scattering them at server root next to a server's own channels, where names like
   // "register" or "how-to-use" are more likely to clash with something the server already has.
-  { key: 'matchmaker', name: 'MatchMaker' },
+  // position: 0 — pinned to the very top of the channel list (not left wherever Discord's default
+  // append-at-the-end placement would put it) so a brand new member's first-ever view of the
+  // server leads with #register, not whatever the server's own channels happen to be. Re-applied
+  // on every /matchmaker-setup re-run (ensureCategory below), not just at creation, so an existing
+  // server that ran setup before this shipped also gets moved, not just fresh ones.
+  { key: 'matchmaker', name: 'MatchMaker', position: 0 },
   // Parent for the four creative queue channels below — gets the bot's ViewChannel/SendMessages
   // set explicitly at creation (unlike the tournament categories above, which rely on each
   // channel's own per-creation overwrite instead), so any channel placed under it inherits bot
@@ -102,16 +107,31 @@ async function ensureRole(guild, existingRoleIds, spec) {
   return created.id;
 }
 
-async function ensureCategory(guild, existingCategoryIds, spec, { permissionOverwrites } = {}) {
+async function ensureCategory(guild, existingCategoryIds, spec, { permissionOverwrites, position } = {}) {
   const existingId = existingCategoryIds[spec.key];
   if (existingId) {
     const existing = await guild.channels.fetch(existingId).catch(() => null);
-    if (existing) return existing.id;
+    if (existing) {
+      // Re-applied on every run (not just once at creation) — an existing server that ran setup
+      // before a spec's position was introduced/changed needs the same move a fresh setup gets,
+      // not just new servers. Skipped when already correct so a routine re-run isn't an API call
+      // that does nothing.
+      if (position !== undefined && existing.position !== position) {
+        try {
+          await existing.setPosition(position);
+          console.log(`  📌 Moved ${spec.name} category to position ${position}`);
+        } catch (err) {
+          console.error(`  ⚠️ Failed to reposition ${spec.name} category:`, err.message);
+        }
+      }
+      return existing.id;
+    }
   }
   const created = await guild.channels.create({
     name: spec.name,
     type: ChannelType.GuildCategory,
     ...(permissionOverwrites ? { permissionOverwrites } : {}),
+    ...(position !== undefined ? { position } : {}),
   });
   return created.id;
 }
@@ -250,7 +270,7 @@ async function runMatchmakerSetup(guild) {
       const categoryIds = { ...config.categoryIds };
       for (const spec of CATEGORY_SPECS) {
         const permissionOverwrites = spec.key === 'creative' ? [botAccessOverwrite(guild)] : undefined;
-        categoryIds[spec.key] = await ensureCategory(guild, config.categoryIds, spec, { permissionOverwrites });
+        categoryIds[spec.key] = await ensureCategory(guild, config.categoryIds, spec, { permissionOverwrites, position: spec.position });
       }
       await setGuildConfig(guild.id, { categoryIds });
 

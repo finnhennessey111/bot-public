@@ -24,6 +24,8 @@ const epicOAuth = require('./epic-oauth');
 const { startScheduler, checkAndCreateChannels, createTournamentChannelsAcrossGuilds } = require('./channel-manager');
 const { scrapeUpcomingTournaments } = require('./tournament-scraper');
 const tournamentApproval = require('./tournament-approval');
+const channelDeletionUndo = require('./channel-deletion-undo');
+const { markSelfDeletion } = require('./self-deletion-tracker');
 const { enforcePermissions, isModMember } = require('./permissions');
 const guildConfig = require('./guild-config');
 const { getRoleId, getChannelId } = guildConfig;
@@ -36,6 +38,7 @@ const {
   buildTournamentEmbed, buildQueueButtons, buildLeaveQueueButton,
   RANK_TIERS, rankTierByKey, rankedCupPoolName, buildRankedCupTournamentEmbed,
   buildTournamentApprovalEmbed,
+  buildChannelDeletionUndoEmbed, buildRestoreChannelListEmbed, buildRestoreChannelButtons,
   buildMatchConfirmedEmbed,
   buildUserSelectRow,
   buildTeamBringCountSelectRow, buildTeamMemberUserSelectRow,
@@ -565,6 +568,7 @@ client.once('clientReady', async () => {
   });
 
   startAccessScheduler(client);
+  channelDeletionUndo.startExpirySweepScheduler(client);
 });
 
 // Only fires for guilds joined WHILE the bot is running — guildConfig.init() (above) handles
@@ -579,6 +583,13 @@ client.on('guildCreate', guild => guildConfig.handleNewGuild(guild).catch(consol
 // until someone notices.
 client.on('guildMemberUpdate', (oldMember, newMember) => {
   guardModRoleGrant(oldMember, newMember).catch(console.error);
+});
+
+// ── ACCIDENTAL TOURNAMENT CHANNEL DELETION ──────────────────────────────────
+// See channel-deletion-undo.js's doc comment for the full flow — fast no-op for anything that
+// isn't an externally-deleted, tracked tournament channel.
+client.on('channelDelete', channel => {
+  channelDeletionUndo.handleChannelDelete(client, channel).catch(console.error);
 });
 
 async function guardModRoleGrant(oldMember, newMember) {
@@ -798,7 +809,29 @@ async function handleInteraction(interaction) {
       await interaction.editReply({ content: `✅ Tournament cancelled. Channel will be deleted in 10 seconds.` });
       delete pinnedMessages[interaction.channelId];
       savePinnedMessages(interaction.guild.id);
+      // A mod running this command IS the "was this intentional?" confirmation — mark it so
+      // channel-deletion-undo.js's channelDelete listener doesn't also DM them asking about a
+      // deletion they just explicitly requested. See self-deletion-tracker.js's doc comment.
+      markSelfDeletion(interaction.channelId);
       setTimeout(() => interaction.channel.delete().catch(console.error), 10000);
+    }
+
+    // /restore-channel — fallback for channel-deletion-undo.js's DM (missed, or the deleter has
+    // DMs disabled): lists every tournament channel in THIS guild still within its 24h restore
+    // window, with a Restore button per entry.
+    if (interaction.commandName === 'restore-channel') {
+      await interaction.deferReply({ flags: 64 });
+      if (!isModMember(interaction.guild.id, interaction)) return replyModOnly(interaction);
+
+      const pending = await channelDeletionUndo.listPendingForGuild(interaction.guild.id);
+      if (pending.length === 0) {
+        return interaction.editReply({ content: 'No tournament channels are currently within their restore window.' });
+      }
+
+      await interaction.editReply({
+        embeds: [buildRestoreChannelListEmbed(pending)],
+        components: buildRestoreChannelButtons(pending),
+      });
     }
 
     // /check-tournaments
@@ -1284,6 +1317,36 @@ async function handleInteraction(interaction) {
 
       await interaction.editReply({
         embeds: [buildTournamentApprovalEmbed(result.tournament, result.status)],
+        components: [],
+      });
+      return;
+    }
+
+    // ── ACCIDENTAL TOURNAMENT CHANNEL DELETION UNDO (deleter DM or /restore-channel fallback) ──
+    // Reached from either the deleter's own DM (no `guild` set — only they could ever click a
+    // button inside their own DM) or /restore-channel's ephemeral, mod-only listing posted in a
+    // guild channel (`guild` set — re-check mod status here since the button itself carries no
+    // gating of its own). See channel-deletion-undo.js's doc comment for the full flow.
+    if (customId.startsWith('restore_channel_')) {
+      await interaction.deferUpdate();
+
+      if (guild && !isModMember(guild.id, interaction)) {
+        // Shouldn't be reachable (this listing is only ever posted ephemerally to the mod who ran
+        // the command), but never let anyone else act on it.
+        return;
+      }
+
+      const recordId = customId.replace('restore_channel_', '');
+      const result = await channelDeletionUndo.restoreChannel(client, recordId);
+
+      if (!result.applied) {
+        // Already decided (double-click) or expired out from under this click — leave whatever
+        // settled state won as-is rather than overwriting it.
+        return;
+      }
+
+      await interaction.editReply({
+        embeds: [buildChannelDeletionUndoEmbed(result.record, 'restored')],
         components: [],
       });
       return;

@@ -35,6 +35,10 @@ const commands = [
     .setDescription('Manually check for upcoming tournaments and create channels'),
 
   new SlashCommandBuilder()
+    .setName('restore-channel')
+    .setDescription('[Mod] List deleted tournament channels still within their 24h restore window'),
+
+  new SlashCommandBuilder()
     .setName('setup-creative-1v1')
     .setDescription('Post the pinned Creative 1v1 queue embed in this channel (run once)'),
 
