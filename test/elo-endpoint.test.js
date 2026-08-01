@@ -123,11 +123,40 @@ test('elo.js: segments always sum exactly to the total score (no rounding gap fo
   try {
     const result = await elo.getPublicElo('SegTest');
     const c = result.creative.components;
-    assert.equal(c.careerPR + c.seasonPR + c.soloPerformance, result.creative.score);
+    assert.equal(c.currentPR + c.seasonPR + c.soloPerformance, result.creative.score);
 
     for (const t of result.tournaments) {
-      const sum = t.components.careerPR + t.components.seasonPR + t.components.soloPerformance + (t.components.ownTournamentPlacement ?? 0);
+      const sum = t.components.currentPR + t.components.seasonPR + t.components.soloPerformance + (t.components.ownTournamentPlacement ?? 0);
       assert.equal(sum, t.score, `segments for ${t.tournamentType} must sum exactly to its score`);
+    }
+  } finally {
+    PlayerModel.find = original;
+  }
+});
+
+// totalPR (scraper.js's extractPowerRank, reading data.powerRank.points) is Fortnite Tracker's
+// continuously-recomputed, decaying "Power Ranking" figure — confirmed live to be the exact number
+// the site headlines on a profile page — NOT a frozen career/lifetime total (that's a genuinely
+// different, separate field, data.powerRank.lifetimePR, never captured or used anywhere in this
+// codebase). components.currentPR (renamed from the misleading careerPR) must reflect that: the
+// old name is gone entirely, not just aliased alongside the new one.
+test('elo.js: the totalPR-derived component is named currentPR, not careerPR — "career" implies a frozen lifetime total, which is not what this figure is', async () => {
+  const original = PlayerModel.find;
+  PlayerModel.find = () => ({
+    lean: async () => [{
+      epicUsername: 'NamingTest', epicUsernameLower: 'namingtest', epicId: 'eNaming', region: 'EU',
+      totalPR: 500, thisSeasonPR: 100, recentEvents: [], lastUpdated: new Date(),
+    }],
+  });
+  try {
+    const result = await elo.getPublicElo('NamingTest');
+
+    assert.equal(result.creative.components.currentPR, 5000, 'currentPR = totalPR * 10, same formula as before, just renamed');
+    assert.equal('careerPR' in result.creative.components, false, 'the old misleading name must be completely gone, not left as a duplicate alias');
+
+    for (const t of result.tournaments) {
+      assert.equal('careerPR' in t.components, false, `${t.tournamentType} components must not have the old careerPR key either`);
+      assert.equal(t.components.currentPR, 5000);
     }
   } finally {
     PlayerModel.find = original;

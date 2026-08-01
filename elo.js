@@ -60,25 +60,33 @@ function labelForKeyword(keyword) {
 }
 
 // Splits a matchScore into UI-ready segments that sum EXACTLY to the total, for a segmented bar on
-// the website — careerPR/seasonPR are already whole numbers (totalPR*10/thisSeasonPR*5, both
+// the website — currentPR/seasonPR are already whole numbers (totalPR*10/thisSeasonPR*5, both
 // integer inputs), but soloModifier/ownTournamentModifier are multiplicative percentages, so their
 // absolute contribution can be fractional. soloPerformance absorbs whatever rounding remainder is
-// left after career+season+ownTournament are each rounded independently, rather than every segment
-// rounding on its own and the total silently drifting off by a point or two.
+// left after current+season+ownTournament are each rounded independently, rather than every
+// segment rounding on its own and the total silently drifting off by a point or two.
+//
+// Named currentPR (not careerPR) deliberately: totalPR (scraper.js's extractPowerRank, reading
+// data.powerRank.points) is Fortnite Tracker's continuously-recomputed, decaying "Power Ranking"
+// figure — confirmed live to be exactly the number the site itself headlines on a profile page —
+// NOT a frozen career/lifetime total (that's a genuinely different, separate field —
+// data.powerRank.lifetimePR — which this codebase never captures or uses at all). "Career" implies
+// a permanent, monotonically-growing sum; this value can and does go back down over time as older
+// results decay out, so "current" is the accurate word.
 function toSegments({ base, soloModifier, ownTournamentModifier, totalPR, thisSeasonPR }) {
   const total = Math.round(base * (1 + soloModifier + ownTournamentModifier));
-  const careerPR = Math.round(totalPR * 10);
+  const currentPR = Math.round(totalPR * 10);
   const seasonPR = Math.round(thisSeasonPR * 5);
   const ownTournamentPlacement = ownTournamentModifier > 0 ? Math.round(base * ownTournamentModifier) : 0;
-  const soloPerformance = total - careerPR - seasonPR - ownTournamentPlacement;
-  return { total, careerPR, seasonPR, ownTournamentPlacement, soloPerformance };
+  const soloPerformance = total - currentPR - seasonPR - ownTournamentPlacement;
+  return { total, currentPR, seasonPR, ownTournamentPlacement, soloPerformance };
 }
 
 // "base" from computeMatchScoreBreakdown IS the PR-only baseline already — totalPR*10 +
 // thisSeasonPR*5, computed before soloModifier/ownTournamentModifier ever get applied — so no
 // separate calculation is needed here, just exposing what was already being computed and thrown
 // away. Rounded for display parity with the (always-integer) final score; base itself is already
-// whole in practice (careerPR/seasonPR are both integer inputs, per toSegments' own comment) but
+// whole in practice (currentPR/seasonPR are both integer inputs, per toSegments' own comment) but
 // rounding here costs nothing and removes any doubt.
 function vsBaselinePercent(score, baseline) {
   if (!baseline) return null; // a brand-new/all-zero PR player — "% above/below zero" is meaningless
@@ -184,7 +192,7 @@ function toExampleEvents(events) {
 
 function buildCreativeElo(playerData, homeRegion, pools) {
   const { base, soloModifier, soloEvents } = computeMatchScoreBreakdown(playerData, NEVER_MATCHES_A_REAL_TOURNAMENT, homeRegion, homeRegion);
-  const { total, careerPR, seasonPR, soloPerformance } = toSegments({
+  const { total, currentPR, seasonPR, soloPerformance } = toSegments({
     base, soloModifier, ownTournamentModifier: 0, totalPR: playerData.totalPR, thisSeasonPR: playerData.thisSeasonPR,
   });
   const baseline = Math.round(base);
@@ -196,7 +204,7 @@ function buildCreativeElo(playerData, homeRegion, pools) {
     vsBaselinePercent: ownVsBaselinePercent,
     relativeToAveragePercent: relativeToAveragePercent(ownVsBaselinePercent, pools.creativeAvgBonus),
     percentile: percentileRank(total, pools.creative),
-    components: { careerPR, seasonPR, soloPerformance },
+    components: { currentPR, seasonPR, soloPerformance },
     examples: { soloPerformance: toExampleEvents(soloEvents) },
   };
 }
@@ -210,7 +218,7 @@ function buildTournamentElo(playerData, homeRegion, pools) {
       playerData.recentEvents, e => e.name.toLowerCase().includes(keyword)
     );
 
-    const { total, careerPR, seasonPR, ownTournamentPlacement, soloPerformance } = toSegments({
+    const { total, currentPR, seasonPR, ownTournamentPlacement, soloPerformance } = toSegments({
       base, soloModifier, ownTournamentModifier, totalPR: playerData.totalPR, thisSeasonPR: playerData.thisSeasonPR,
     });
     const ownVsBaselinePercent = vsBaselinePercent(total, baseline);
@@ -224,7 +232,7 @@ function buildTournamentElo(playerData, homeRegion, pools) {
       relativeToAveragePercent: relativeToAveragePercent(ownVsBaselinePercent, pools.tournamentAvgBonus[keyword]),
       percentile: percentileRank(total, pools.tournaments[keyword]),
       components: {
-        careerPR, seasonPR, soloPerformance,
+        currentPR, seasonPR, soloPerformance,
         // Only present when there's real history — same "just the shared base, no extra modifier"
         // behavior computeMatchScoreBreakdown already has for any tournament a player hasn't
         // played (ownTournamentModifier is 0, so `total` here already equals the creative score
