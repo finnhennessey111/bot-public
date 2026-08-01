@@ -27,6 +27,11 @@
 // formula so it's apples-to-apples) — computed once per request, not twice. Unlike the rest of
 // this endpoint, that pool query is NOT free — see getAllScoredPlayers' doc comment for the scale
 // assumption behind doing it as a live full collection scan.
+//
+// `examples` surfaces up to 3 real events behind soloPerformance/ownTournamentPlacement — the
+// EXACT events those modifiers were computed from (scraper.js's computeMatchScoreBreakdown now
+// also returns soloEvents; computeOwnTournamentModifier already returned matchedEvents), not a
+// separately re-derived "recent events" list. No new selection logic lives here.
 
 const { computeMatchScoreBreakdown, computeOwnTournamentModifier } = require('./scraper');
 const { PERMANENT_KEYWORDS } = require('./tournament-scraper');
@@ -164,8 +169,21 @@ function relativeToAveragePercent(ownPercent, avgPercent) {
   return Math.round((ownPercent - avgPercent) * 10) / 10;
 }
 
+// Up to 3 REAL example events behind a component's number — deliberately capped at 3 for display
+// even for soloPerformance, whose modifier itself draws from up to 5 (scraper.js's
+// computeMatchScoreBreakdown) — "example events", not a full audit trail of every input. Takes the
+// first 3 of whatever was already selected to compute the modifier (both soloEvents and
+// ownTournamentModifier's matchedEvents come back newest-first, same order recentEvents itself is
+// sorted in), so this is genuinely a prefix of the real inputs, not a re-filtered/re-sorted
+// approximation — no re-scrape, no new selection logic, just formatting what already fed the math.
+function toExampleEvents(events) {
+  return events.slice(0, 3).map(e => ({
+    name: e.name, date: e.date, placement: e.placement, prPoints: e.prPoints,
+  }));
+}
+
 function buildCreativeElo(playerData, homeRegion, pools) {
-  const { base, soloModifier } = computeMatchScoreBreakdown(playerData, NEVER_MATCHES_A_REAL_TOURNAMENT, homeRegion, homeRegion);
+  const { base, soloModifier, soloEvents } = computeMatchScoreBreakdown(playerData, NEVER_MATCHES_A_REAL_TOURNAMENT, homeRegion, homeRegion);
   const { total, careerPR, seasonPR, soloPerformance } = toSegments({
     base, soloModifier, ownTournamentModifier: 0, totalPR: playerData.totalPR, thisSeasonPR: playerData.thisSeasonPR,
   });
@@ -179,15 +197,16 @@ function buildCreativeElo(playerData, homeRegion, pools) {
     relativeToAveragePercent: relativeToAveragePercent(ownVsBaselinePercent, pools.creativeAvgBonus),
     percentile: percentileRank(total, pools.creative),
     components: { careerPR, seasonPR, soloPerformance },
+    examples: { soloPerformance: toExampleEvents(soloEvents) },
   };
 }
 
 function buildTournamentElo(playerData, homeRegion, pools) {
-  const { base, soloModifier } = computeMatchScoreBreakdown(playerData, NEVER_MATCHES_A_REAL_TOURNAMENT, homeRegion, homeRegion);
+  const { base, soloModifier, soloEvents } = computeMatchScoreBreakdown(playerData, NEVER_MATCHES_A_REAL_TOURNAMENT, homeRegion, homeRegion);
   const baseline = Math.round(base);
 
   return PERMANENT_KEYWORDS.map(keyword => {
-    const { modifier: ownTournamentModifier, hasHistory } = computeOwnTournamentModifier(
+    const { modifier: ownTournamentModifier, hasHistory, matchedEvents: ownTournamentMatchedEvents } = computeOwnTournamentModifier(
       playerData.recentEvents, e => e.name.toLowerCase().includes(keyword)
     );
 
@@ -212,6 +231,12 @@ function buildTournamentElo(playerData, homeRegion, pools) {
         // exactly); omitted rather than a 0 field so the website can tell "no history" apart from
         // "history that happened to score zero placement value" at a glance.
         ...(hasHistory ? { ownTournamentPlacement } : {}),
+      },
+      examples: {
+        soloPerformance: toExampleEvents(soloEvents),
+        // Same omission rule as components.ownTournamentPlacement above — no history means no real
+        // events to show, not an empty-but-present array implying "checked, found none relevant".
+        ...(hasHistory ? { ownTournamentPlacement: toExampleEvents(ownTournamentMatchedEvents) } : {}),
       },
     };
   });

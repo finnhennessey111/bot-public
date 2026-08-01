@@ -276,7 +276,10 @@ function computeMatchScoreBreakdown(playerData, tournamentName, homeRegion, queu
 
   const matchScore = Math.round(base * (1 + soloModifier + ownTournamentModifier - regionPenalty));
 
-  return { matchScore, base, ownTournamentModifier, soloModifier, regionPenalty };
+  // soloEvents included alongside soloModifier — the exact (up to 5) events the modifier above was
+  // actually computed from, not a re-derived approximation — so a caller (elo.js's public ELO
+  // lookup) can show real example events behind the number instead of just the number itself.
+  return { matchScore, base, ownTournamentModifier, soloModifier, regionPenalty, soloEvents };
 }
 
 function calculateMatchScore(playerData, tournamentName, homeRegion, queueRegion) {

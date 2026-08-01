@@ -160,6 +160,107 @@ test('elo.js: a real linked player with history in SOME (not all) permanent tour
   }
 });
 
+// ── example events behind soloPerformance / ownTournamentPlacement ───────────
+// A real player with MORE qualifying events than either modifier actually uses (6 solo events when
+// only 5 feed soloModifier, 4 FNCS-Division-matching events when only 3 feed ownTournamentModifier)
+// — so a test that just grabbed "the first few events of the matching type" without replicating the
+// modifiers' own filter+slice exactly would silently include the wrong (excluded) event. Interleaved
+// with a ranked solo event (must be excluded from soloEvents, same as the real formula) and a non-
+// solo event (must also be excluded), in real newest-first order, exactly as parseProfileData stores
+// recentEvents.
+test('elo.js: examples.soloPerformance/ownTournamentPlacement return the EXACT (up to 3) events the real modifiers used — not just "some recent events"', async () => {
+  const recentEvents = [
+    { name: 'Solo Cash Cup A', date: '2026-07-30', placement: 5, prPoints: 80, rosterSize: 1, elims: 20 },
+    { name: 'Solo Ranked Cup', date: '2026-07-29', placement: 1, prPoints: 999, rosterSize: 1, elims: 50 }, // solo but RANKED -> must be excluded from soloEvents
+    { name: 'FNCS Division 2', date: '2026-07-28', placement: 8, prPoints: 200, rosterSize: 3, elims: 15 },
+    { name: 'Solo Cash Cup B', date: '2026-07-27', placement: 10, prPoints: 70, rosterSize: 1, elims: 18 },
+    { name: 'Duo Cash Cup', date: '2026-07-26', placement: 3, prPoints: 90, rosterSize: 2, elims: 25 }, // not solo -> must be excluded from soloEvents
+    { name: 'FNCS Division 2', date: '2026-07-25', placement: 12, prPoints: 150, rosterSize: 3, elims: 10 },
+    { name: 'Solo Cash Cup C', date: '2026-07-24', placement: 15, prPoints: 60, rosterSize: 1, elims: 12 },
+    { name: 'Solo Cash Cup D', date: '2026-07-23', placement: 20, prPoints: 50, rosterSize: 1, elims: 10 },
+    { name: 'FNCS Division 3', date: '2026-07-22', placement: 20, prPoints: 100, rosterSize: 3, elims: 5 },
+    { name: 'Solo Cash Cup E', date: '2026-07-21', placement: 25, prPoints: 40, rosterSize: 1, elims: 8 }, // 5th solo -> DOES feed soloModifier, but is beyond the 3-example display cap
+    { name: 'Solo Cash Cup F', date: '2026-07-20', placement: 30, prPoints: 30, rosterSize: 1, elims: 6 }, // 6th solo -> must be excluded from soloEvents entirely (modifier itself only reads 5)
+    { name: 'FNCS Division 1', date: '2026-07-19', placement: 50, prPoints: 50, rosterSize: 3, elims: 2 }, // 4th FNCS-Division match -> must be excluded (modifier itself only reads 3)
+  ];
+
+  const original = PlayerModel.find;
+  PlayerModel.find = () => ({
+    lean: async () => [{
+      epicUsername: 'ExampleEvents', epicUsernameLower: 'exampleevents', epicId: 'eEx', region: 'EU',
+      totalPR: 900, thisSeasonPR: 200, recentEvents, lastUpdated: new Date(),
+    }],
+  });
+  try {
+    const result = await elo.getPublicElo('ExampleEvents');
+
+    // creative.examples.soloPerformance: first 3 of the 5 REAL events soloModifier used (A, B, C) —
+    // not padded to 3 with anything else, and NOT the ranked cup or the duo event even though both
+    // sort earlier/interleaved in recentEvents.
+    assert.deepEqual(result.creative.examples.soloPerformance, [
+      { name: 'Solo Cash Cup A', date: '2026-07-30', placement: 5, prPoints: 80 },
+      { name: 'Solo Cash Cup B', date: '2026-07-27', placement: 10, prPoints: 70 },
+      { name: 'Solo Cash Cup C', date: '2026-07-24', placement: 15, prPoints: 60 },
+    ]);
+
+    const fncs = result.tournaments.find(t => t.tournamentType === 'FNCS Division');
+    assert.equal(fncs.hasHistory, true);
+    // Same soloPerformance examples on the tournament entry (shared soloModifier, same events).
+    assert.deepEqual(fncs.examples.soloPerformance, result.creative.examples.soloPerformance);
+    // ownTournamentPlacement: the 3 REAL matched events (both "FNCS Division 2"s + "FNCS Division
+    // 3"), newest first, NOT the 4th ("FNCS Division 1") which the real modifier itself never reads.
+    assert.deepEqual(fncs.examples.ownTournamentPlacement, [
+      { name: 'FNCS Division 2', date: '2026-07-28', placement: 8, prPoints: 200 },
+      { name: 'FNCS Division 2', date: '2026-07-25', placement: 12, prPoints: 150 },
+      { name: 'FNCS Division 3', date: '2026-07-22', placement: 20, prPoints: 100 },
+    ]);
+
+    const victoryCup = result.tournaments.find(t => t.tournamentType === 'Console Duos Victory Cup');
+    assert.equal(victoryCup.hasHistory, false);
+    assert.equal('ownTournamentPlacement' in victoryCup.examples, false, 'no history -> examples key omitted entirely, not an empty array');
+    assert.deepEqual(victoryCup.examples.soloPerformance, result.creative.examples.soloPerformance, 'no own-tournament history -> still gets the same real soloPerformance examples');
+  } finally {
+    PlayerModel.find = original;
+  }
+});
+
+test('elo.js: examples.soloPerformance returns fewer than 3 (not padded) when the player has fewer than 3 qualifying solo events', async () => {
+  const original = PlayerModel.find;
+  PlayerModel.find = () => ({
+    lean: async () => [{
+      epicUsername: 'OneSolo', epicUsernameLower: 'onesolo', epicId: 'eOne', region: 'EU',
+      totalPR: 400, thisSeasonPR: 50, lastUpdated: new Date(),
+      recentEvents: [
+        { name: 'Only Solo Cup', date: '2026-07-30', placement: 40, prPoints: 20, rosterSize: 1, elims: 5 },
+      ],
+    }],
+  });
+  try {
+    const result = await elo.getPublicElo('OneSolo');
+    assert.deepEqual(result.creative.examples.soloPerformance, [
+      { name: 'Only Solo Cup', date: '2026-07-30', placement: 40, prPoints: 20 },
+    ]);
+  } finally {
+    PlayerModel.find = original;
+  }
+});
+
+test('elo.js: examples.soloPerformance is an empty array (not omitted, not padded) when there are no qualifying solo events at all', async () => {
+  const original = PlayerModel.find;
+  PlayerModel.find = () => ({
+    lean: async () => [{
+      epicUsername: 'NoSolo', epicUsernameLower: 'nosolo', epicId: 'eNoSolo', region: 'EU',
+      totalPR: 400, thisSeasonPR: 50, recentEvents: [], lastUpdated: new Date(),
+    }],
+  });
+  try {
+    const result = await elo.getPublicElo('NoSolo');
+    assert.deepEqual(result.creative.examples.soloPerformance, []);
+  } finally {
+    PlayerModel.find = original;
+  }
+});
+
 // ── baseline (PR-only) vs final score ─────────────────────────────────────────
 // Stubs PlayerModel.find generically enough to answer BOTH queries getPublicElo now issues: the
 // existing epicUsernameLower/epicId lookup (findCanonicalByEpicUsername) AND the new
