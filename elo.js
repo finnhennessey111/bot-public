@@ -11,10 +11,26 @@
 // (neither ever matches a real recentEvents tournament name, so ownTournamentModifier is always 0
 // for creative regardless of which mode string is used) — so this computes it once, generically,
 // rather than once per creative mode.
+//
+// Also exposes derived-not-invented pieces per score: `baseline` (the PR-only portion of the SAME
+// formula, before soloModifier/ownTournamentModifier are applied) and `vsBaselinePercent` (this
+// score vs. that baseline). Note `vsBaselinePercent` can only ever be >= 0 — soloModifier and
+// ownTournamentModifier never go negative in the real formula, and this endpoint always calls it
+// with homeRegion === queueRegion so regionPenalty is always 0 — so it is NOT a genuine above/
+// below-average signal on its own, just "how much bonus is this score carrying over its floor."
+// `relativeToAveragePercent` is the real two-sided comparison: this player's OWN vsBaselinePercent
+// minus the comparison pool's AVERAGE vsBaselinePercent for that same category — positive means a
+// bigger-than-typical bonus (genuinely above average), negative means smaller (genuinely below).
+// `percentile` is this score's rank against every other real scored player's score for that same
+// category. Both `relativeToAveragePercent` and `percentile` are built from the SAME pool
+// (players.js's getAllScoredPlayers, deduped one entry per real account, fed through the SAME
+// formula so it's apples-to-apples) — computed once per request, not twice. Unlike the rest of
+// this endpoint, that pool query is NOT free — see getAllScoredPlayers' doc comment for the scale
+// assumption behind doing it as a live full collection scan.
 
 const { computeMatchScoreBreakdown, computeOwnTournamentModifier } = require('./scraper');
 const { PERMANENT_KEYWORDS } = require('./tournament-scraper');
-const { findCanonicalByEpicUsername } = require('./players');
+const { findCanonicalByEpicUsername, getAllScoredPlayers } = require('./players');
 
 // Never a real tournament title (recentEvents' names all come from real scraped Fortnite Tracker
 // event titles) — passed as computeMatchScoreBreakdown's tournamentName so ownTournamentModifier
@@ -53,20 +69,122 @@ function toSegments({ base, soloModifier, ownTournamentModifier, totalPR, thisSe
   return { total, careerPR, seasonPR, ownTournamentPlacement, soloPerformance };
 }
 
-function buildCreativeElo(playerData, homeRegion) {
+// "base" from computeMatchScoreBreakdown IS the PR-only baseline already — totalPR*10 +
+// thisSeasonPR*5, computed before soloModifier/ownTournamentModifier ever get applied — so no
+// separate calculation is needed here, just exposing what was already being computed and thrown
+// away. Rounded for display parity with the (always-integer) final score; base itself is already
+// whole in practice (careerPR/seasonPR are both integer inputs, per toSegments' own comment) but
+// rounding here costs nothing and removes any doubt.
+function vsBaselinePercent(score, baseline) {
+  if (!baseline) return null; // a brand-new/all-zero PR player — "% above/below zero" is meaningless
+  return Math.round(((score / baseline) - 1) * 1000) / 10;
+}
+
+// Standard "mean rank" percentile: a tie counts as half above/half below rather than all-below or
+// all-above, so (a) a lone top scorer lands just under the 100th percentile instead of getting
+// rounded up to exactly 100 (nobody is "better than everyone including themselves"), and (b) a
+// group of players tied on the same score all land on the exact same, fair percentile instead of
+// an arbitrary tiebreak order. allScores includes the looked-up player's own score (they're a
+// real scored player too), matching how the pool is built in getPublicElo below.
+function percentileRank(score, allScores) {
+  if (allScores.length === 0) return null;
+  let below = 0;
+  let equal = 0;
+  for (const s of allScores) {
+    if (s < score) below++;
+    else if (s === score) equal++;
+  }
+  return Math.round(((below + equal / 2) / allScores.length) * 1000) / 10;
+}
+
+function rawTotal(base, soloModifier, ownTournamentModifier) {
+  return Math.round(base * (1 + soloModifier + ownTournamentModifier));
+}
+
+function average(nums) {
+  if (nums.length === 0) return null;
+  return nums.reduce((sum, n) => sum + n, 0) / nums.length;
+}
+
+// Builds the comparison pools ONCE per request (not once per tournament type) — every scored
+// player's creative score, plus their score for each permanent tournament type, using the SAME
+// "no history in this type -> just the shared base" rule buildTournamentElo below gives the
+// looked-up player, so the pool is genuinely apples-to-apples with what's being ranked against it.
+// homeRegion/queueRegion are passed as the same fixed value for every pool player (not each
+// player's own stored region) deliberately — computeMatchScoreBreakdown's regionPenalty only ever
+// applies when they DIFFER, and elo.js always calls it with homeRegion === queueRegion for the
+// looked-up player too (see buildCreativeElo/buildTournamentElo below), so the actual region value
+// never affects the score either way; fetching each pool player's own region would cost an extra
+// projected field for zero behavioral difference.
+//
+// Also collects each pool player's OWN vsBaselinePercent (their score vs. their own PR floor) so
+// getPublicElo can compare the looked-up player's bonus against the POOL AVERAGE bonus, not just
+// their own floor. That average comparison is the only two-sided signal available here: every
+// individual vsBaselinePercent is >= 0 (soloModifier/ownTournamentModifier never go negative — see
+// vsBaselinePercent's doc comment) — averaging across real players doesn't change that; it turns
+// "am I above MY OWN floor" (always yes/flat) into "am I getting a BIGGER bonus over my floor than
+// the average real player gets over theirs" (a genuine above/below-average comparison).
+function buildScorePools(allPlayers) {
+  const creative = [];
+  const creativeBonuses = [];
+  const tournaments = Object.fromEntries(PERMANENT_KEYWORDS.map(k => [k, []]));
+  const tournamentBonuses = Object.fromEntries(PERMANENT_KEYWORDS.map(k => [k, []]));
+
+  for (const playerData of allPlayers) {
+    const { base, soloModifier } = computeMatchScoreBreakdown(playerData, NEVER_MATCHES_A_REAL_TOURNAMENT, 'EU', 'EU');
+    const baseline = Math.round(base);
+    const creativeScore = rawTotal(base, soloModifier, 0);
+    creative.push(creativeScore);
+    const creativeBonus = vsBaselinePercent(creativeScore, baseline);
+    if (creativeBonus !== null) creativeBonuses.push(creativeBonus);
+
+    for (const keyword of PERMANENT_KEYWORDS) {
+      const { modifier } = computeOwnTournamentModifier(playerData.recentEvents, e => e.name.toLowerCase().includes(keyword));
+      const score = rawTotal(base, soloModifier, modifier);
+      tournaments[keyword].push(score);
+      const bonus = vsBaselinePercent(score, baseline);
+      if (bonus !== null) tournamentBonuses[keyword].push(bonus);
+    }
+  }
+
+  return {
+    creative,
+    tournaments,
+    creativeAvgBonus: average(creativeBonuses),
+    tournamentAvgBonus: Object.fromEntries(PERMANENT_KEYWORDS.map(k => [k, average(tournamentBonuses[k])])),
+  };
+}
+
+// The looked-up player's own vsBaselinePercent minus the pool's average vsBaselinePercent for the
+// same category — positive means a bigger-than-average bonus over their own floor (a real
+// above-average performer), negative means a smaller one (genuinely below-average), even though
+// ownPercent itself can never be negative on its own.
+function relativeToAveragePercent(ownPercent, avgPercent) {
+  if (ownPercent === null || avgPercent === null) return null;
+  return Math.round((ownPercent - avgPercent) * 10) / 10;
+}
+
+function buildCreativeElo(playerData, homeRegion, pools) {
   const { base, soloModifier } = computeMatchScoreBreakdown(playerData, NEVER_MATCHES_A_REAL_TOURNAMENT, homeRegion, homeRegion);
   const { total, careerPR, seasonPR, soloPerformance } = toSegments({
     base, soloModifier, ownTournamentModifier: 0, totalPR: playerData.totalPR, thisSeasonPR: playerData.thisSeasonPR,
   });
+  const baseline = Math.round(base);
+  const ownVsBaselinePercent = vsBaselinePercent(total, baseline);
 
   return {
     score: total,
+    baseline,
+    vsBaselinePercent: ownVsBaselinePercent,
+    relativeToAveragePercent: relativeToAveragePercent(ownVsBaselinePercent, pools.creativeAvgBonus),
+    percentile: percentileRank(total, pools.creative),
     components: { careerPR, seasonPR, soloPerformance },
   };
 }
 
-function buildTournamentElo(playerData, homeRegion) {
+function buildTournamentElo(playerData, homeRegion, pools) {
   const { base, soloModifier } = computeMatchScoreBreakdown(playerData, NEVER_MATCHES_A_REAL_TOURNAMENT, homeRegion, homeRegion);
+  const baseline = Math.round(base);
 
   return PERMANENT_KEYWORDS.map(keyword => {
     const { modifier: ownTournamentModifier, hasHistory } = computeOwnTournamentModifier(
@@ -76,11 +194,16 @@ function buildTournamentElo(playerData, homeRegion) {
     const { total, careerPR, seasonPR, ownTournamentPlacement, soloPerformance } = toSegments({
       base, soloModifier, ownTournamentModifier, totalPR: playerData.totalPR, thisSeasonPR: playerData.thisSeasonPR,
     });
+    const ownVsBaselinePercent = vsBaselinePercent(total, baseline);
 
     return {
       tournamentType: labelForKeyword(keyword),
       hasHistory,
       score: total,
+      baseline,
+      vsBaselinePercent: ownVsBaselinePercent,
+      relativeToAveragePercent: relativeToAveragePercent(ownVsBaselinePercent, pools.tournamentAvgBonus[keyword]),
+      percentile: percentileRank(total, pools.tournaments[keyword]),
       components: {
         careerPR, seasonPR, soloPerformance,
         // Only present when there's real history — same "just the shared base, no extra modifier"
@@ -115,12 +238,18 @@ async function getPublicElo(epicUsername) {
     recentEvents: player.recentEvents ?? [],
   };
 
+  // Fetched only once we know there's a real score to rank — the "registered but never scraped"
+  // branch above already returned, so this never pays for a full scan on a lookup that couldn't
+  // use it anyway.
+  const allPlayers = await getAllScoredPlayers();
+  const pools = buildScorePools(allPlayers);
+
   return {
     found: true,
     hasStats: true,
     epicUsername: player.epicUsername,
-    creative: buildCreativeElo(playerData, homeRegion),
-    tournaments: buildTournamentElo(playerData, homeRegion),
+    creative: buildCreativeElo(playerData, homeRegion, pools),
+    tournaments: buildTournamentElo(playerData, homeRegion, pools),
   };
 }
 

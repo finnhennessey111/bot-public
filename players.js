@@ -43,10 +43,25 @@ async function upsertPlayer(guildId, discordId, fields) {
 // username. Case-insensitive exact match against the indexed epicUsernameLower field — fast enough
 // for a public, repeatedly-hammerable endpoint without needing a regex scan.
 async function findCanonicalByEpicUsername(epicUsername) {
-  const lower = String(epicUsername ?? '').trim().toLowerCase();
-  if (!lower) return null;
+  const trimmed = String(epicUsername ?? '').trim();
+  if (!trimmed) return null;
+  const lower = trimmed.toLowerCase();
 
-  const candidates = await PlayerModel.find({ epicUsernameLower: lower }).lean();
+  let candidates = await PlayerModel.find({ epicUsernameLower: lower }).lean();
+
+  // Fallback for a record written before epicUsernameLower existed (upsertPlayer only sets it on
+  // a write that touches epicUsername — see that function's doc comment) and never re-saved since
+  // — confirmed against real production data: every pre-existing Player document has epicUsername
+  // populated but epicUsernameLower genuinely missing. Without this, a real, linked, previously-
+  // scraped player incorrectly reports as "not found" until their record happens to get rewritten.
+  // Slower (an unindexed, case-insensitive regex scan) but only ever reached for a record this gap
+  // actually affects — backfill-epic-username-lower.js is the real fix for the general case, this
+  // is what keeps correctness from depending on whether that script has been run yet.
+  if (candidates.length === 0) {
+    const escaped = trimmed.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    candidates = await PlayerModel.find({ epicUsername: new RegExp(`^${escaped}$`, 'i') }).lean();
+  }
+
   if (candidates.length === 0) return null;
 
   const epicId = candidates.find(c => c.epicId)?.epicId;
@@ -211,6 +226,42 @@ async function rescrapeRegisteredPlayers(guildId, region) {
   console.log(`[stats] cache invalidation — expired lastUpdated for ${matched} registered player(s) in guild=${guildId} region=${region} (re-scraped lazily on their next queue, via getPlayerStats)`);
 }
 
+// Powers elo.js's percentile ranking — needs "every OTHER player with a real recorded score",
+// not just one guild's registrants, so this is deliberately NOT guild-scoped (unlike every other
+// function here). Deduped down to one entry per real account using the SAME freshest-by-
+// lastUpdated rule findCanonicalByEpicUsername uses for a single lookup — without this, a player
+// registered under N guilds (a normal, already-supported situation — see that function's doc
+// comment) would occupy N slots in the comparison pool and skew everyone else's percentile.
+// Projected to only the fields the score formula actually needs, to keep the payload small.
+//
+// Full, unindexed collection scan (totalPR has no index) — fine at this bot's current scale (at
+// most a few thousand Player docs across all guilds combined). If the player base ever grows
+// into the tens of thousands, or this endpoint's traffic grows enough that a full scan per
+// request becomes hot, this should move to a precomputed/cached leaderboard rather than
+// recomputing every score on every single ELO lookup.
+async function getAllScoredPlayers() {
+  const docs = await PlayerModel.find(
+    { totalPR: { $ne: null } },
+    { epicId: 1, totalPR: 1, thisSeasonPR: 1, recentEvents: 1, lastUpdated: 1 }
+  ).lean();
+
+  const byAccount = new Map();
+  for (const doc of docs) {
+    // No epicId at all (legacy/never-OAuth-linked record) -> nothing to dedupe against; treat the
+    // doc as its own account rather than accidentally merging unrelated null-epicId players.
+    const key = doc.epicId ?? `_id:${doc._id}`;
+    const existingAge = byAccount.get(key)?.lastUpdated ? new Date(byAccount.get(key).lastUpdated).getTime() : -1;
+    const age = doc.lastUpdated ? new Date(doc.lastUpdated).getTime() : 0;
+    if (age >= existingAge) byAccount.set(key, doc);
+  }
+
+  return [...byAccount.values()].map(doc => ({
+    totalPR: doc.totalPR ?? 0,
+    thisSeasonPR: doc.thisSeasonPR ?? 0,
+    recentEvents: doc.recentEvents ?? [],
+  }));
+}
+
 module.exports = {
   getPlayer,
   upsertPlayer,
@@ -223,4 +274,5 @@ module.exports = {
   forceRefreshStats,
   rescrapeRegisteredPlayers,
   findCanonicalByEpicUsername,
+  getAllScoredPlayers,
 };
