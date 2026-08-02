@@ -1,9 +1,9 @@
 // channel-manager.js - Automated tournament channel creation and deletion
 
 const { ChannelType, PermissionFlagsBits } = require('discord.js');
-const { scrapeUpcomingTournaments, isBareBuildModeLabel } = require('./tournament-scraper');
+const { scrapeUpcomingTournaments, isBareBuildModeLabel, isRankedCupTitle } = require('./tournament-scraper');
 const { savePinnedMessages } = require('./store');
-const { buildTournamentEmbed, buildRankedCupTournamentEmbed, rankedCupPoolName, RANK_TIERS } = require('./embeds');
+const { buildTournamentEmbed, buildRankedCupTournamentEmbed, buildRankedCupQueueButtons, rankedCupPoolName, RANK_TIERS } = require('./embeds');
 const { getQueueCount } = require('./queue');
 const { getRoleId, getCategoryId } = require('./guild-config');
 const playerStore = require('./players');
@@ -541,12 +541,43 @@ async function updateActiveTournamentEmbeds(guild, pinnedMessages, backfillTourn
       }
 
       const msg = await channel.messages.fetch(pinned.messageId);
-      // isRankedCup is only ever set at fresh-creation time (createTournamentChannel above) —
-      // never backfilled onto a pre-existing entry, since that entry's already-sent message still
-      // has the old single generic button, not the per-rank ones this embed layout expects. A
-      // pre-existing Ranked Cup channel just keeps its old plain embed until it's naturally
-      // recreated (these are non-permanent — 2hrs after the tournament begins) with the new logic.
-      const newEmbed = pinned.isRankedCup
+
+      // isRankedCup used to only ever be set at fresh-creation time and never revisited — a
+      // pre-existing entry whose title genuinely IS a Ranked Cup (isRankedCupTitle re-checked
+      // fresh here, not trusted from the stored flag) but was created before detection covered it
+      // correctly (or via /setup-tournament, which didn't check at all) would keep its old plain
+      // embed/generic button forever. This upgrades it in place — but ONLY once it's actually safe
+      // to swap the buttons.
+      //
+      // Why "safe" matters: the generic queue_duo/queue_lf2 button is about to be replaced by
+      // per-rank ones. Anyone who already joined via that OLD button is sitting in a pool keyed by
+      // the plain tournament name (queue.js's queues[tournamentName][region]) — a genuinely
+      // DIFFERENT pool from any rank-scoped one (embeds.js's rankedCupPoolName). If the buttons
+      // vanish out from under them: (a) queue.js's sweepAllQueues would keep matching them against
+      // whoever else is stuck in that same orphaned pool regardless of rank — defeating the whole
+      // point of a Ranked Cup — and (b) they'd have NO way to leave that queue at all — the
+      // leave-queue flow only ever reappears by re-clicking the exact button they queued with
+      // (index.js's queue_duo/queue_rank_ handlers), which is gone, and there's no separate
+      // /leave-queue command. So the upgrade is deferred (not skipped — re-checked every tick)
+      // until that legacy pool is genuinely empty; anyone still in it keeps using the old generic
+      // button exactly as before in the meantime, completely unaffected. Worst case, the channel
+      // just reaches its normal 2h-post-begin delete+recreate first, which already fixes this the
+      // slow way.
+      const actuallyRankedCup = isRankedCupTitle(pinned.tournamentName.toLowerCase());
+      const needsRankedCupUpgrade = actuallyRankedCup && !pinned.isRankedCup;
+      let upgradeSafe = false;
+
+      if (needsRankedCupUpgrade) {
+        const legacyPoolCount = getQueueCount(guild.id, pinned.tournamentName, pinned.region);
+        if (legacyPoolCount === 0) {
+          upgradeSafe = true;
+        } else {
+          console.log(`  ⏳ ${channelId} (${pinned.tournamentName}) — should be a Ranked Cup but ${legacyPoolCount} player(s) are still queued in the legacy (pre-upgrade) pool; deferring the per-rank button upgrade until it's empty`);
+        }
+      }
+
+      const effectiveIsRankedCup = pinned.isRankedCup || upgradeSafe;
+      const newEmbed = effectiveIsRankedCup
         ? buildRankedCupTournamentEmbed(
             pinned.tournamentName, pinned.region, computeRankCounts(guild.id, pinned.tournamentName, pinned.region), pinned.isTrios,
             pinned.beginTime, pinned.deleteAt, pinned.permanent, pinned.tournamentEventId ?? null
@@ -555,7 +586,20 @@ async function updateActiveTournamentEmbeds(guild, pinnedMessages, backfillTourn
             pinned.tournamentName, pinned.region, getQueueCount(guild.id, pinned.tournamentName, pinned.region), pinned.isTrios,
             pinned.beginTime, pinned.deleteAt, pinned.permanent, pinned.tournamentEventId ?? null
           );
-      await msg.edit({ embeds: [newEmbed], components: msg.components });
+      const newComponents = upgradeSafe ? buildRankedCupQueueButtons(pinned.isTrios) : msg.components;
+
+      await msg.edit({ embeds: [newEmbed], components: newComponents });
+
+      // Only persisted AFTER a successful edit — if msg.edit throws (caught below), nothing is
+      // saved, so the next tick retries the whole upgrade from scratch instead of leaving
+      // pinned.isRankedCup=true persisted while the actual message still has its old generic
+      // button (a half-upgraded state this design specifically avoids).
+      if (upgradeSafe) {
+        pinned.isRankedCup = true;
+        savePinnedMessages(guild.id);
+        console.log(`  ⬆️ ${channelId} (${pinned.tournamentName}) — upgraded to per-rank Ranked Cup queues (legacy pool was empty)`);
+      }
+
       console.log(`  ✅ ${channelId} (${pinned.tournamentName}) — embed refreshed`);
     } catch (err) {
       console.error(`  ❌ Failed to refresh tournament embed for channel ${channelId}:`, err.message);
@@ -653,4 +697,5 @@ function startScheduler(client, pinnedMessages) {
 module.exports = {
   startScheduler, checkAndCreateChannels, managedChannels, buildChannelName, abbreviateBuildMode,
   createTournamentChannel, createTournamentChannelsAcrossGuilds, CHANNEL_DELETE_BUFFER_MS,
+  updateActiveTournamentEmbeds,
 };

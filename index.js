@@ -22,7 +22,7 @@ const { createMatchChannelsForMatch } = require('./match-channels');
 const playerStore = require('./players');
 const epicOAuth = require('./epic-oauth');
 const { startScheduler, checkAndCreateChannels, createTournamentChannelsAcrossGuilds } = require('./channel-manager');
-const { scrapeUpcomingTournaments } = require('./tournament-scraper');
+const { scrapeUpcomingTournaments, isRankedCupTitle } = require('./tournament-scraper');
 const tournamentApproval = require('./tournament-approval');
 const channelDeletionUndo = require('./channel-deletion-undo');
 const { markSelfDeletion } = require('./self-deletion-tracker');
@@ -36,7 +36,7 @@ const suggestions = require('./suggestions');
 const { BOT_OWNER_DISCORD_ID } = suggestions;
 const {
   buildTournamentEmbed, buildQueueButtons, buildLeaveQueueButton,
-  RANK_TIERS, rankTierByKey, rankedCupPoolName, buildRankedCupTournamentEmbed,
+  RANK_TIERS, rankTierByKey, rankedCupPoolName, buildRankedCupTournamentEmbed, buildRankedCupQueueButtons,
   buildTournamentApprovalEmbed,
   buildChannelDeletionUndoEmbed, buildRestoreChannelListEmbed, buildRestoreChannelButtons,
   buildMatchConfirmedEmbed,
@@ -687,10 +687,21 @@ async function handleInteraction(interaction) {
       const region = interaction.options.getString('region');
       const isTrios = interaction.options.getBoolean('trios') ?? false;
 
-      const embed = buildTournamentEmbed(tournamentName, region, 0, isTrios);
-      const buttons = buildQueueButtons(isTrios);
+      // Same detection the auto-scraper uses (tournament-scraper.js's isRankedCupTitle) — this
+      // command previously always used the generic single-button path unconditionally, so a mod
+      // manually standing up a Ranked Cup channel (e.g. ahead of the scraper picking it up) got
+      // per-rank buttons/breakdown nowhere near as reliably as an auto-created channel did.
+      const isRankedCup = isRankedCupTitle(tournamentName.toLowerCase());
+      // Zero counts across every rank — this channel/its per-rank queue pools don't exist yet
+      // before this very message is sent, so there's genuinely nothing queued in any of them.
+      const zeroRankCounts = Object.fromEntries(RANK_TIERS.map(tier => [tier.key, 0]));
 
-      const msg = await interaction.channel.send({ embeds: [embed], components: [buttons] });
+      const embed = isRankedCup
+        ? buildRankedCupTournamentEmbed(tournamentName, region, zeroRankCounts, isTrios)
+        : buildTournamentEmbed(tournamentName, region, 0, isTrios);
+      const components = isRankedCup ? buildRankedCupQueueButtons(isTrios) : [buildQueueButtons(isTrios)];
+
+      const msg = await interaction.channel.send({ embeds: [embed], components });
       await msg.pin();
 
       pinnedMessages[interaction.channelId] = {
@@ -700,6 +711,7 @@ async function handleInteraction(interaction) {
         region,
         isTrios,
         consoleOnly: false,
+        isRankedCup,
       };
       savePinnedMessages(interaction.guild.id);
 
