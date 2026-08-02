@@ -986,6 +986,41 @@ function buildRejectReasonButtons(matchId) {
   );
 }
 
+// ── POST-MATCH OUTCOME/DIFFICULTY SURVEY (data capture only — see post-match-feedback.js) ────
+// DM'd to every participant once a CREATIVE match concludes (channel closed, either via the Close
+// Channel button or its own auto-delete timer) — separate from the "rate your match" flow above
+// (buildFeedbackRatingButtons), different trigger point and different questions. Pure data
+// capture for later manual review — never affects the reporting player's own score in any way
+// (see models/PostMatchFeedback.js's doc comment for why that constraint matters). Two steps, same
+// "don't record anything until the final answer" shape as buildFeedbackNotGreatReasonButtons above
+// — outcome is threaded through the second step's customId rather than written after step 1, so a
+// player ends up with exactly one response per match, not a stray outcome-only partial one.
+function buildPostMatchOutcomeEmbed(mode) {
+  return new EmbedBuilder()
+    .setTitle('🏆 How did your match go?')
+    .setDescription(`A quick 2-question check-in for your recent **${mode}** match — purely for us to review later, this never affects your score.`)
+    .setColor(COLOR_DEFAULT)
+    .setFooter({ text: 'MatchMaker' });
+}
+
+function buildPostMatchOutcomeButtons(matchId) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`postmatch_outcome_win_${matchId}`).setLabel('I won').setStyle(ButtonStyle.Success).setEmoji('✅'),
+    new ButtonBuilder().setCustomId(`postmatch_outcome_loss_${matchId}`).setLabel('I lost').setStyle(ButtonStyle.Danger).setEmoji('❌'),
+  );
+}
+
+// outcome ('win'/'loss') is threaded through here from whichever step-1 button was clicked —
+// step 2's customId carries it forward so the final write (index.js's postmatch_result_ handler)
+// has both answers at once without needing to look anything up.
+function buildPostMatchDifficultyButtons(matchId, outcome) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`postmatch_result_${outcome}_easy_${matchId}`).setLabel('Too easy for my skill').setStyle(ButtonStyle.Secondary).setEmoji('🟢'),
+    new ButtonBuilder().setCustomId(`postmatch_result_${outcome}_fair_${matchId}`).setLabel('Felt fair').setStyle(ButtonStyle.Secondary).setEmoji('🟡'),
+    new ButtonBuilder().setCustomId(`postmatch_result_${outcome}_hard_${matchId}`).setLabel('Too hard for my skill').setStyle(ButtonStyle.Secondary).setEmoji('🔴'),
+  );
+}
+
 // ── HOWTO ──────────────────────────────────────────────────────────────────
 
 function buildHowtoEmbed() {
@@ -1649,6 +1684,9 @@ module.exports = {
   buildFeedbackRatingButtons,
   buildFeedbackNotGreatReasonButtons,
   buildRejectReasonButtons,
+  buildPostMatchOutcomeEmbed,
+  buildPostMatchOutcomeButtons,
+  buildPostMatchDifficultyButtons,
   buildHowtoEmbed,
   buildSetupInstructionsEmbed,
   buildRolesEmbed,

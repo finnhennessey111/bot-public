@@ -37,6 +37,7 @@ const store = require('./store');
 const { bestPartitionByPR } = require('./team-partition');
 const credits = require('./credits');
 const feedback = require('./feedback');
+const postMatchFeedback = require('./post-match-feedback');
 const { getRoleId, getCreativeChannelInfo } = require('./guild-config');
 const {
   buildCreativeMatchConfirmedEmbed, buildCloseChannelButton, buildVoteKickOpenButtonRow,
@@ -264,6 +265,11 @@ async function startTeamMatch(units, mode, region, completingGuildId, client) {
   // just 2), regardless of what happens in the lock/ready-check/vote-kick lifecycle afterward.
   // Never blocks match creation.
   feedback.recordCreativeMatch({ matchId: matchState.matchId, mode, region, players }).catch(console.error);
+
+  // Separate data capture (post-match-feedback.js) — the post-match win/loss+difficulty survey.
+  // 'creative-team' matches this file's own scheduleChannelDeletion kind below, which is also
+  // what's checked when actually sending the prompt later (index.js's channelDeleted listener).
+  postMatchFeedback.recordMatchParticipants({ matchId: matchState.matchId, kind: 'creative-team', mode, region, players }).catch(console.error);
 
   const channelClusterForDeletion = [];
 

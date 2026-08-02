@@ -72,8 +72,10 @@ const { startAccessScheduler } = require('./notifications');
 const { QUEUE_CHANNEL_CONFIGS, categoryForAnyMode } = require('./creative-channel-configs');
 const db = require('./db');
 const feedback = require('./feedback');
+const postMatchFeedback = require('./post-match-feedback');
 const {
   buildFeedbackRatingButtons, buildFeedbackNotGreatReasonButtons, buildRejectReasonButtons,
+  buildPostMatchDifficultyButtons,
 } = require('./embeds');
 
 const botStartTime = Date.now();
@@ -561,9 +563,18 @@ client.once('clientReady', async () => {
   await teamMatchLifecycle.cleanupOrphanedMatchesOnStartup(client).catch(console.error);
 
   channelLifecycle.restoreScheduledDeletions(client);
-  channelLifecycle.channelLifecycleEvents.on('channelDeleted', ({ channels, kind }) => {
+  channelLifecycle.channelLifecycleEvents.on('channelDeleted', ({ groupId, channels, kind }) => {
     if (kind === 'creative-team') {
       for (const c of channels) teamMatchLifecycle.endTeamMatch(c.textChannelId);
+    }
+
+    // Post-match survey (post-match-feedback.js) — this covers the OTHER real conclusion path
+    // (the channel's own auto-delete timer firing) that close_creative_channel's handler doesn't:
+    // a match nobody explicitly closed. sendPromptsIfNeeded is idempotent, so if the explicit-close
+    // path already sent it (which also cancels this timer, so this branch shouldn't even fire for
+    // that case) this is a safe no-op regardless.
+    if (kind === 'creative-pairwise' || kind === 'creative-team') {
+      postMatchFeedback.sendPromptsIfNeeded(groupId, client).catch(console.error);
     }
   });
 
@@ -1364,6 +1375,41 @@ async function handleInteraction(interaction) {
       return;
     }
 
+    // ── POST-MATCH SURVEY — outcome (step 1, data capture only — post-match-feedback.js) ────
+    // Only ever arrives via DM (post-match-feedback.js's sendPromptsIfNeeded) — no `guild` in
+    // scope, no mod-gating concern the way restore_channel_ above has (only the DM recipient could
+    // ever click a button inside their own DM). Doesn't record anything yet — same "wait for the
+    // final answer" shape as feedback_notgreat_ below — outcome is carried into step 2's own
+    // customId instead.
+    if (customId.startsWith('postmatch_outcome_')) {
+      const rest = customId.replace('postmatch_outcome_', ''); // "<win|loss>_<matchId>"
+      const [outcome, ...matchIdParts] = rest.split('_');
+      const matchId = matchIdParts.join('_');
+
+      await interaction.update({
+        content: outcome === 'win' ? '✅ Nice win! One more question:' : '❌ Tough one. One more question:',
+        components: [buildPostMatchDifficultyButtons(matchId, outcome)],
+      });
+      return;
+    }
+
+    // ── POST-MATCH SURVEY — outcome + difficulty (step 2, data capture only) ────────────────
+    // The actual write — see post-match-feedback.js's doc comment and
+    // models/PostMatchFeedback.js's for the hard constraint this must never violate: nothing here
+    // (or anywhere else) feeds this player's own answer back into their own score.
+    if (customId.startsWith('postmatch_result_')) {
+      const rest = customId.replace('postmatch_result_', ''); // "<win|loss>_<easy|fair|hard>_<matchId>"
+      const [outcome, difficultyToken, ...matchIdParts] = rest.split('_');
+      const matchId = matchIdParts.join('_');
+
+      postMatchFeedback.submitResponse(matchId, user.id, outcome, difficultyToken).catch(console.error);
+      await interaction.update({
+        content: '🙏 Thanks — this helps us keep matches fair. It never affects your own score.',
+        components: [],
+      });
+      return;
+    }
+
     // ── BIO BUTTON ───────────────────────────────────────────────────────────
     if (customId === 'set_bio') {
       const modal = new ModalBuilder()
@@ -2118,6 +2164,14 @@ async function handleInteraction(interaction) {
       if (cancelled) credits.cancelCreditTimer(cancelled.groupId);
       const channels = cancelled?.channels ?? [{ textChannelId: channelId, voiceChannelId: null }];
 
+      // Post-match survey (post-match-feedback.js) — the group's id IS the matchId (see this
+      // block's own doc comment above), and cancelled.kind (channel-lifecycle.js's own
+      // 'creative-pairwise'/'creative-team'/'tournament') is exactly what scopes this to creative
+      // matches only. Non-fatal, never blocks the actual close below.
+      if (cancelled && (cancelled.kind === 'creative-pairwise' || cancelled.kind === 'creative-team')) {
+        postMatchFeedback.sendPromptsIfNeeded(cancelled.groupId, client).catch(console.error);
+      }
+
       await interaction.reply({ content: '🔒 Closing this channel in 10 seconds...' });
       setTimeout(() => {
         for (const c of channels) {
@@ -2453,6 +2507,15 @@ async function notifyCreativeMatchFound(unitA, unitB, mode, region, client) {
   // Data capture only (feedback.js) — snapshotted here regardless of whether this proposal is
   // later accepted or rejected/expires, per "whenever a match forms." Never blocks match creation.
   feedback.recordCreativeMatch({ matchId, mode, region, players: allPlayers }).catch(console.error);
+
+  // Separate data capture (post-match-feedback.js) — the post-match win/loss+difficulty survey.
+  // 'creative-pairwise' matches channel-lifecycle.js's own kind value for this exact match type
+  // (see confirmMatchChannels' scheduleChannelDeletion call below), which is also what's checked
+  // when actually sending the prompt later. Snapshotted here (not "if accepted") since a match
+  // that's rejected/expires never reaches confirmMatchChannels/close_creative_channel at all — the
+  // record just never gets its prompt sent, same harmless fate feedback.recordCreativeMatch above
+  // already has for that case.
+  postMatchFeedback.recordMatchParticipants({ matchId, kind: 'creative-pairwise', mode, region, players: allPlayers }).catch(console.error);
 
   const category = categoryForAnyMode(mode);
   if (category) {
