@@ -118,9 +118,13 @@ test('buildQueueButtons (non-ranked path) is completely unaffected — still a s
 // createTournamentChannel now posts via forum.threads.create (message: {embeds, components}) —
 // this fake forum captures that message payload directly instead of a separate channel.send().
 // DeletedTournamentChannelModel.findOne is stubbed (createTournamentChannel calls it for every
-// eventId-bearing tournament, which both tests below have) and guild-config's getChannelId/
-// getTagId are stubbed to point at a fake tournament forum — same "stub the Model"/require-cache
-// precedent as test/tournament-channel-rename.test.js.
+// eventId-bearing tournament, which both tests below have) and guild-config's getChannelId is
+// stubbed to point every tournamentForum_* key (channel-manager.js's
+// `tournamentForum_${region}_${buildMode}`) at the SAME fake forum — these tests are about the
+// Ranked Cup per-rank button/embed logic, not routing itself (that's tournament-channel-rename.
+// test.js's job), so one fake forum answering for whichever region/buildMode combo actually gets
+// looked up is enough. Same "stub the Model"/require-cache precedent as
+// test/tournament-channel-rename.test.js.
 const DeletedTournamentChannelModel = require('../models/DeletedTournamentChannel');
 
 const FORUM_ID = 'forum-1';
@@ -135,8 +139,7 @@ async function withGuildConfigStub(fn) {
   require.cache[guildConfigPath] = {
     id: guildConfigPath, filename: guildConfigPath, loaded: true,
     exports: {
-      getChannelId: (g, k) => (k === 'tournamentForum' ? FORUM_ID : null),
-      getTagId: () => 'region-tag-id',
+      getChannelId: (g, k) => (k.startsWith('tournamentForum_') ? FORUM_ID : null),
       getRoleId: () => null,
     },
   };

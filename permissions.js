@@ -28,14 +28,23 @@
 const { PermissionFlagsBits } = require('discord.js');
 const { pinnedMessages } = require('./store');
 const { getChannelId, getRoleId, getCreativeChannelInfo } = require('./guild-config');
+const { BUILD_MODES } = require('./build-mode');
 
 // Tournament posts became forum threads — a thread has no .permissionOverwrites of its own at all
 // (confirmed via discord.js source: ThreadChannel extends BaseChannel directly, not GuildChannel,
 // which is the only place permissionOverwrites gets set up), so editOverwrite() on one would throw
 // "Cannot read properties of undefined (reading 'edit')" on every single enforcePermissions() run.
-// enforceQueueChannels below skips these — enforceTournamentForumChannel is what actually sets
-// visibility/attachment-lock now, once on the shared forum channel itself (guild-config.js's
-// channelIds.tournamentForum), which every post inherits.
+// enforceQueueChannels below skips these — enforceTournamentForumChannels is what actually sets
+// visibility/attachment-lock now, once per each of the 9 region×build-mode forum channels
+// (guild-config.js's channelIds.tournamentForum_{region}_{buildMode} — see matchmaker-setup.js's
+// TOURNAMENT_FORUM_SPECS), which every post inherits.
+
+// Same region set matchmaker-setup.js's REGION_SPECS / tournament-scraper.js's SUPPORTED_REGIONS
+// cover — duplicated here rather than imported for the same reason matchmaker-setup.js duplicates
+// it instead of importing from tournament-scraper.js: this is enforcement-side, that's scraper-
+// side, and requiring matchmaker-setup.js from here would be circular (it already requires this
+// module for enforcePermissions/botAccessOverwrite).
+const REGIONS = ['EU', 'NAC', 'ME'];
 
 // Visible to a brand new member with no roles at all — the very first thing they see.
 const ENTRY_CHANNEL_KEYS = ['register'];
@@ -232,30 +241,34 @@ async function enforceQueueChannels(guild) {
     await lockQueueChannelAttachments(guild, channelId, { resetViewChannel: true });
   }
 
-  await enforceTournamentForumChannel(guild);
+  await enforceTournamentForumChannels(guild);
 }
 
-// The forum-level equivalent of lockQueueChannelAttachments — sets it ONCE on the shared
-// tournament forum (channelIds.tournamentForum) instead of once per post, since a forum thread
-// can't hold its own overwrites (see this file's header comment). Every existing post inherits
-// this automatically; nothing needs to touch them individually. Same visibility rule tournament
-// channels have always had: visible to @everyone (no Registered-role gate on ViewChannel — see
-// this file's module doc comment), files/embeds locked down, mods always allowed in.
-async function enforceTournamentForumChannel(guild) {
-  const forumChannelId = getChannelId(guild.id, 'tournamentForum');
-  if (!forumChannelId) return; // not set up yet — guild-config.js's self-heal migration handles this
-
-  const forum = await guild.channels.fetch(forumChannelId).catch(() => null);
-  if (!forum) return;
-
-  await editOverwrite(forum, guild.roles.everyone, { ViewChannel: true, AttachFiles: false, EmbedLinks: false }, '@everyone');
-
+// The forum-level equivalent of lockQueueChannelAttachments — sets it on each of the 9 region×
+// build-mode tournament forums (channelIds.tournamentForum_{region}_{buildMode}) instead of once
+// per post, since a forum thread can't hold its own overwrites (see this file's header comment).
+// Every existing post inherits this automatically from its own forum; nothing needs to touch them
+// individually. Same visibility rule tournament channels have always had: visible to @everyone (no
+// Registered-role gate on ViewChannel — see this file's module doc comment), files/embeds locked
+// down, mods always allowed in — identical on all 9, no per-region/build-mode distinction.
+async function enforceTournamentForumChannels(guild) {
   const modRoleId = getRoleId(guild.id, 'mod');
-  if (modRoleId) {
-    await editOverwrite(forum, modRoleId, { ViewChannel: true, SendMessages: true }, 'mod role');
-  }
 
-  await grantBotAccess(guild, forum);
+  for (const region of REGIONS) {
+    for (const mode of BUILD_MODES) {
+      const forumChannelId = getChannelId(guild.id, `tournamentForum_${region}_${mode.key}`);
+      if (!forumChannelId) continue; // not set up yet for this combo — guild-config.js's self-heal migration handles this
+
+      const forum = await guild.channels.fetch(forumChannelId).catch(() => null);
+      if (!forum) continue;
+
+      await editOverwrite(forum, guild.roles.everyone, { ViewChannel: true, AttachFiles: false, EmbedLinks: false }, '@everyone');
+      if (modRoleId) {
+        await editOverwrite(forum, modRoleId, { ViewChannel: true, SendMessages: true }, 'mod role');
+      }
+      await grantBotAccess(guild, forum);
+    }
+  }
 }
 
 async function enforcePermissions(guild) {

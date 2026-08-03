@@ -22,7 +22,7 @@
 
 const TournamentApprovalModel = require('./models/TournamentApproval');
 const { dmUser } = require('./discord-dm');
-const { buildTournamentApprovalEmbed, buildTournamentApprovalButtons } = require('./embeds');
+const { buildTournamentApprovalEmbed, buildTournamentApprovalButtons, buildBuildModeSelectRow } = require('./embeds');
 
 const BOT_OWNER_DISCORD_ID = process.env.BOT_OWNER_DISCORD_ID || null;
 
@@ -56,7 +56,12 @@ async function requestApproval(client, tournament) {
 
   const msg = await dmUser(client, BOT_OWNER_DISCORD_ID, {
     embeds: [buildTournamentApprovalEmbed(tournament)],
-    components: [buildTournamentApprovalButtons(tournament.eventId)],
+    // Build-mode select menu ABOVE the Approve/Reject row — one unified interaction on the same
+    // message, not a separate system. Pre-selected to tournament.buildMode (tournament-scraper.js's
+    // auto-detection, stamped on every scraped tournament — see buildTournamentGroups). Changing
+    // it (tournament_buildmode_ in index.js) edits this same message in place via setBuildMode,
+    // so whatever it shows at the moment Approve/Reject is actually clicked is authoritative.
+    components: [buildBuildModeSelectRow(tournament.eventId, tournament.buildMode), buildTournamentApprovalButtons(tournament.eventId)],
   });
 
   if (msg) {
@@ -98,12 +103,41 @@ async function gateTournaments(client, tournaments, pinnedMessages) {
       continue; // pending as of just now — never approved same-tick
     }
 
-    if (record.status === 'approved') approved.push(tournament);
+    if (record.status === 'approved') {
+      // buildMode comes from the RECORD (the value that was actually decided — auto-detected
+      // default if never touched, or whatever a mod picked via the approval DM's select menu
+      // before approving), NOT re-derived fresh from this tick's own scrape. tournament here is
+      // this tick's freshly re-scraped object, which — if buildMode were read off it instead —
+      // would silently re-run tournament-scraper.js's auto-detection on every single tick for as
+      // long as this eventId's channel stays open, overwriting a manual correction the very first
+      // time createTournamentChannel is actually called for it (a real, easy-to-miss bug: the
+      // ONLY tournaments a mod would ever need to correct are exactly the ambiguous ones where
+      // auto-detection got it wrong in the first place, so this isn't a rare edge case for the
+      // feature it undermines). See channel-manager.js's createTournamentChannel for why buildMode
+      // has to be stable across ticks once a post might already exist under it.
+      approved.push({ ...tournament, buildMode: record.tournament?.buildMode ?? tournament.buildMode });
+      continue;
+    }
     // 'pending' -> still waiting, skip silently (no re-DM this tick)
     // 'rejected' / 'expired' -> skip forever
   }
 
   return approved;
+}
+
+// Called by index.js's tournament_buildmode_ select-menu handler — corrects the auto-detected
+// build mode on a still-pending record before it's approved (e.g. a mod checked in-game and found
+// tournament-scraper.js's title-based guess wrong for some genuinely ambiguous title). Guarded to
+// status:'pending' — same shape as settlePending's atomic guard below — so a select-menu change
+// arriving after the record has already been decided (a late/duplicate interaction) is a safe
+// no-op rather than reopening a settled decision. Returns the updated record (for index.js to
+// re-render the DM with) or null if it wasn't pending anymore.
+async function setBuildMode(eventId, buildMode) {
+  return TournamentApprovalModel.findOneAndUpdate(
+    { eventId, status: 'pending' },
+    { $set: { 'tournament.buildMode': buildMode } },
+    { returnDocument: 'after' }
+  ).lean();
 }
 
 // Atomically transitions a record OUT of 'pending' — the `status: 'pending'` filter is what makes
@@ -174,6 +208,7 @@ async function expirePendingApprovals(client) {
 module.exports = {
   gateTournaments,
   decide,
+  setBuildMode,
   expirePendingApprovals,
   BOT_OWNER_DISCORD_ID,
 };

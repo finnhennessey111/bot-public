@@ -1,15 +1,17 @@
-// Verifies requirement 1's channel-visibility half, reworked for the forum-post migration: every
-// tournament post (any region, console-only or not) is visible to @everyone — region/console
-// Discord roles never gate ViewChannel, even when those roles ARE configured for the guild.
+// Verifies requirement 1's channel-visibility half, reworked for the forum-restructure: every
+// tournament post (any region, build mode, console-only or not) is visible to @everyone — region/
+// console Discord roles never gate ViewChannel, even when those roles ARE configured for the guild.
 //
 // This used to be a per-post permissionOverwrites array passed to guild.channels.create(). A
 // forum THREAD can't hold its own overwrites independent of its parent forum channel (confirmed
 // via discord.js source: ThreadChannel has no .permissionOverwrites at all, and
-// GuildForumThreadManager#create's options don't accept any) — so createTournamentChannel no
-// longer sets permissions at all; permissions.js's enforceTournamentForumChannel (part of
-// enforcePermissions) sets them ONCE on the shared tournament forum channel instead, which every
-// post inherits. Both halves are exercised here: createTournamentChannel creates a post with no
-// per-post overwrite logic to break, and enforcePermissions is what actually proves visibility.
+// GuildForumThreadManager#create's options don't accept any) — so createTournamentChannel never
+// sets permissions at all; permissions.js's enforceTournamentForumChannels (part of
+// enforcePermissions) sets them on EACH of the 9 region×build-mode tournament forums instead,
+// which every post inherits from its own forum. Both halves are exercised here: createTournamentChannel
+// creates a post with no per-post overwrite logic to break, and enforcePermissions is what actually
+// proves visibility, across more than one of the 9 forums (not just the one a single test happens
+// to create a post in).
 //
 // Queueing itself still requires the Registered role (unchanged, tested separately by inspecting
 // the real index.js source below, since index.js can't be required directly in a test — it calls
@@ -62,15 +64,25 @@ async function withStubbedGuildConfig(stubExports, fn) {
   }
 }
 
-const FORUM_ID = 'forum-1';
+// Deterministic (not random) so getChannelId's stub below can map a composite key straight to an
+// id without needing a live guild instance first — same precedent as
+// test/tournament-channel-rename.test.js's forumId().
+function forumId(region, buildMode) {
+  return `forum-${region}-${buildMode}`;
+}
 
-function makeFakeGuild() {
+function getChannelIdStub(g, k) {
+  const match = k.match(/^tournamentForum_(EU|NAC|ME)_(battle_royale|zero_build|reload)$/);
+  return match ? forumId(match[1], match[2]) : null;
+}
+
+function makeFakeForum(id) {
   const capturedOverwrites = {}; // targetId -> permissions object last set
   const createdThreads = [];
 
   const forum = {
-    id: FORUM_ID,
-    name: 'tournaments',
+    id,
+    name: id,
     permissionOverwrites: {
       edit: async (target, perms) => {
         const targetId = typeof target === 'string' ? target : target.id;
@@ -78,25 +90,38 @@ function makeFakeGuild() {
       },
     },
     threads: {
-      create: async ({ name, message, appliedTags }) => {
-        const thread = {
-          id: `thread-${createdThreads.length + 1}`,
-          name,
-          parentId: FORUM_ID,
-          appliedTags: appliedTags ?? [],
-        };
-        createdThreads.push({ thread, message, appliedTags });
+      create: async ({ name, message }) => {
+        const thread = { id: `${id}-thread-${createdThreads.length + 1}`, name, parentId: id };
+        createdThreads.push({ thread, message });
         return thread;
       },
     },
   };
+  return { forum, createdThreads, getCapturedOverwrites: () => capturedOverwrites };
+}
+
+// Builds all 9 region×build-mode forums (real /matchmaker-setup creates exactly these) so
+// enforcePermissions' loop over every one of them can be genuinely exercised, not just a single
+// stand-in forum.
+function makeFakeGuild() {
+  const forums = {}; // 'EU_battle_royale' -> {forum, createdThreads, getCapturedOverwrites}
+  const channelsById = new Map();
+
+  for (const region of ['EU', 'NAC', 'ME']) {
+    for (const buildMode of ['battle_royale', 'zero_build', 'reload']) {
+      const id = forumId(region, buildMode);
+      const built = makeFakeForum(id);
+      forums[`${region}_${buildMode}`] = built;
+      channelsById.set(id, built.forum);
+    }
+  }
 
   const guild = {
     id: 'guild1',
     roles: {
       // Full role-shape (not a bare string) — enforcePermissions' lockGuildBasePermissions calls
-      // .permissions.remove()/.setPermissions() on it directly, before enforceTournamentForumChannel
-      // ever runs.
+      // .permissions.remove()/.setPermissions() on it directly, before
+      // enforceTournamentForumChannels ever runs.
       everyone: {
         id: 'everyone-role-id',
         permissions: { remove: () => ({ bitfield: 0n }), bitfield: 0n },
@@ -107,10 +132,10 @@ function makeFakeGuild() {
     client: { user: { id: 'bot-id' } },
     channels: {
       cache: { find: () => undefined }, // no existing post — always the "create new" path
-      fetch: async (id) => (id === FORUM_ID ? forum : null),
+      fetch: async (id) => channelsById.get(id) ?? null,
     },
   };
-  return { guild, forum, createdThreads, getCapturedOverwrites: () => capturedOverwrites };
+  return { guild, forums };
 }
 
 function futureIso(hoursFromNow) {
@@ -131,73 +156,78 @@ function baseTournament(overrides = {}) {
   };
 }
 
-test('createTournamentChannel: creates a forum post with no per-post permission logic to break (permissions now live on the forum itself)', async () => {
+test('createTournamentChannel: creates a forum post (in the correct region×build-mode forum) with no per-post permission logic to break', async () => {
   await withStubbedGuildConfig(
-    { getChannelId: (g, k) => (k === 'tournamentForum' ? FORUM_ID : null), getTagId: () => 'eu-tag-id' },
+    { getChannelId: getChannelIdStub },
     async (channelManager) => {
-      const { guild, createdThreads } = makeFakeGuild();
+      const { guild, forums } = makeFakeGuild();
       await channelManager.createTournamentChannel(guild, baseTournament(), {});
 
-      assert.equal(createdThreads.length, 1, 'exactly one forum post should be created');
-      assert.deepEqual(createdThreads[0].appliedTags, ['eu-tag-id']);
+      const { createdThreads } = forums.EU_battle_royale; // "Some Cup" has no build-mode marker -> defaults to Battle Royale
+      assert.equal(createdThreads.length, 1, 'exactly one forum post should be created, in the EU/battle_royale forum');
 
       clearTimeout(channelManager.managedChannels[createdThreads[0].thread.id]?.deleteTimer);
     }
   );
 });
 
-test('enforcePermissions -> enforceTournamentForumChannel: @everyone gets ViewChannel allowed + AttachFiles/EmbedLinks denied, even with NO mod role configured', async () => {
+test('enforcePermissions -> enforceTournamentForumChannels: @everyone gets ViewChannel allowed + AttachFiles/EmbedLinks denied on EVERY one of the 9 forums, even with NO mod role configured', async () => {
   await withStubbedGuildConfig(
     {
-      getChannelId: (g, k) => (k === 'tournamentForum' ? FORUM_ID : null),
+      getChannelId: getChannelIdStub,
       getRoleId: () => null,
       getCreativeChannelInfo: () => null,
     },
     async (channelManager, permissions) => {
-      const { guild, getCapturedOverwrites } = makeFakeGuild();
+      const { guild, forums } = makeFakeGuild();
       await permissions.enforcePermissions(guild);
 
-      const overwrites = getCapturedOverwrites();
-      const everyoneOverwrite = overwrites['everyone-role-id'];
-      assert.ok(everyoneOverwrite, '@everyone must have an explicit overwrite on the forum');
-      assert.equal(everyoneOverwrite.ViewChannel, true, 'ViewChannel must be allowed for @everyone');
-      assert.equal(everyoneOverwrite.AttachFiles, false);
-      assert.equal(everyoneOverwrite.EmbedLinks, false);
+      for (const [key, { getCapturedOverwrites }] of Object.entries(forums)) {
+        const overwrites = getCapturedOverwrites();
+        const everyoneOverwrite = overwrites['everyone-role-id'];
+        assert.ok(everyoneOverwrite, `@everyone must have an explicit overwrite on the ${key} forum`);
+        assert.equal(everyoneOverwrite.ViewChannel, true, `ViewChannel must be allowed for @everyone on ${key}`);
+        assert.equal(everyoneOverwrite.AttachFiles, false);
+        assert.equal(everyoneOverwrite.EmbedLinks, false);
+      }
     }
   );
 });
 
-test('enforcePermissions -> enforceTournamentForumChannel: mod role gets ViewChannel+SendMessages on the forum when configured — same for a console-only tournament\'s post (no per-post/per-role Console gate exists anymore)', async () => {
+test('enforcePermissions -> enforceTournamentForumChannels: mod role gets ViewChannel+SendMessages on the forum when configured — same for a console-only tournament\'s post (no per-post/per-role Console gate exists anymore)', async () => {
   await withStubbedGuildConfig(
     {
-      getChannelId: (g, k) => (k === 'tournamentForum' ? FORUM_ID : null),
+      getChannelId: getChannelIdStub,
       getRoleId: (g, k) => (k === 'mod' ? 'mod-role-id' : (k === 'Console' ? 'console-role-id' : null)),
-      getTagId: () => 'eu-tag-id',
       getCreativeChannelInfo: () => null,
     },
     async (channelManager, permissions) => {
-      const { guild, forum, createdThreads, getCapturedOverwrites } = makeFakeGuild();
+      const { guild, forums } = makeFakeGuild();
 
       // A console-only tournament's post is created exactly the same way as any other — no
       // per-role Console overwrite is ever built for it (confirmed by there being no such code
       // path left in createTournamentChannel at all, not just by an absent overwrite here).
       await channelManager.createTournamentChannel(guild, baseTournament({ consoleOnly: true, eventId: 'epicgames_consolecup_EU' }), {});
+      const { createdThreads } = forums.EU_battle_royale;
       assert.equal(createdThreads.length, 1);
       clearTimeout(channelManager.managedChannels[createdThreads[0].thread.id]?.deleteTimer);
 
       await permissions.enforcePermissions(guild);
-      const overwrites = getCapturedOverwrites();
 
-      const everyoneOverwrite = overwrites['everyone-role-id'];
-      assert.ok(everyoneOverwrite);
-      assert.equal(everyoneOverwrite.ViewChannel, true, '@everyone must see a console-only tournament\'s post too — the forum itself has no per-tournament distinction');
+      for (const [key, { getCapturedOverwrites }] of Object.entries(forums)) {
+        const overwrites = getCapturedOverwrites();
 
-      const modOverwrite = overwrites['mod-role-id'];
-      assert.ok(modOverwrite, 'mod role should get an explicit overwrite on the forum');
-      assert.equal(modOverwrite.ViewChannel, true);
-      assert.equal(modOverwrite.SendMessages, true);
+        const everyoneOverwrite = overwrites['everyone-role-id'];
+        assert.ok(everyoneOverwrite);
+        assert.equal(everyoneOverwrite.ViewChannel, true, `@everyone must see the ${key} forum too — no per-tournament distinction`);
 
-      assert.equal(overwrites['console-role-id'], undefined, 'no per-role Console overwrite should exist anywhere — that gate was removed, not moved');
+        const modOverwrite = overwrites['mod-role-id'];
+        assert.ok(modOverwrite, `mod role should get an explicit overwrite on the ${key} forum`);
+        assert.equal(modOverwrite.ViewChannel, true);
+        assert.equal(modOverwrite.SendMessages, true);
+
+        assert.equal(overwrites['console-role-id'], undefined, `no per-role Console overwrite should exist on ${key} — that gate was removed, not moved`);
+      }
     }
   );
 });

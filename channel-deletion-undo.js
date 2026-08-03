@@ -79,6 +79,10 @@ function snapshotToTournament(snapshot) {
   return {
     name: snapshot.tournamentName,
     region: snapshot.region,
+    // Falls back to createTournamentChannel's own re-detection (via title) if this snapshot
+    // predates buildMode being added to pinnedMessages — never blocks a restore outright, just
+    // possibly re-derives it instead of using whatever was originally decided.
+    buildMode: snapshot.buildMode,
     beginTime: snapshot.beginTime,
     lastBeginTime,
     isTrios: !!snapshot.isTrios,

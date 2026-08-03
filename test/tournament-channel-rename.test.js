@@ -5,16 +5,19 @@
 // sit as an orphaned duplicate until its own deletion timer eventually cleared it, on every server,
 // every time.
 //
-// Also covers item #3 of the forum-post migration directly: findExistingTournamentChannel's
-// no-eventId fallback used to match by category membership (one category per region); one shared
-// forum now holds every region's posts, so region is disambiguated by an APPLIED TAG instead —
-// two same-named tournaments in different regions must never collide with each other.
+// Also covers the forum-restructure's core requirement directly: a tournament routes into the
+// correct ONE of 9 forums (region × build-mode), and findExistingTournamentChannel's no-eventId
+// fallback correctly disambiguates by forum identity (parentId) alone now — there's no longer a
+// shared forum + tag to worry about; each of the 9 forums is already region+build-mode-specific by
+// construction, the same way the original per-region categories were.
 //
 // Exercises the real createTournamentChannel (not a reimplementation) against a lightweight fake
-// Discord guild/forum. DeletedTournamentChannelModel.findOne is stubbed (same "stub the Model, not
-// the module" precedent as test/store-selective-persistence.test.js) purely to avoid a real
-// MongoDB dependency — createTournamentChannel calls it for every tournament that has an eventId,
-// which every one of these does.
+// Discord guild with all 9 region×build-mode forums pre-built (deterministic IDs via forumId()
+// below, so a test can seed an "already exists" thread under the exact right one without a
+// chicken-and-egg problem). DeletedTournamentChannelModel.findOne is stubbed (same "stub the
+// Model, not the module" precedent as test/store-selective-persistence.test.js) purely to avoid a
+// real MongoDB dependency — createTournamentChannel calls it for every tournament that has an
+// eventId, which most of these do.
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
@@ -24,15 +27,22 @@ const originalFindOne = DeletedTournamentChannelModel.findOne;
 test.before(() => { DeletedTournamentChannelModel.findOne = () => ({ lean: async () => null }); });
 test.after(() => { DeletedTournamentChannelModel.findOne = originalFindOne; });
 
-const FORUM_ID = 'forum-1';
-const REGION_TAG_IDS = { EU: 'tag-eu', NAC: 'tag-nac', ME: 'tag-me' };
+const REGIONS = ['EU', 'NAC', 'ME'];
+const BUILD_MODE_KEYS = ['battle_royale', 'zero_build', 'reload'];
 
-// Simulates a real forum post: a thread whose id/name/appliedTags/parentId behave like discord.js's
-// real ThreadChannel for exactly what findExistingTournamentChannel/createTournamentChannel read —
-// c.name, c.parentId, c.appliedTags, plus setName (rename-in-place).
-function makeFakeThread(id, name, appliedTags = []) {
+// Deterministic (not random) so a test can reference "the EU/zero_build forum's id" directly when
+// seeding a pre-existing thread, without needing makeFakeGuild to hand the id back first.
+function forumId(region, buildMode) {
+  return `forum-${region}-${buildMode}`;
+}
+
+// Simulates a real forum post: a thread whose id/name/parentId behave like discord.js's real
+// ThreadChannel for exactly what findExistingTournamentChannel/createTournamentChannel read —
+// c.name, c.parentId, plus setName (rename-in-place). No appliedTags at all — routing is by which
+// forum (parentId) the thread lives in now, not a tag.
+function makeFakeThread(id, name, parentId) {
   const thread = {
-    id, name, parentId: FORUM_ID, appliedTags,
+    id, name, parentId,
     setNameCalls: [],
     async setName(newName) {
       thread.setNameCalls.push(newName);
@@ -43,23 +53,29 @@ function makeFakeThread(id, name, appliedTags = []) {
   return thread;
 }
 
+// Pre-builds all 9 region×build-mode forums (real /matchmaker-setup creates exactly these — see
+// matchmaker-setup.js's TOURNAMENT_FORUM_SPECS) plus any pre-seeded existing threads.
 function makeFakeGuild(id, existingThreads = []) {
   const channelsById = new Map(existingThreads.map(c => [c.id, c]));
   let nextId = 1000;
   let createCalls = 0;
 
-  const forum = {
-    id: FORUM_ID,
-    threads: {
-      create: async ({ name, appliedTags }) => {
-        createCalls++;
-        const thread = makeFakeThread(String(nextId++), name, appliedTags ?? []);
-        channelsById.set(thread.id, thread);
-        return thread;
-      },
-    },
-  };
-  channelsById.set(FORUM_ID, forum);
+  for (const region of REGIONS) {
+    for (const buildMode of BUILD_MODE_KEYS) {
+      const fid = forumId(region, buildMode);
+      channelsById.set(fid, {
+        id: fid,
+        threads: {
+          create: async ({ name }) => {
+            createCalls++;
+            const thread = makeFakeThread(String(nextId++), name, fid);
+            channelsById.set(thread.id, thread);
+            return thread;
+          },
+        },
+      });
+    }
+  }
 
   const guild = {
     id,
@@ -78,14 +94,25 @@ function futureIso(hoursFromNow) {
   return new Date(Date.now() + hoursFromNow * 3600_000).toISOString();
 }
 
-async function withGuildConfigStub(stubExports, fn) {
+async function withGuildConfigStub(fn) {
   const guildConfigPath = require.resolve('../guild-config');
   const channelManagerPath = require.resolve('../channel-manager');
   const previous = require.cache[guildConfigPath];
   delete require.cache[guildConfigPath];
   delete require.cache[channelManagerPath];
 
-  require.cache[guildConfigPath] = { id: guildConfigPath, filename: guildConfigPath, loaded: true, exports: stubExports };
+  require.cache[guildConfigPath] = {
+    id: guildConfigPath, filename: guildConfigPath, loaded: true,
+    exports: {
+      getRoleId: () => null,
+      // Purely deterministic (forumId()), independent of any one makeFakeGuild instance — real
+      // guild-config.js's getChannelId is just a flat-map lookup too, this mirrors that shape.
+      getChannelId: (g, k) => {
+        const match = k.match(/^tournamentForum_(EU|NAC|ME)_(battle_royale|zero_build|reload)$/);
+        return match ? forumId(match[1], match[2]) : null;
+      },
+    },
+  };
 
   const freshChannelManager = require('../channel-manager');
   try {
@@ -93,8 +120,7 @@ async function withGuildConfigStub(stubExports, fn) {
   } finally {
     // Each stubbed call gets its own fresh channel-manager module instance (a fresh require after
     // deleting it from the cache above), so its armDeletionTimer real setTimeouts live on THIS
-    // instance's own managedChannels — a different object than the top-level channelManager import
-    // this file also holds. Clearing here (not just via the top-level clearAllManagedTimers) is
+    // instance's own managedChannels — a different object than any other test's. Clearing here is
     // what actually stops the process from hanging on real multi-hour timers.
     for (const key of Object.keys(freshChannelManager.managedChannels)) {
       clearTimeout(freshChannelManager.managedChannels[key].deleteTimer);
@@ -106,17 +132,10 @@ async function withGuildConfigStub(stubExports, fn) {
   }
 }
 
-function guildConfigStub() {
-  return {
-    getChannelId: (g, k) => (k === 'tournamentForum' ? FORUM_ID : null),
-    getTagId: (g, region) => REGION_TAG_IDS[region] ?? null,
-    getRoleId: () => null,
-  };
-}
-
 test('a channel tracked under an old name gets renamed in place, not duplicated, when naming logic changes', async () => {
-  await withGuildConfigStub(guildConfigStub(), async (cm) => {
-    const oldThread = makeFakeThread('ch1', 'old-wrong-name', [REGION_TAG_IDS.EU]);
+  await withGuildConfigStub(async (cm) => {
+    // "New Correct Tournament Name" has no build-mode marker -> defaults to battle_royale.
+    const oldThread = makeFakeThread('ch1', 'old-wrong-name', forumId('EU', 'battle_royale'));
     const { guild, channelsById, getCreateCalls } = makeFakeGuild('guild1', [oldThread]);
 
     const pinnedMessages = {
@@ -145,14 +164,13 @@ test('a channel tracked under an old name gets renamed in place, not duplicated,
     await cm.createTournamentChannel(guild, tournament, pinnedMessages);
 
     assert.equal(getCreateCalls(), 0, 'must not create a second post for the same eventId');
-    assert.equal(channelsById.size, 2, 'still exactly one post for this tournament (plus the forum itself)');
     assert.deepEqual(oldThread.setNameCalls, [cm.buildChannelName('New Correct Tournament Name')]);
     assert.equal(pinnedMessages.ch1.tournamentName, 'New Correct Tournament Name');
   });
 });
 
-test('a genuinely new tournament (no existing post matches its identity) still creates normally', async () => {
-  await withGuildConfigStub(guildConfigStub(), async (cm) => {
+test('a genuinely new tournament (no existing post matches its identity) creates in the correct region×build-mode forum', async () => {
+  await withGuildConfigStub(async (cm) => {
     const { guild, channelsById, getCreateCalls } = makeFakeGuild('guild1', []);
     const pinnedMessages = {};
 
@@ -170,22 +188,22 @@ test('a genuinely new tournament (no existing post matches its identity) still c
     await cm.createTournamentChannel(guild, tournament, pinnedMessages);
 
     assert.equal(getCreateCalls(), 1, 'must create exactly one new post');
-    assert.equal(channelsById.size, 2); // forum + the one new post
-    const created = [...channelsById.values()].find(c => c.id !== FORUM_ID);
+    const created = [...channelsById.values()].find(c => c.setNameCalls !== undefined);
     assert.equal(created.name, cm.buildChannelName('Brand New Cup'));
-    assert.deepEqual(created.appliedTags, [REGION_TAG_IDS.EU]);
+    assert.equal(created.parentId, forumId('EU', 'battle_royale'), 'no build-mode marker -> defaults to Battle Royale -> the EU/battle_royale forum');
 
     const pinnedEntry = Object.values(pinnedMessages).find(p => p.tournamentEventId === 'epicgames_brandnew_EU');
     assert.ok(pinnedEntry, 'new post must be tracked under its stable eventId');
     assert.equal(pinnedEntry.tournamentName, 'Brand New Cup');
+    assert.equal(pinnedEntry.buildMode, 'battle_royale', 'buildMode must be stamped on the pinned entry too');
   });
 });
 
 test('re-running with no naming change is a pure no-op: no rename, no new post', async () => {
-  await withGuildConfigStub(guildConfigStub(), async (cm) => {
+  await withGuildConfigStub(async (cm) => {
     const correctName = cm.buildChannelName('Already Correctly Named Cup');
-    const existingThread = makeFakeThread('ch2', correctName, [REGION_TAG_IDS.EU]);
-    const { guild, channelsById, getCreateCalls } = makeFakeGuild('guild1', [existingThread]);
+    const existingThread = makeFakeThread('ch2', correctName, forumId('EU', 'battle_royale'));
+    const { guild, getCreateCalls } = makeFakeGuild('guild1', [existingThread]);
 
     const pinnedMessages = {
       ch2: {
@@ -213,15 +231,14 @@ test('re-running with no naming change is a pure no-op: no rename, no new post',
     await cm.createTournamentChannel(guild, tournament, pinnedMessages);
 
     assert.equal(getCreateCalls(), 0);
-    assert.equal(channelsById.size, 2);
     assert.deepEqual(existingThread.setNameCalls, [], 'must not call setName when the name already matches');
     assert.equal(pinnedMessages.ch2.tournamentName, 'Already Correctly Named Cup');
   });
 });
 
 test('two different tournaments (different eventIds) never collide even with similar names', async () => {
-  await withGuildConfigStub(guildConfigStub(), async (cm) => {
-    const { guild, channelsById, getCreateCalls } = makeFakeGuild('guild1', []);
+  await withGuildConfigStub(async (cm) => {
+    const { channelsById, guild, getCreateCalls } = makeFakeGuild('guild1', []);
     const pinnedMessages = {};
 
     const br = {
@@ -237,17 +254,21 @@ test('two different tournaments (different eventIds) never collide even with sim
     await cm.createTournamentChannel(guild, zb, pinnedMessages);
 
     assert.equal(getCreateCalls(), 2, 'distinct eventIds must produce two distinct posts');
-    assert.equal(channelsById.size, 3); // forum + 2 posts
+    const posts = [...channelsById.values()].filter(c => c.setNameCalls !== undefined);
+    assert.equal(posts.length, 2);
+    // Same region, but genuinely different build modes -> two DIFFERENT forums, not just two
+    // different posts in the same one.
+    assert.deepEqual(posts.map(p => p.parentId).sort(), [forumId('EU', 'battle_royale'), forumId('EU', 'zero_build')].sort());
   });
 });
 
-// Item #3's actual crux: with every region sharing ONE forum now, a same-titled tournament in a
-// different region must be disambiguated by its applied TAG, not by category/parent alone — the
-// same parentId (the shared forum) is no longer enough on its own. Deliberately has NO eventId (a
-// raw, never-before-seen session with the same title in two regions) so this exercises
-// findExistingTournamentChannel's name+tag fallback match specifically, not the eventId path.
-test('the SAME tournament title in two different regions, with no eventId to disambiguate by, are treated as two separate posts (tag-based match, not the old category-based one)', async () => {
-  await withGuildConfigStub(guildConfigStub(), async (cm) => {
+// The forum-restructure's actual crux: with 9 separate forums now (one per region×build-mode),
+// region AND build mode both need to independently route a tournament into the correct one —
+// neither dimension alone is enough to reuse the old "one shared thing, disambiguate the rest"
+// approach. Deliberately has NO eventId (a raw, never-before-seen session) so this exercises
+// findExistingTournamentChannel's name+forum fallback match specifically, not the eventId path.
+test('the SAME tournament title in two different regions (same build mode) route into two different forums, never collide', async () => {
+  await withGuildConfigStub(async (cm) => {
     const { guild, channelsById, getCreateCalls } = makeFakeGuild('guild1', []);
     const pinnedMessages = {};
 
@@ -263,15 +284,38 @@ test('the SAME tournament title in two different regions, with no eventId to dis
     await cm.createTournamentChannel(guild, euVersion, pinnedMessages);
     await cm.createTournamentChannel(guild, nacVersion, pinnedMessages);
 
-    assert.equal(getCreateCalls(), 2, 'same title, different region tags — must NOT be treated as the same existing post');
-    const posts = [...channelsById.values()].filter(c => c.id !== FORUM_ID);
+    assert.equal(getCreateCalls(), 2, 'same title, different regions — must NOT be treated as the same existing post');
+    const posts = [...channelsById.values()].filter(c => c.setNameCalls !== undefined);
     assert.equal(posts.length, 2);
-    assert.deepEqual(posts.map(p => p.appliedTags).sort(), [[REGION_TAG_IDS.NAC], [REGION_TAG_IDS.EU]].sort());
+    assert.deepEqual(posts.map(p => p.parentId).sort(), [forumId('EU', 'battle_royale'), forumId('NAC', 'battle_royale')].sort());
   });
 });
 
-test('re-running the SAME region+title (still no eventId) correctly matches the existing post instead of duplicating it', async () => {
-  await withGuildConfigStub(guildConfigStub(), async (cm) => {
+test('the SAME region+title but a DIFFERENT build mode routes into a different forum, never collides with the other build mode\'s post', async () => {
+  await withGuildConfigStub(async (cm) => {
+    const { guild, channelsById, getCreateCalls } = makeFakeGuild('guild1', []);
+    const pinnedMessages = {};
+
+    const brVersion = {
+      name: 'Weekly Skin Cup', region: 'EU', beginTime: futureIso(20), lastBeginTime: futureIso(20),
+      isTrios: false, consoleOnly: false, isPermanent: false, eventId: null,
+    };
+    const reloadVersion = {
+      name: 'Weekly Skin Cup (Reload)', region: 'EU', beginTime: futureIso(20), lastBeginTime: futureIso(20),
+      isTrios: false, consoleOnly: false, isPermanent: false, eventId: null,
+    };
+
+    await cm.createTournamentChannel(guild, brVersion, pinnedMessages);
+    await cm.createTournamentChannel(guild, reloadVersion, pinnedMessages);
+
+    assert.equal(getCreateCalls(), 2);
+    const posts = [...channelsById.values()].filter(c => c.setNameCalls !== undefined);
+    assert.deepEqual(posts.map(p => p.parentId).sort(), [forumId('EU', 'battle_royale'), forumId('EU', 'reload')].sort());
+  });
+});
+
+test('re-running the SAME region+title+build-mode (still no eventId) correctly matches the existing post instead of duplicating it', async () => {
+  await withGuildConfigStub(async (cm) => {
     const { guild, channelsById, getCreateCalls } = makeFakeGuild('guild1', []);
     const pinnedMessages = {};
 
@@ -284,6 +328,6 @@ test('re-running the SAME region+title (still no eventId) correctly matches the 
     await cm.createTournamentChannel(guild, { ...tournament }, pinnedMessages);
 
     assert.equal(getCreateCalls(), 1, 'the second call must find and reuse the first call\'s post, not create a duplicate');
-    assert.equal([...channelsById.values()].filter(c => c.id !== FORUM_ID).length, 1);
+    assert.equal([...channelsById.values()].filter(c => c.setNameCalls !== undefined).length, 1);
   });
 });

@@ -37,7 +37,7 @@ const { BOT_OWNER_DISCORD_ID } = suggestions;
 const {
   buildTournamentEmbed, buildQueueButtons, buildLeaveQueueButton,
   RANK_TIERS, rankTierByKey, rankedCupPoolName, buildRankedCupTournamentEmbed, buildRankedCupQueueButtons,
-  buildTournamentApprovalEmbed,
+  buildTournamentApprovalEmbed, buildTournamentApprovalButtons, buildBuildModeSelectRow,
   buildChannelDeletionUndoEmbed, buildRestoreChannelListEmbed, buildRestoreChannelButtons,
   buildMatchConfirmedEmbed,
   buildUserSelectRow,
@@ -1129,6 +1129,36 @@ async function handleInteraction(interaction) {
 
   // ── SELECT MENUS ─────────────────────────────────────────────────────────────
   if (interaction.isStringSelectMenu()) {
+    // ── TOURNAMENT BUILD-MODE SELECT (owner DM — corrects auto-detected build mode before
+    // Approve/Reject) ── Deliberately BEFORE the generic deferReply below, same precedent as the
+    // tournament_approve_/tournament_reject_ button branch: this edits the SAME DM message in
+    // place (deferUpdate), not a new ephemeral reply, and — like that branch — is clicked from a
+    // DM, before anything below that assumes `guild` is set.
+    if (interaction.customId.startsWith('tournament_buildmode_')) {
+      await interaction.deferUpdate();
+
+      if (interaction.user.id !== tournamentApproval.BOT_OWNER_DISCORD_ID) {
+        // Same defensive-only rationale as tournament_approve_/tournament_reject_ — only the owner
+        // was ever DMed this message.
+        return;
+      }
+
+      const eventId = interaction.customId.replace('tournament_buildmode_', '');
+      const buildMode = interaction.values[0];
+      const record = await tournamentApproval.setBuildMode(eventId, buildMode);
+      if (!record) {
+        // No longer pending (already decided, or expired, between the DM being sent and this
+        // click) — nothing left to correct, leave the settled embed/buttons exactly as they are.
+        return;
+      }
+
+      await interaction.editReply({
+        embeds: [buildTournamentApprovalEmbed(record.tournament)],
+        components: [buildBuildModeSelectRow(eventId, record.tournament.buildMode), buildTournamentApprovalButtons(eventId)],
+      });
+      return;
+    }
+
     await interaction.deferReply({ flags: 64 });
     const { user, customId, values, guildId } = interaction;
 

@@ -5,7 +5,8 @@ const { scrapeUpcomingTournaments, isBareBuildModeLabel, isRankedCupTitle } = re
 const { savePinnedMessages } = require('./store');
 const { buildTournamentEmbed, buildRankedCupTournamentEmbed, buildRankedCupQueueButtons, rankedCupPoolName, RANK_TIERS } = require('./embeds');
 const { getQueueCount } = require('./queue');
-const { getChannelId, getTagId } = require('./guild-config');
+const { getChannelId } = require('./guild-config');
+const { detectBuildMode } = require('./build-mode');
 const playerStore = require('./players');
 const tournamentApproval = require('./tournament-approval');
 const { markSelfDeletion } = require('./self-deletion-tracker');
@@ -160,19 +161,21 @@ function refreshPermanentBeginTime(channelId, latestBeginTime, pinnedMessages, g
 // shipped left its old, now-incorrectly-named channels sitting as duplicates until their own
 // deletion timer eventually cleared them, across every server, each time.
 //
-// Falls back to a name+forum+tag match when there's no eventId (a raw session that somehow
-// arrived without one) or no pinnedMessages entry matches it yet (e.g. a post that predates this
-// field) — so a genuinely untracked-but-correctly-named post still isn't duplicated either.
+// Falls back to a name+forum match when there's no eventId (a raw session that somehow arrived
+// without one) or no pinnedMessages entry matches it yet (e.g. a post that predates this field) —
+// so a genuinely untracked-but-correctly-named post still isn't duplicated either.
 //
-// Region used to disambiguate same-named tournaments in different regions via category membership
-// (parentId) alone, since each region had its own category. One shared forum now holds every
-// region's posts, so parentId alone would incorrectly treat "ZB Mongraal Cup" in EU and in NAC as
-// the same post — appliedTags (the region tag) is what actually disambiguates them now; parentId
-// is kept alongside it purely to scope the search to this guild's own tournament forum. A pre-
-// migration plain-text channel (legacy, still tracked via its own pinnedMessages entry) has no
-// appliedTags at all, so it naturally never matches here — it's still found via the eventId path
-// above regardless of its channel type.
-async function findExistingTournamentChannel(guild, pinnedMessages, tournament, forumChannelId, regionTagId, channelName) {
+// Region+build-mode used to disambiguate same-named tournaments via category membership (parentId)
+// alone (one category per region), then briefly via an applied tag once every region shared one
+// forum. Now there are 9 separate forums — one per region×build-mode combination — so parentId
+// alone is sufficient again, exactly like the original per-category design: forumChannelId here is
+// already THE specific forum this tournament's region+buildMode routes to (see
+// createTournamentChannel), so any post found under it is necessarily the right region AND the
+// right build mode. A pre-migration plain-text channel (legacy, still tracked via its own
+// pinnedMessages entry) has some other parentId (a category, or an old shared forum), so it
+// naturally never matches here — it's still found via the eventId path above regardless of its
+// channel type or which forum/category it lives in.
+async function findExistingTournamentChannel(guild, pinnedMessages, tournament, forumChannelId, channelName) {
   if (tournament.eventId) {
     const match = Object.entries(pinnedMessages).find(
       ([, pinned]) => pinned.guildId === guild.id && pinned.tournamentEventId === tournament.eventId
@@ -186,11 +189,7 @@ async function findExistingTournamentChannel(guild, pinnedMessages, tournament, 
     }
   }
 
-  const existing = guild.channels.cache.find(c =>
-    c.name === channelName
-    && c.parentId === (forumChannelId ?? null)
-    && (!regionTagId || c.appliedTags?.includes(regionTagId))
-  );
+  const existing = guild.channels.cache.find(c => c.name === channelName && c.parentId === (forumChannelId ?? null));
   if (existing) return { channel: existing, pinnedEntry: pinnedMessages[existing.id] ?? null, matchedBy: 'name' };
 
   return null;
@@ -246,14 +245,22 @@ async function createTournamentChannel(guild, tournament, pinnedMessages) {
   const dateStr = perDay ? getDateStr(beginTime) : null;
   const channelName = buildChannelName(name, dateStr);
 
-  console.log(`  🔧 createTournamentChannel("${name}", ${region}) → post title "${channelName}"`);
+  // buildMode is normally already stamped by tournament-scraper.js's buildTournamentGroups (and
+  // carried through tournament-approval.js's pending record, possibly manually corrected there —
+  // see gateTournaments' doc comment) — the fallback re-detection here only matters for a
+  // tournament object that predates this field entirely (a restored channel-deletion-undo.js
+  // snapshot from before buildMode was added to pinnedMessages, or a manually /setup-tournament-
+  // style object), so a stale/missing field never blocks routing outright.
+  const buildMode = tournament.buildMode ?? detectBuildMode(name.toLowerCase());
 
-  // Region is no longer baked into the name (one shared forum holds every region's posts,
-  // disambiguated by tag instead — see findExistingTournamentChannel's own doc comment), so the
-  // same tournament in a different region produces an identical title.
-  const forumChannelId = getChannelId(guild.id, 'tournamentForum');
-  const regionTagId = getTagId(guild.id, region);
-  const found = await findExistingTournamentChannel(guild, pinnedMessages, tournament, forumChannelId, regionTagId, channelName);
+  console.log(`  🔧 createTournamentChannel("${name}", ${region}, ${buildMode}) → post title "${channelName}"`);
+
+  // Region is no longer baked into the name — which of the 9 region×build-mode forums a post
+  // lives in is what disambiguates it now (see findExistingTournamentChannel's own doc comment),
+  // so the same tournament in a different region (or a different build mode) produces an
+  // identical title, just routed into a different forum.
+  const forumChannelId = getChannelId(guild.id, `tournamentForum_${region}_${buildMode}`);
+  const found = await findExistingTournamentChannel(guild, pinnedMessages, tournament, forumChannelId, channelName);
   if (found) {
     const { channel: existing, pinnedEntry, matchedBy } = found;
 
@@ -298,28 +305,25 @@ async function createTournamentChannel(guild, tournament, pinnedMessages) {
   // filtered those out before this tournament ever reached us.
 
   if (!forumChannelId) {
-    console.error(`  ❌ No tournament forum configured for this guild — run /matchmaker-setup (or wait for the next startup self-heal) before tournament posts can be created`);
+    console.error(`  ❌ No ${region}/${buildMode} tournament forum configured for this guild — run /matchmaker-setup (or wait for the next startup self-heal) before this tournament's post can be created`);
     return;
   }
   const forum = await guild.channels.fetch(forumChannelId).catch(() => null);
   if (!forum) {
-    console.error(`  ❌ Configured tournament forum ${forumChannelId} no longer exists for this guild`);
+    console.error(`  ❌ Configured ${region}/${buildMode} tournament forum ${forumChannelId} no longer exists for this guild`);
     return;
-  }
-  if (!regionTagId) {
-    console.log(`  ⚠️ No ${region} tag configured for this guild — post will be created untagged`);
   }
 
   // Visibility/attachment-lock permissions are NOT set per-post here — a forum THREAD can't hold
   // its own overwrites independent of its parent forum channel (confirmed via discord.js source:
   // ThreadChannel has no .permissionOverwrites at all, and GuildForumThreadManager#create's
   // options don't accept any). The forum CHANNEL's own overwrites (matchmaker-setup.js's
-  // ensureTournamentForum + permissions.js's enforcePermissions) are what every post inherits —
+  // ensureTournamentForums + permissions.js's enforcePermissions) are what every post inherits —
   // same @everyone-ViewChannel-allow/AttachFiles-EmbedLinks-deny + mod-role-allow rule as before,
-  // just applied once at the forum level instead of once per post.
+  // just applied once per forum instead of once per post.
 
   try {
-    console.log(`  🚀 Calling forum.threads.create("${channelName}")...`);
+    console.log(`  🚀 Calling forum.threads.create("${channelName}") in the ${region}/${buildMode} forum...`);
 
     // Permanent tournaments never get a deleteAt at all — never scheduled for deletion, by
     // design (see the class-level comment on PERMANENT_KEYWORDS in tournament-scraper.js).
@@ -334,7 +338,9 @@ async function createTournamentChannel(guild, tournament, pinnedMessages) {
     const thread = await forum.threads.create({
       name: channelName,
       message: { embeds: [embed], components },
-      appliedTags: regionTagId ? [regionTagId] : [],
+      // No appliedTags — which forum this post is created in already fully encodes region AND
+      // build mode (see findExistingTournamentChannel's doc comment), unlike the earlier single-
+      // shared-forum design this replaces.
       // Max available (1 week) — not enough on its own for a genuinely permanent post (FNCS
       // Divisionals can go quiet longer than that with no new messages, and editing the starter
       // message — which the periodic refresh does — does NOT reset this timer, only a new message
@@ -355,6 +361,12 @@ async function createTournamentChannel(guild, tournament, pinnedMessages) {
       tournamentName: name,
       tournamentEventId: tournament.eventId ?? null,
       region,
+      // Which of the 9 forums this post was routed into — kept on the pinned entry (not just
+      // re-derivable from the title) so a rename/restore/backfill never has to re-run detection
+      // and risk landing on a different value than what actually routed the post originally
+      // (e.g. after a mod manually corrected it at approval time — see tournament-approval.js's
+      // setBuildMode).
+      buildMode,
       isTrios,
       // See tournament-scraper.js's isRankedCupTitle — Ranked Cups get one queue button/pool per
       // in-game rank tier (embeds.js's buildRankedCupQueueButtons/buildRankedCupTournamentEmbed)

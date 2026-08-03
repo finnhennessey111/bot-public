@@ -15,11 +15,13 @@ const guildSchema = new mongoose.Schema({
   channelIds: { type: mongoose.Schema.Types.Mixed, default: {} },
   roleIds: { type: mongoose.Schema.Types.Mixed, default: {} },
   categoryIds: { type: mongoose.Schema.Types.Mixed, default: {} },
-  // Forum tag IDs — parallel to categoryIds, but for the forum-post-based tournament channels
-  // (channelIds.tournamentForum holds the forum channel itself). Region used to be expressed by
-  // which category a tournament's text channel lived in; a forum post can't be parented into a
-  // per-region category the same way (one shared forum holds every region's posts), so region is
-  // instead an applied TAG on the post — tagIds.EU/NAC/ME hold that forum's tag IDs for this guild.
+  // Forum tag IDs from an earlier tournament-forum design (one shared "tournaments" forum, region
+  // expressed as an applied tag: EU/NAC/ME). Superseded by 9 separate region×build-mode forums
+  // (channelIds.tournamentForum_{region}_{buildMode} — see matchmaker-setup.js's
+  // TOURNAMENT_FORUM_SPECS), which no longer use tags at all. Left in place, unused by any current
+  // code path, rather than deleted — a guild that has this populated still has a real, working
+  // shared forum in Discord with real posts inside it; nothing here migrates or removes those, see
+  // guild-config.js's GUILD_CONFIG_MIGRATIONS doc comment for the full non-destructive rationale.
   tagIds: { type: mongoose.Schema.Types.Mixed, default: {} },
   pinnedMessages: { type: mongoose.Schema.Types.Mixed, default: {} },
   creativeChannels: { type: mongoose.Schema.Types.Mixed, default: {} },

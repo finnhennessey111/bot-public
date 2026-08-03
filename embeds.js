@@ -7,6 +7,7 @@ const {
 const config = require('./config');
 const { MODES, REGIONS } = require('./creative-queue');
 const epicOAuth = require('./epic-oauth');
+const { BUILD_MODES, buildModeSpec } = require('./build-mode');
 
 const PLATFORM_ICONS = {
   PC: '🖥️',
@@ -238,11 +239,14 @@ function buildTournamentApprovalEmbed(tournament, decision = null) {
     expired: '⌛ **Expired** — the tournament\'s start time passed with no decision, so it was skipped.',
   }[decision];
 
+  const buildModeLabel = buildModeSpec(tournament.buildMode).label;
+
   return new EmbedBuilder()
     .setTitle(decision ? '🆕 Tournament review — settled' : '🆕 New tournament detected — approval needed')
     .setDescription(
       `**${tournament.name}**\n` +
       `Region: ${tournament.region}\n` +
+      `Build mode: ${buildModeLabel}${decision ? '' : ' (auto-detected — change below before approving if wrong)'}\n` +
       `Format: ${tournament.isTrios ? 'Trios' : 'Duos'}\n` +
       `Starts: <t:${startTs}:F> (<t:${startTs}:R>)\n` +
       (tags.length ? `${tags.join(' • ')}\n` : '') +
@@ -250,6 +254,28 @@ function buildTournamentApprovalEmbed(tournament, decision = null) {
       (statusLine ? `\n\n${statusLine}` : '')
     )
     .setColor(decision === 'rejected' ? 0xE74C3C : decision === 'expired' ? 0x95A5A6 : 0x4A90D9);
+}
+
+// Lets the developer correct tournament-scraper.js's title-based auto-detection (build-mode.js's
+// detectBuildMode) before approving — some titles are genuinely ambiguous and worth a real check
+// in-game rather than trusting automated detection alone. Pre-selected to currentBuildMode (the
+// tournament's current value — auto-detected default, or whatever was last picked here) via
+// setDefault, so re-rendering after a change (index.js's tournament_buildmode_ handler) shows the
+// new choice as selected, not reset back to the top.
+function buildBuildModeSelectRow(eventId, currentBuildMode) {
+  return new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId(`tournament_buildmode_${eventId}`)
+      .setPlaceholder('Build mode')
+      .addOptions(
+        BUILD_MODES.map(mode =>
+          new StringSelectMenuOptionBuilder()
+            .setLabel(mode.label)
+            .setValue(mode.key)
+            .setDefault(mode.key === currentBuildMode)
+        )
+      ),
+  );
 }
 
 function buildTournamentApprovalButtons(eventId) {
@@ -1679,6 +1705,7 @@ module.exports = {
   buildRankedCupQueueButtons,
   buildTournamentApprovalEmbed,
   buildTournamentApprovalButtons,
+  buildBuildModeSelectRow,
   buildChannelDeletionUndoEmbed,
   buildChannelDeletionUndoButton,
   buildRestoreChannelListEmbed,

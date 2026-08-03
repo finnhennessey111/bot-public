@@ -26,6 +26,9 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const path = require('path');
+// Static data only (not runtime guild-config state) — safe to require at file scope, outside
+// withFakeGuildConfig's require-cache stubbing below.
+const { TOURNAMENT_FORUM_SPECS } = require('../matchmaker-setup');
 
 function withFakeGuildConfig(fn) {
   const guildConfigPath = require.resolve('../guild-config');
@@ -157,12 +160,14 @@ test('matchmaker-setup: roles/categories/channels created before a partial failu
 
     const saved = getCurrent();
     assert.equal(Object.keys(saved.roleIds).length, 11, 'all 11 roles should be saved even though the run failed later');
-    assert.ok(saved.categoryIds.matchmaker && saved.categoryIds.creative,
-      'both categories should be saved even though the run failed later');
+    assert.ok(saved.categoryIds.matchmaker && saved.categoryIds.creative && saved.categoryIds.tournaments,
+      'all 3 categories should be saved even though the run failed later');
     assert.ok(saved.channelIds.register && saved.channelIds.getRoles && saved.channelIds.howto,
       'channels created before the failing #setup embed post should be saved');
-    assert.ok(saved.channelIds.tournamentForum,
-      'the tournament forum (created before the failing #setup embed post) should be saved too');
+    assert.ok(
+      TOURNAMENT_FORUM_SPECS.every(spec => saved.channelIds[spec.key]),
+      'all 9 tournament forums (created before the failing #setup embed post) should be saved too'
+    );
   });
 });
 

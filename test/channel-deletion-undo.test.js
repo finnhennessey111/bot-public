@@ -9,8 +9,10 @@
 // Tournament posts are forum threads now (see channel-manager.js's createTournamentChannel):
 // every fake "channel" here is thread-shaped (isThread() -> true, no parent category), and
 // guild-config is stubbed (require-cache swap, done once for the whole file in test.before/after
-// since every test needs the same fixed forum/tag values) so createTournamentChannel has
-// somewhere to post. handleChannelDelete's audit-log lookup now also depends on isThread() to pick
+// since every test needs the same fixed forum value) so createTournamentChannel has somewhere to
+// post — one fake forum answers for all 9 region×build-mode keys (these tests are about the
+// deletion-undo flow, not routing itself; test/tournament-channel-rename.test.js covers routing).
+// handleChannelDelete's audit-log lookup now also depends on isThread() to pick
 // AuditLogEvent.ThreadDelete vs .ChannelDelete — covered directly near the bottom of this file.
 //
 // Same "stub the Model with a small real in-memory collection, not the module" precedent as
@@ -26,7 +28,6 @@ const selfDeletionTracker = require('../self-deletion-tracker');
 const store = require('../store');
 
 const FORUM_ID = 'forum-1';
-const REGION_TAG_IDS = { EU: 'tag-eu', NAC: 'tag-nac', ME: 'tag-me' };
 
 // channelManager/channelDeletionUndo are (re)required fresh inside test.before, AFTER the
 // guild-config require-cache swap below — a plain top-level require() here would run before
@@ -49,8 +50,7 @@ test.before(() => {
   require.cache[guildConfigPath] = {
     id: guildConfigPath, filename: guildConfigPath, loaded: true,
     exports: {
-      getChannelId: (g, k) => (k === 'tournamentForum' ? FORUM_ID : null),
-      getTagId: (g, region) => REGION_TAG_IDS[region] ?? null,
+      getChannelId: (g, k) => (k.startsWith('tournamentForum_') ? FORUM_ID : null),
       getRoleId: () => null,
     },
   };

@@ -2,6 +2,7 @@ const puppeteer = require('puppeteer');
 const config = require('./config');
 const { proxyLaunchArgs, authenticatePage, blockUnnecessaryResources, logProxyMode, withBrowserSlot, closeBrowserSafely } = require('./proxy-config');
 const { resolveRosterSize, inferRosterSize } = require('./roster-size');
+const { detectBuildMode } = require('./build-mode');
 
 logProxyMode('tournament-scraper');
 
@@ -139,6 +140,14 @@ function buildTournamentGroups(rawSessions) {
     const isMultiSession = MULTI_SESSION_KEYWORDS.some(k => session.titleLower.includes(k));
     const isPermanent = PERMANENT_KEYWORDS.some(k => session.titleLower.includes(k));
     const isRankedCup = isRankedCupTitle(session.titleLower);
+    // Auto-detected default (build-mode.js) — routes channel-manager.js's createTournamentChannel
+    // into the correct one of the 9 region×build-mode forums. Carried through
+    // tournament-approval.js's pending record as-is; a mod can override it via the approval DM's
+    // build-mode select menu before approving (tournament-approval.js's setBuildMode) — that
+    // override, once made, takes precedence over re-running this detection on every later tick
+    // (see gateTournaments' doc comment on why the already-approved fast path reads it back off
+    // the record instead of recomputing).
+    const buildMode = detectBuildMode(session.titleLower);
 
     if (!groups[session.key]) {
       groups[session.key] = {
@@ -152,6 +161,7 @@ function buildTournamentGroups(rawSessions) {
         isMultiSession,
         isPermanent,
         isRankedCup,
+        buildMode,
         platforms: session.platforms,
         // Stable identity independent of the rendered title — Fortnite Tracker's own event
         // identifier for this tournament+region+build-mode (e.g. "epicgames_S41_PSTypicalGamer_EU"

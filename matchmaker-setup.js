@@ -13,6 +13,7 @@ const { enforcePermissions, botAccessOverwrite } = require('./permissions');
 const { postCreativeQueueChannel, postComingSoonCreativeChannel, ensureComingSoonCreativeChannel } = require('./creative-channel');
 const { QUEUE_CHANNEL_CONFIGS, COMING_SOON_CREATIVE_CATEGORIES } = require('./creative-channel-configs');
 const { ACCESS_GATING_ENABLED } = require('./access');
+const { BUILD_MODES } = require('./build-mode');
 const changelog = require('./changelog');
 const {
   buildRolesEmbed, buildRolesComponents, buildBioButtonRow, buildRegisterEmbed, buildEpicLinkButtonRow,
@@ -40,11 +41,14 @@ const ROLE_SPECS = [
 ];
 
 // EU/NAC/ME used to be here (one category per region, tournament text channels parented into the
-// matching one) — replaced by ensureTournamentForum below: one shared forum channel with region
-// expressed as a tag instead of a parent category (see models/Guild.js's tagIds doc comment for
-// why a forum post can't be parented per-region the way a text channel was). A guild that already
-// has old EU/NAC/ME categories from before this migration keeps them untouched — nothing here
-// deletes a pre-existing category, they're just no longer created/managed for new setups.
+// matching one) — replaced first by a single shared "tournaments" forum with region as a tag, and
+// now by 'tournaments' below: one category holding 9 separate forums, one per region×build-mode
+// combination (TOURNAMENT_FORUM_SPECS) — region is expressed by WHICH forum a post lives in again,
+// same as the original per-region categories, just with build-mode as an additional dimension
+// categories never had. A guild that already has old EU/NAC/ME categories, or the old single
+// shared "tournaments" forum, from before either migration keeps them untouched — nothing here
+// deletes a pre-existing category/channel, they're just no longer created/managed for new setups.
+// See ensureTournamentForums' own doc comment for why 9 separate forums instead of tags.
 const CATEGORY_SPECS = [
   // Parent for register/get-roles/how-to-use/access (CHANNEL_SPECS' `category: 'matchmaker'`
   // entries below) — groups the bot's generically-named, member-facing channels together instead
@@ -61,6 +65,8 @@ const CATEGORY_SPECS = [
   // channel's own per-creation overwrite instead), so any channel placed under it inherits bot
   // access automatically instead of needing enforcePermissions to patch it in after the fact.
   { key: 'creative', name: 'Creative' },
+  // Parent for the 9 tournament forums (TOURNAMENT_FORUM_SPECS/ensureTournamentForums below).
+  { key: 'tournaments', name: 'Tournaments' },
 ];
 
 const CHANNEL_SPECS = [
@@ -98,17 +104,30 @@ const CREATIVE_CHANNEL_SPECS = [
   { key: '8s', name: 'creative-8s' },
 ];
 
-// One shared forum channel for every region's tournament posts — ensureTournamentForum below.
-const TOURNAMENT_FORUM_SPEC = { key: 'tournamentForum', name: 'tournaments' };
-
 // Same region set tournament-scraper.js's SUPPORTED_REGIONS covers — deliberately not imported
 // from there (that module is scraper-side, this is guild-setup-side; duplicating three short
 // strings is cheaper than adding a cross-cutting dependency between them for it).
-const REGION_TAG_SPECS = [
+const REGION_SPECS = [
   { key: 'EU', name: 'EU' },
   { key: 'NAC', name: 'NAC' },
   { key: 'ME', name: 'ME' },
 ];
+
+// 9 forums: one per region×build-mode combination. key matches exactly what channel-manager.js's
+// createTournamentChannel looks up (`tournamentForum_${region}_${buildMode}`) — guild-config.js's
+// existing flat channelIds map stores each one under this composite key, same mechanism every
+// other single-channel entry (getRoles, howto, setup, ...) already uses; no new top-level
+// guild-config field needed for this (unlike the old tagIds map, which this replaces and makes
+// unused going forward — see guild-config.js's own migration doc comment on why tagIds is left in
+// place rather than deleted).
+const TOURNAMENT_FORUM_SPECS = REGION_SPECS.flatMap(region =>
+  BUILD_MODES.map(mode => ({
+    key: `tournamentForum_${region.key}_${mode.key}`,
+    name: `${region.name.toLowerCase()}-${mode.abbreviation.toLowerCase()}`,
+    region: region.key,
+    buildMode: mode.key,
+  }))
+);
 
 const runningGuilds = new Set();
 
@@ -168,47 +187,42 @@ async function ensureChannel(guild, existingChannelIds, spec, { parentId, parent
   return created.id;
 }
 
-// Fetch-or-create the shared tournament forum, then reconcile its available tags to exactly
-// REGION_TAG_SPECS. Tag identity is preserved across re-runs by ID (existingTagIds — the guild's
-// currently-stored tagIds map), not by matching on name: passing a tag WITH its existing id back
-// into setAvailableTags keeps that same id (confirmed against discord.js's ThreadOnlyChannel
-// source — GuildForumTagData's `id` is optional specifically so an entry without one gets a fresh
-// id assigned while one that includes it is preserved). Without this, a routine /matchmaker-setup
-// re-run would mint three brand new tag IDs every time and orphan every already-created post's
-// appliedTags reference to the old ones. A region whose stored id no longer exists on the forum
-// (deleted out-of-band, in Discord's UI) safely falls back to getting a fresh one, same as a
-// first-ever run.
-async function ensureTournamentForum(guild, existingChannelIds, existingTagIds) {
-  let channel = existingChannelIds.tournamentForum
-    ? await guild.channels.fetch(existingChannelIds.tournamentForum).catch(() => null)
-    : null;
+// Fetch-or-create all 9 region×build-mode forums, parented under the Tournaments category. Each
+// forum is independently idempotent (same fetch-existing-by-id-else-create pattern as
+// ensureChannel/ensureCategory above) — a partial prior run that only got through some of the 9
+// resumes correctly, same "nothing duplicated on retry" guarantee the rest of setup already has.
+//
+// No tags here at all (unlike the earlier single-shared-forum design this replaces) — region AND
+// build-mode are now both expressed by WHICH of the 9 forums a post lives in, the same way region
+// alone used to be expressed by which of the 3 old EU/NAC/ME categories a channel lived in. That's
+// what item #2/#3 of the restructure asked for specifically ("region is no longer a tag... replace
+// with 9 distinct forum channels"), and it's simpler besides: no setAvailableTags reconciliation,
+// no tag-id-preservation logic to get right.
+//
+// permissionOverwrites deliberately NOT set here — a forum THREAD can't hold its own overwrites
+// independent of its parent forum channel (confirmed via discord.js source: ThreadChannel extends
+// BaseChannel directly, not GuildChannel, so it has no .permissionOverwrites at all;
+// GuildForumThreadManager#create's options don't accept permissionOverwrites either). The forum
+// CHANNEL's own overwrites are what every post inherits — permissions.js's enforcePermissions
+// (called right after this, at the end of runMatchmakerSetup, and again on every bot startup) sets
+// them on all 9, same as every other managed channel.
+async function ensureTournamentForums(guild, existingChannelIds, categoryId) {
+  const channelIds = {};
 
-  if (!channel) {
-    channel = await guild.channels.create({ name: TOURNAMENT_FORUM_SPEC.name, type: ChannelType.GuildForum });
+  for (const spec of TOURNAMENT_FORUM_SPECS) {
+    const existingId = existingChannelIds[spec.key];
+    let channel = existingId ? await guild.channels.fetch(existingId).catch(() => null) : null;
+
+    if (!channel) {
+      channel = await guild.channels.create({ name: spec.name, type: ChannelType.GuildForum, parent: categoryId ?? null });
+    } else {
+      await ensureChannelParent(channel, categoryId, 'Tournaments');
+    }
+
+    channelIds[spec.key] = channel.id;
   }
 
-  const currentById = new Map((channel.availableTags ?? []).map(tag => [tag.id, tag]));
-  const desiredTags = REGION_TAG_SPECS.map(spec => {
-    const existingId = existingTagIds[spec.key];
-    const existingTag = existingId ? currentById.get(existingId) : null;
-    return existingTag ? { id: existingTag.id, name: spec.name } : { name: spec.name };
-  });
-
-  const updated = await channel.setAvailableTags(desiredTags);
-
-  const tagIds = {};
-  for (const spec of REGION_TAG_SPECS) {
-    tagIds[spec.key] = updated.availableTags.find(tag => tag.name === spec.name)?.id ?? null;
-  }
-
-  // permissionOverwrites deliberately NOT set here — a forum THREAD can't hold its own overwrites
-  // independent of its parent forum channel (confirmed via discord.js source: ThreadChannel
-  // extends BaseChannel directly, not GuildChannel, so it has no .permissionOverwrites at all;
-  // GuildForumThreadManager#create's options don't accept permissionOverwrites either). The
-  // forum CHANNEL's own overwrites are what every post inherits — permissions.js's
-  // enforcePermissions (called right after this, at the end of runMatchmakerSetup, and again on
-  // every bot startup) is the single place that sets them, same as every other managed channel.
-  return { channelId: channel.id, tagIds };
+  return channelIds;
 }
 
 // One-time migration for servers that ran /matchmaker-setup before a given channel's category
@@ -313,7 +327,7 @@ async function runMatchmakerSetup(guild) {
 
   try {
     const config = getGuildConfig(guild.id);
-    let channelIds, creativeChannelIds, roleIds, tagIds;
+    let channelIds, creativeChannelIds, roleIds;
 
     try {
       roleIds = {};
@@ -338,10 +352,9 @@ async function runMatchmakerSetup(guild) {
         channelIds[spec.key] = await ensureChannel(guild, config.channelIds, spec, { parentId, parentLabel: 'MatchMaker' });
       }
 
-      const forum = await ensureTournamentForum(guild, config.channelIds, config.tagIds ?? {});
-      channelIds.tournamentForum = forum.channelId;
-      tagIds = forum.tagIds;
-      await setGuildConfig(guild.id, { channelIds, tagIds });
+      const tournamentForumIds = await ensureTournamentForums(guild, config.channelIds, categoryIds.tournaments);
+      Object.assign(channelIds, tournamentForumIds);
+      await setGuildConfig(guild.id, { channelIds });
 
       creativeChannelIds = {};
       for (const spec of CREATIVE_CHANNEL_SPECS) {
@@ -400,20 +413,20 @@ async function runMatchmakerSetup(guild) {
       const missingCategories = missing(CATEGORY_SPECS, saved.categoryIds);
       const missingChannels = missing(CHANNEL_SPECS, saved.channelIds);
       const missingCreative = CREATIVE_CHANNEL_SPECS.filter(s => !saved.creativeChannels?.[s.key]?.channelId).map(s => s.name);
-      const missingForum = !saved.channelIds?.tournamentForum;
+      const missingForums = missing(TOURNAMENT_FORUM_SPECS, saved.channelIds);
 
       console.error(`❌ /matchmaker-setup failed partway through for guild ${guild.id}: ${err.message}`);
       console.error(
         `   Confirmed so far — roles: ${ROLE_SPECS.length - missingRoles.length}/${ROLE_SPECS.length}, `
         + `categories: ${CATEGORY_SPECS.length - missingCategories.length}/${CATEGORY_SPECS.length}, `
         + `channels: ${CHANNEL_SPECS.length - missingChannels.length}/${CHANNEL_SPECS.length}, `
-        + `tournament forum: ${missingForum ? '0/1' : '1/1'}, `
+        + `tournament forums: ${TOURNAMENT_FORUM_SPECS.length - missingForums.length}/${TOURNAMENT_FORUM_SPECS.length}, `
         + `creative channels: ${CREATIVE_CHANNEL_SPECS.length - missingCreative.length}/${CREATIVE_CHANNEL_SPECS.length}`
       );
       if (missingRoles.length) console.error(`   Not yet created: roles [${missingRoles.join(', ')}]`);
       if (missingCategories.length) console.error(`   Not yet created: categories [${missingCategories.join(', ')}]`);
       if (missingChannels.length) console.error(`   Not yet created: channels [${missingChannels.join(', ')}]`);
-      if (missingForum) console.error('   Not yet created: tournament forum');
+      if (missingForums.length) console.error(`   Not yet created: tournament forums [${missingForums.join(', ')}]`);
       if (missingCreative.length) console.error(`   Not yet created: creative channels [${missingCreative.join(', ')}]`);
       console.error('   Nothing that already existed was deleted or altered — fix the permission gap above and re-run /matchmaker-setup, it will resume from here instead of duplicating what already exists.');
       throw err;
@@ -428,7 +441,7 @@ async function runMatchmakerSetup(guild) {
         `Roles: ${ROLE_SPECS.map(s => s.name).join(', ')}\n` +
         `Categories: ${CATEGORY_SPECS.map(s => s.name).join(', ')}\n` +
         `Channels: ${CHANNEL_SPECS.map(s => `<#${channelIds[s.key]}>`).join(', ')}\n` +
-        `Tournament forum: <#${channelIds.tournamentForum}> (tags: ${REGION_TAG_SPECS.map(s => s.name).join(', ')})\n` +
+        `Tournament forums: ${TOURNAMENT_FORUM_SPECS.map(s => `<#${channelIds[s.key]}>`).join(', ')}\n` +
         `Creative channels: ${CREATIVE_CHANNEL_SPECS.map(s => `<#${creativeChannelIds[s.key]}>`).join(', ')}\n` +
         verifiedRoleLine,
     };
@@ -468,13 +481,13 @@ async function refreshAllSetupEmbeds(client) {
 module.exports = {
   runMatchmakerSetup,
   refreshAllSetupEmbeds,
-  // ensureTournamentForum: called directly by guild-config.js's self-heal migration (a guild
-  // missing channelIds.tournamentForum shouldn't need a full /matchmaker-setup re-run just to get
-  // one) — see that migration's own doc comment for why it's a deferred require rather than a
+  // ensureTournamentForums: called directly by guild-config.js's self-heal migration (a guild
+  // missing any of the 9 tournament forums shouldn't need a full /matchmaker-setup re-run just to
+  // get them) — see that migration's own doc comment for why it's a deferred require rather than a
   // top-level one.
-  ensureTournamentForum,
+  ensureTournamentForums,
   // Specs exported for testing (e.g. a regression guard confirming no "general" text/voice
   // channel is ever added back) — runMatchmakerSetup itself needs a live Discord guild object to
   // exercise, so asserting against these directly is how that's verified without one.
-  ROLE_SPECS, CATEGORY_SPECS, CHANNEL_SPECS, CREATIVE_CHANNEL_SPECS, TOURNAMENT_FORUM_SPEC, REGION_TAG_SPECS,
+  ROLE_SPECS, CATEGORY_SPECS, CHANNEL_SPECS, CREATIVE_CHANNEL_SPECS, TOURNAMENT_FORUM_SPECS,
 };

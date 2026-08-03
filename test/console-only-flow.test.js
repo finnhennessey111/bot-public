@@ -94,8 +94,11 @@ function makeFakeGuild() {
 
 const GUILD_CONFIG_STUB = {
   getRoleId: () => null,
-  getChannelId: (g, k) => (k === 'tournamentForum' ? FORUM_ID : null),
-  getTagId: () => 'eu-tag-id',
+  // Matches any of the 9 region×build-mode forum keys (channel-manager.js's
+  // `tournamentForum_${region}_${buildMode}`) to the one fake forum below — this test is about
+  // consoleOnly flowing through, not routing itself (tournament-channel-rename.test.js covers
+  // that), so one fake forum answering for whichever combo actually gets looked up is enough.
+  getChannelId: (g, k) => (k.startsWith('tournamentForum_') ? FORUM_ID : null),
 };
 
 test('a known console-only tournament: consoleOnly flows all the way from the scraper-shaped tournament object to pinnedMessages', async () => {
@@ -141,7 +144,7 @@ test('an already-tracked channel missing consoleOnly (pre-fix data) gets backfil
     // Simulates a pre-existing forum post — the thread already exists (tracked by eventId in
     // pinnedMessages below), so createTournamentChannel must find and reuse it via the eventId
     // match, not call forum.threads.create() again.
-    const existingChannel = { id: 'existing-thread-1', name: 'console-duos-zb-cash-cup', parentId: FORUM_ID, appliedTags: ['eu-tag-id'], async setName(n) { this.name = n; return this; } };
+    const existingChannel = { id: 'existing-thread-1', name: 'console-duos-zb-cash-cup', parentId: FORUM_ID, async setName(n) { this.name = n; return this; } };
     channelsById.set(existingChannel.id, existingChannel);
 
     // Simulates a real pre-fix pinnedMessages entry — created before this fix shipped, so it has
