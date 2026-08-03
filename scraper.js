@@ -45,7 +45,11 @@ function sleep(ms) {
 // across the whole bot — see that function's header comment for why (a thundering herd of
 // simultaneous scrapes, e.g. every registered player's cache expiring the instant a tournament
 // goes live, is a real path to exhausting a small VPS's memory).
-async function scrapePlayerOnce(epicUsername, region = 'EU', epicId = null) {
+// platformSegment is a real Fortnite Tracker input-method URL segment (config.ftPlatformSegments —
+// confirmed live: kbm, gamepad, touch, all). Defaults to 'all' (the combined/every-input segment,
+// prior behavior unchanged) — only players.js's getStatsForContext ever passes a specific segment,
+// for the one (region, platform) context a queueing player actually needs.
+async function scrapePlayerOnce(epicUsername, region = 'EU', epicId = null, platformSegment = 'all') {
   return withBrowserSlot(async () => {
     const browser = await puppeteer.launch({
       headless: 'new',
@@ -61,8 +65,10 @@ async function scrapePlayerOnce(epicUsername, region = 'EU', epicId = null) {
       );
 
       const slug = encodeURIComponent(epicUsername);
-      const url = config.ftUrls[region]
+      const url = config.ftUrlTemplate
+        .replace('{platform}', platformSegment)
         .replace('{slug}', slug)
+        .replace('{region}', region)
         .replace('{epicId}', epicId ?? '');
 
       console.log(`Scraping: ${url}`);
@@ -125,10 +131,10 @@ async function scrapePlayerOnce(epicUsername, region = 'EU', epicId = null) {
 // Delegates through module.exports (not a direct call to scrapePlayerOnce) so a test can swap in
 // a fake single-attempt implementation without needing a real Puppeteer/network round trip — the
 // exported function is what actually gets called, same as any other real caller.
-async function scrapePlayer(epicUsername, region = 'EU', epicId = null) {
+async function scrapePlayer(epicUsername, region = 'EU', epicId = null, platformSegment = 'all') {
   for (let attempt = 1; attempt <= PLAYER_SCRAPE_MAX_ATTEMPTS; attempt++) {
     try {
-      return await module.exports.scrapePlayerOnce(epicUsername, region, epicId);
+      return await module.exports.scrapePlayerOnce(epicUsername, region, epicId, platformSegment);
     } catch (err) {
       console.log(`  [scraper:${epicUsername}] attempt ${attempt}/${PLAYER_SCRAPE_MAX_ATTEMPTS} threw: ${err.message}`);
       if (attempt < PLAYER_SCRAPE_MAX_ATTEMPTS) {
@@ -245,13 +251,24 @@ function computeOwnTournamentModifier(recentEvents, matchesEvent) {
 // does NOT apply to ownTournamentModifier below, where self-referential history for the exact
 // same tournament (even if that tournament is a ranked cup) is always a fair signal.
 //
+// Placement-only (kills dropped) — same bounded 0-100 placement scale ownTournamentModifier
+// already used on its own. Kills previously contributed 30% of this signal; placement quality
+// alone is what's left now, matching ownTournamentModifier's existing shape rather than diverging
+// from it for no reason.
+//
+// No region argument anymore: this used to also take homeRegion/queueRegion to apply a
+// cross-region penalty when they differed, but that penalty is gone now that playerData ITSELF is
+// already the correct region+platform-specific snapshot by the time it gets here (players.js's
+// getStatsForContext resolves which context to scrape before this ever runs) — there is no longer
+// a separate "penalize the mismatch" step because there is no mismatch left to penalize.
+//
 // Returns the individual modifiers alongside the final matchScore — used by queue.js's
 // buildPlayer and creative-queue.js's buildCreativePlayer, both of which stamp soloModifier (not
 // just the final score) onto the built player object so feedback.js can snapshot it verbatim at
 // match time rather than re-deriving it later from a possibly-since-changed recentEvents history.
 // calculateMatchScore below is unchanged for every existing caller — just now implemented in
 // terms of this.
-function computeMatchScoreBreakdown(playerData, tournamentName, homeRegion, queueRegion) {
+function computeMatchScoreBreakdown(playerData, tournamentName) {
   const base = (playerData.totalPR * 10) + (playerData.thisSeasonPR * 5);
 
   const { modifier: ownTournamentModifier } = computeOwnTournamentModifier(
@@ -265,25 +282,19 @@ function computeMatchScoreBreakdown(playerData, tournamentName, homeRegion, queu
   let soloModifier = 0;
   if (soloEvents.length > 0) {
     const placementQuality = (soloEvents.reduce((sum, e) => sum + getPlacementScore(e.placement), 0) / soloEvents.length) / 100;
-    const killsQuality = Math.min((soloEvents.reduce((sum, e) => sum + e.elims, 0) / soloEvents.length) / 45, 1);
-    const soloSignal = (placementQuality * 0.7) + (killsQuality * 0.3);
-    soloModifier = soloSignal * 0.35;
+    soloModifier = placementQuality * 0.35;
   }
 
-  const regionPenalty = homeRegion !== queueRegion
-    ? (config.regionPenalties[homeRegion]?.[queueRegion] ?? 0)
-    : 0;
-
-  const matchScore = Math.round(base * (1 + soloModifier + ownTournamentModifier - regionPenalty));
+  const matchScore = Math.round(base * (1 + soloModifier + ownTournamentModifier));
 
   // soloEvents included alongside soloModifier — the exact (up to 5) events the modifier above was
   // actually computed from, not a re-derived approximation — so a caller (elo.js's public ELO
   // lookup) can show real example events behind the number instead of just the number itself.
-  return { matchScore, base, ownTournamentModifier, soloModifier, regionPenalty, soloEvents };
+  return { matchScore, base, ownTournamentModifier, soloModifier, soloEvents };
 }
 
-function calculateMatchScore(playerData, tournamentName, homeRegion, queueRegion) {
-  return computeMatchScoreBreakdown(playerData, tournamentName, homeRegion, queueRegion).matchScore;
+function calculateMatchScore(playerData, tournamentName) {
+  return computeMatchScoreBreakdown(playerData, tournamentName).matchScore;
 }
 
 module.exports = {

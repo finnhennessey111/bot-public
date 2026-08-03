@@ -48,13 +48,6 @@ module.exports = {
     teamChoiceSeconds: 60,
   },
 
-  // Cross-region Match Score penalties (applied to player's Match Score)
-  regionPenalties: {
-    'ME': { 'NAC': 0.10, 'EU': 0.25 },
-    'NAC': { 'EU': 0.15 },
-    'EU': {},
-  },
-
   // Placement score conversion — bounded 0-100 scale. Worst possible placement in any
   // tournament is #10,000 (confirmed), so this is fully bounded rather than open-ended; bands
   // are calibrated against the actual player base, where top-10/top-50 finishes essentially
@@ -71,10 +64,26 @@ module.exports = {
   channelCreateHoursBefore: 24,  // midday day before = ~24hrs
   channelDeleteHoursAfter: 1,    // delete 1hr after tournament starts
 
-  // Fortnite Tracker URL templates
-  ftUrls: {
-  EU:  'https://fortnitetracker.com/profile/all/{slug}/events?region=EU&id={epicId}',
-  NAC: 'https://fortnitetracker.com/profile/all/{slug}/events?region=NAC&id={epicId}',
-  ME:  'https://fortnitetracker.com/profile/all/{slug}/events?region=ME&id={epicId}',
-},
+  // Fortnite Tracker profile URL template — {platform} is a real Tracker input-method segment
+  // (confirmed live: kbm, gamepad, touch, all all resolve to real profile pages), not a device
+  // field of its own. competitive=pr narrows the response to PR-affecting events only, mirroring
+  // what scraper.js's parseProfileData already discards client-side (event.isPrEvent) anyway — so
+  // this is a pure reduction in what gets downloaded/parsed, no behavior change.
+  ftUrlTemplate: 'https://fortnitetracker.com/profile/{platform}/{slug}/events?region={region}&id={epicId}&competitive=pr',
+
+  // Which Tracker input-method segment stands in for each of this bot's platform roles — the
+  // closest real proxy Tracker exposes for "this platform's own PR" (confirmed real segments via
+  // live Tracker profiles, e.g. fortnitetracker.com/profile/gamepad/Typical%20Gamer and
+  // .../profile/kbm/Hamlinz). Only used when a query actually needs a platform-specific context
+  // (players.js's getStatsForContext) — every other lookup stays on the 'all' (combined) segment,
+  // unchanged from prior behavior. Mobile has no entry: platform-aware PR is scoped to PC/Console
+  // per the actual task this shipped for; a Mobile player's PR context is untouched.
+  ftPlatformSegments: { PC: 'kbm', Console: 'gamepad' },
+
+  // Fortnite Tracker /events calendar query params — competitive=pr narrows the calendar to real
+  // PR-tracked tournaments (see tournament-scraper.js's fetchRawCalendar). playlist is fetched once
+  // per confirmed real value this bot actually needs (duos, trios — solo is irrelevant, this bot
+  // never queues solo tournaments) and merged, rather than one big unfiltered fetch discarding most
+  // of it client-side via BLOCKED_KEYWORDS.
+  ftCalendarPlaylists: ['duos', 'trios'],
 };

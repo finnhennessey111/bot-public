@@ -44,9 +44,32 @@ const playerSchema = new mongoose.Schema({
   prBand: String,
   recentEvents: { type: [recentEventSchema], default: [] },
   // Last time totalPR/thisSeasonPR/prBand/recentEvents were scraped from Fortnite Tracker —
-  // drives both the 24h queue-join cache (players.js's getPlayerStats) and the 1h /refresh-stats
-  // cooldown (players.js's refreshPlayerStats). Null until the player's first scrape.
+  // drives both the recency-based queue-join cache TTL (players.js's getPlayerStats/
+  // cacheTtlMsFor) and the 1h /refresh-stats cooldown (players.js's refreshPlayerStats). Null
+  // until the player's first scrape. This is always this player's HOME region, default (all-
+  // input) platform snapshot — the one every existing caller (findCanonicalByEpicUsername,
+  // getAllScoredPlayers, elo.js, the profile embed) already assumes exists.
   lastUpdated: { type: Date, default: null },
+  // Per-(region, platform-segment) PR snapshots, ADDITIONAL to the home-context fields above —
+  // populated lazily, only for a context a player has actually queued under that genuinely
+  // differs from their home context (players.js's getStatsForContext): a different region (#3 —
+  // "use their PR for the region they're actually about to play in") and/or a different Fortnite
+  // Tracker input segment for a Console player (#6 — gamepad for a console-exclusive tournament,
+  // kbm otherwise). Never populated preemptively for every region/platform combo — only the one
+  // context a real queue join actually needed. Keyed `${region}|${platformSegment}` (e.g.
+  // "NAC|gamepad"). Same recency-based TTL logic as the home context (cacheTtlMsFor) applies to
+  // each entry independently, keyed off that entry's own lastUpdated/recentEvents.
+  statsByContext: {
+    type: Map,
+    of: new mongoose.Schema({
+      totalPR: Number,
+      thisSeasonPR: Number,
+      prBand: String,
+      recentEvents: { type: [recentEventSchema], default: [] },
+      lastUpdated: Date,
+    }, { _id: false }),
+    default: {},
+  },
   registeredAt: { type: Date, default: Date.now },
 });
 

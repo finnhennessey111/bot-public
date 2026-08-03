@@ -389,6 +389,26 @@ function formatDiscordLine(player) {
   return tag === player.discordUsername ? player.discordUsername : `${player.discordUsername} (${tag})`;
 }
 
+// One consistent "true home region/platform vs. currently-displayed PR context" indicator —
+// combines #3's region transparency and #6's platform transparency into a single note rather than
+// two separate ad-hoc ones, per that task's explicit instruction. Returns null (nothing rendered)
+// for the overwhelmingly common case: a player queueing in their own home region on their default
+// platform segment, where the displayed PR already IS their home PR with nothing to disclose.
+// player.prContext is stamped by players.js's getStatsForContext via queue.js's buildPlayer /
+// creative-queue.js's buildCreativePlayer.
+function buildPrContextNote(player) {
+  const ctx = player.prContext;
+  if (!ctx || (ctx.isHomeRegion && ctx.isHomePlatform)) return null;
+
+  const parts = [];
+  if (!ctx.isHomeRegion) parts.push(`${ctx.region} region (home: ${player.homeRegion})`);
+  if (!ctx.isHomePlatform) {
+    const segmentLabel = ctx.platformSegment === 'gamepad' ? 'Console' : 'PC';
+    parts.push(`${segmentLabel}-tournament PR — genuinely ${player.platform}`);
+  }
+  return `Showing: ${parts.join(' • ')}`;
+}
+
 // Shared field set for the tournament duo/trio match card — used by both buildMatchCard (same
 // server) and buildCrossServerPlayerCard (cross-server, which just appends a Server field on
 // top of this). A one-off tournament with no queue history for itself falls back to the
@@ -435,6 +455,11 @@ function buildTournamentPlayerFields(player, tournamentName) {
 
   if (player.ageBracket) {
     fields.splice(3, 0, { name: '🔞 Age Bracket', value: player.ageBracket, inline: true });
+  }
+
+  const prContextNote = buildPrContextNote(player);
+  if (prContextNote) {
+    fields.splice(1, 0, { name: '📎 PR Context', value: prContextNote, inline: true });
   }
 
   return fields;
@@ -736,15 +761,22 @@ function buildCreativeMatchCard(player) {
   const platformIcon = PLATFORM_ICONS[player.platform] ?? '🎮';
   const flag = REGION_FLAGS[player.region] ?? '🏳️';
 
+  const fields = [
+    { name: '⚡ Total PR', value: `**${player.totalPR}**`, inline: true },
+    { name: '🌍 Region', value: `${flag} ${player.region}`, inline: true },
+    { name: '🎮 Platform', value: player.platform, inline: true },
+  ];
+
+  const prContextNote = buildPrContextNote(player);
+  if (prContextNote) {
+    fields.push({ name: '📎 PR Context', value: prContextNote, inline: false });
+  }
+
   return new EmbedBuilder()
     .setTitle(`${platformIcon} ${player.epicUsername}`)
     .setDescription(`**Discord:** ${player.discordUsername}`)
     .setColor(CREATIVE_COLOR)
-    .addFields(
-      { name: '⚡ Total PR', value: `**${player.totalPR}**`, inline: true },
-      { name: '🌍 Region', value: `${flag} ${player.region}`, inline: true },
-      { name: '🎮 Platform', value: player.platform, inline: true },
-    )
+    .addFields(...fields)
     .setFooter({ text: `${player.mode} • MatchMaker Creative` })
     .setTimestamp();
 }

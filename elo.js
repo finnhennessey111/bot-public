@@ -15,8 +15,7 @@
 // Also exposes derived-not-invented pieces per score: `baseline` (the PR-only portion of the SAME
 // formula, before soloModifier/ownTournamentModifier are applied) and `vsBaselinePercent` (this
 // score vs. that baseline). Note `vsBaselinePercent` can only ever be >= 0 — soloModifier and
-// ownTournamentModifier never go negative in the real formula, and this endpoint always calls it
-// with homeRegion === queueRegion so regionPenalty is always 0 — so it is NOT a genuine above/
+// ownTournamentModifier never go negative in the real formula — so it is NOT a genuine above/
 // below-average signal on its own, just "how much bonus is this score carrying over its floor."
 // `relativeToAveragePercent` is the real two-sided comparison: this player's OWN vsBaselinePercent
 // minus the comparison pool's AVERAGE vsBaselinePercent for that same category — positive means a
@@ -123,12 +122,10 @@ function average(nums) {
 // player's creative score, plus their score for each permanent tournament type, using the SAME
 // "no history in this type -> just the shared base" rule buildTournamentElo below gives the
 // looked-up player, so the pool is genuinely apples-to-apples with what's being ranked against it.
-// homeRegion/queueRegion are passed as the same fixed value for every pool player (not each
-// player's own stored region) deliberately — computeMatchScoreBreakdown's regionPenalty only ever
-// applies when they DIFFER, and elo.js always calls it with homeRegion === queueRegion for the
-// looked-up player too (see buildCreativeElo/buildTournamentElo below), so the actual region value
-// never affects the score either way; fetching each pool player's own region would cost an extra
-// projected field for zero behavioral difference.
+// computeMatchScoreBreakdown no longer takes a region at all (see scraper.js's doc comment on it —
+// region-aware PR now happens upstream, in WHICH data was scraped, not inside the formula), so
+// every pool player's stored (home-context) totalPR/thisSeasonPR/recentEvents is used exactly as-
+// is here.
 //
 // Also collects each pool player's OWN vsBaselinePercent (their score vs. their own PR floor) so
 // getPublicElo can compare the looked-up player's bonus against the POOL AVERAGE bonus, not just
@@ -144,7 +141,7 @@ function buildScorePools(allPlayers) {
   const tournamentBonuses = Object.fromEntries(PERMANENT_KEYWORDS.map(k => [k, []]));
 
   for (const playerData of allPlayers) {
-    const { base, soloModifier } = computeMatchScoreBreakdown(playerData, NEVER_MATCHES_A_REAL_TOURNAMENT, 'EU', 'EU');
+    const { base, soloModifier } = computeMatchScoreBreakdown(playerData, NEVER_MATCHES_A_REAL_TOURNAMENT);
     const baseline = Math.round(base);
     const creativeScore = rawTotal(base, soloModifier, 0);
     creative.push(creativeScore);
@@ -190,8 +187,8 @@ function toExampleEvents(events) {
   }));
 }
 
-function buildCreativeElo(playerData, homeRegion, pools) {
-  const { base, soloModifier, soloEvents } = computeMatchScoreBreakdown(playerData, NEVER_MATCHES_A_REAL_TOURNAMENT, homeRegion, homeRegion);
+function buildCreativeElo(playerData, pools) {
+  const { base, soloModifier, soloEvents } = computeMatchScoreBreakdown(playerData, NEVER_MATCHES_A_REAL_TOURNAMENT);
   const { total, currentPR, seasonPR, soloPerformance } = toSegments({
     base, soloModifier, ownTournamentModifier: 0, totalPR: playerData.totalPR, thisSeasonPR: playerData.thisSeasonPR,
   });
@@ -209,8 +206,8 @@ function buildCreativeElo(playerData, homeRegion, pools) {
   };
 }
 
-function buildTournamentElo(playerData, homeRegion, pools) {
-  const { base, soloModifier, soloEvents } = computeMatchScoreBreakdown(playerData, NEVER_MATCHES_A_REAL_TOURNAMENT, homeRegion, homeRegion);
+function buildTournamentElo(playerData, pools) {
+  const { base, soloModifier, soloEvents } = computeMatchScoreBreakdown(playerData, NEVER_MATCHES_A_REAL_TOURNAMENT);
   const baseline = Math.round(base);
 
   return PERMANENT_KEYWORDS.map(keyword => {
@@ -264,7 +261,6 @@ async function getPublicElo(epicUsername) {
     return { found: true, hasStats: false, epicUsername: player.epicUsername };
   }
 
-  const homeRegion = player.region ?? 'EU';
   const playerData = {
     totalPR: player.totalPR ?? 0,
     thisSeasonPR: player.thisSeasonPR ?? 0,
@@ -281,8 +277,8 @@ async function getPublicElo(epicUsername) {
     found: true,
     hasStats: true,
     epicUsername: player.epicUsername,
-    creative: buildCreativeElo(playerData, homeRegion, pools),
-    tournaments: buildTournamentElo(playerData, homeRegion, pools),
+    creative: buildCreativeElo(playerData, pools),
+    tournaments: buildTournamentElo(playerData, pools),
   };
 }
 

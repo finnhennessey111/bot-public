@@ -5,6 +5,7 @@
 // here always creates-or-updates in one atomic call, so that bug can't recur.
 
 const PlayerModel = require('./models/Player');
+const config = require('./config');
 const { scrapePlayer } = require('./scraper');
 
 // How long a scraped stats snapshot is trusted before a Queue click triggers a fresh FT scrape
@@ -12,8 +13,38 @@ const { scrapePlayer } = require('./scraper');
 // (refreshPlayerStats). Deliberately separate constants — one paces automatic reuse, the other
 // paces user-initiated re-scrapes — even though today they're both read off the same
 // lastUpdated timestamp.
-const STATS_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const RECENT_ACTIVITY_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const REFRESH_COOLDOWN_MS = 60 * 60 * 1000;
+
+// Old tournament results never change once they're over — re-scraping a player whose most recent
+// recorded activity is already old can't turn up anything different, so such a player gets a much
+// longer TTL than one who's actively competing (where a fresh event, or Fortnite Tracker's own
+// continuous PR decay, could genuinely have moved the numbers since yesterday). ~90 days is a
+// conservative floor for "more than a Fortnite competitive season has passed" (real seasons run
+// roughly 10-14 weeks) — used only to pick a cache TTL, never to hide/discard any event data
+// itself (recentEvents is stored and returned exactly as scraped either way).
+const SETTLED_ACTIVITY_WINDOW_DAYS = 90;
+
+// Not literally permanent: totalPR is Fortnite Tracker's own continuously-decaying figure (see
+// scraper.js/elo.js's doc comments on totalPR) — it can still drift slowly even for a player with
+// zero new events, so treating a "settled" player as cached forever would eventually go stale in
+// a way nothing would ever notice or correct. 30 days is a large reduction from the 24h recent-
+// activity TTL (the actual goal — meaningfully cut redundant re-scraping of data that can't have
+// meaningfully changed) without claiming a permanence this data doesn't really have.
+const SETTLED_CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
+// A player with NO recorded events at all (brand new, or never actually competed) is deliberately
+// NOT "settled" — they could start playing any day, and there's no history to judge recency from,
+// so they stay on the short TTL rather than risking a month-stale zero after their first real
+// event. Only a player with genuine history whose MOST RECENT entry (recentEvents is stored
+// newest-first — see scraper.js's parseProfileData) is already old counts as settled.
+function cacheTtlMsFor(recentEvents) {
+  const newestDate = recentEvents?.[0]?.date ? new Date(recentEvents[0].date).getTime() : null;
+  if (newestDate == null) return RECENT_ACTIVITY_CACHE_TTL_MS;
+
+  const ageDays = (Date.now() - newestDate) / (24 * 60 * 60 * 1000);
+  return ageDays > SETTLED_ACTIVITY_WINDOW_DAYS ? SETTLED_CACHE_TTL_MS : RECENT_ACTIVITY_CACHE_TTL_MS;
+}
 
 async function getPlayer(guildId, discordId) {
   return PlayerModel.findOne({ guildId, discordId }).lean();
@@ -94,12 +125,17 @@ function isEpicLinked(playerRecord) {
 
 // Clears whatever cached Fortnite Tracker stats are on a record — used whenever the linked Epic
 // account changes (a fresh link, a re-link to a *different* account, or an explicit unlink), since
-// getPlayerStats' 24h cache (below) keys purely off lastUpdated/discordId+guildId with no check
-// that the cached snapshot actually belongs to the currently-linked epicId. Without this, a re-
-// link to a different account could keep serving the OLD account's stats — mislabeled as the new
-// one's — for up to 24h.
+// getPlayerStats' cache (below) keys purely off lastUpdated/discordId+guildId with no check that
+// the cached snapshot actually belongs to the currently-linked epicId. Without this, a re-link to
+// a different account could keep serving the OLD account's stats — mislabeled as the new one's —
+// for as long as that cache entry's TTL happens to be (up to SETTLED_CACHE_TTL_MS for a settled
+// snapshot, not just the shorter recent-activity one).
 function clearedStatsFields() {
-  return { totalPR: null, thisSeasonPR: null, prBand: null, recentEvents: [], lastUpdated: null };
+  // statsByContext included: those per-(region, platform) snapshots (getContextualPlayerStats)
+  // belong to the OLD epicId just as much as the home-context fields do — leaving them behind on
+  // a re-link would keep serving the old account's region/platform-specific PR indefinitely
+  // whenever a future queue join happens to need a non-home context.
+  return { totalPR: null, thisSeasonPR: null, prBand: null, recentEvents: [], lastUpdated: null, statsByContext: {} };
 }
 
 // Called by the Epic OAuth callback (webhook-server.js) on every successful link, including a re-
@@ -149,13 +185,16 @@ function toStatsFields(scraped) {
 }
 
 // Called on every Queue click (queue.js's buildPlayer). Reuses a player's MongoDB record if it
-// was scraped within STATS_CACHE_TTL_MS — skipping the Puppeteer/FT Tracker round trip entirely
-// — otherwise scrapes fresh and persists the result for next time.
+// was scraped within its recency-based TTL (cacheTtlMsFor — short for a player with recent/
+// current-season activity, much longer for one whose history is already settled) — skipping the
+// Puppeteer/FT Tracker round trip entirely — otherwise scrapes fresh and persists the result for
+// next time. This is always the player's HOME region, default-platform snapshot — see
+// getStatsForContext below for a queue-region/platform-specific fetch.
 async function getPlayerStats(guildId, discordId, epicUsername, epicId, region) {
   const existing = await PlayerModel.findOne({ guildId, discordId });
   const age = existing?.lastUpdated ? Date.now() - existing.lastUpdated.getTime() : null;
 
-  if (existing?.lastUpdated && age < STATS_CACHE_TTL_MS && existing.totalPR != null) {
+  if (existing?.lastUpdated && age < cacheTtlMsFor(existing.recentEvents) && existing.totalPR != null) {
     console.log(`[stats] cache HIT for ${epicUsername} (${discordId}) — scraped ${formatAge(age)} ago, skipping FT scrape`);
     return {
       totalPR: existing.totalPR,
@@ -194,13 +233,85 @@ async function refreshPlayerStats(guildId, discordId, epicUsername, epicId, regi
 }
 
 // Called by the mod-only /force-refresh command. Unlike refreshPlayerStats, this ignores both
-// the 24h cache and the 1h self-service cooldown entirely — a mod override that always does
-// exactly what was asked.
+// the passive TTL cache and the 1h self-service cooldown entirely — a mod override that always
+// does exactly what was asked.
 async function forceRefreshStats(guildId, discordId, epicUsername, epicId, region) {
   console.log(`[stats] force refresh for ${epicUsername} (${discordId}) — scraping fresh, ignoring cache`);
   const fresh = await scrapePlayer(epicUsername, region, epicId);
   await upsertPlayer(guildId, discordId, { epicUsername, epicId, ...toStatsFields(fresh) });
   return fresh;
+}
+
+// Region/platform-segment key for Player.statsByContext — see models/Player.js's doc comment on
+// that field.
+function contextKey(region, platformSegment) {
+  return `${region}|${platformSegment}`;
+}
+
+// A player's PR for a SPECIFIC (region, platform-segment) context that genuinely differs from
+// their home-context snapshot (getPlayerStats' top-level fields) — used when someone queues
+// somewhere their cached home stats don't actually represent (a different region per #3, or a
+// different Fortnite Tracker input segment for a Console player per #6). Additive: never touches
+// or overwrites the home-context fields, and — same principle as getPlayerStats — only ever
+// fetches the ONE context actually asked for, never every region/platform combo up front.
+async function getContextualPlayerStats(guildId, discordId, epicUsername, epicId, region, platformSegment) {
+  const key = contextKey(region, platformSegment);
+  const existing = await PlayerModel.findOne({ guildId, discordId });
+  const cached = existing?.statsByContext?.get(key);
+  const age = cached?.lastUpdated ? Date.now() - new Date(cached.lastUpdated).getTime() : null;
+
+  if (cached?.lastUpdated && age < cacheTtlMsFor(cached.recentEvents) && cached.totalPR != null) {
+    console.log(`[stats] contextual cache HIT for ${epicUsername} (${discordId}) context=${key} — scraped ${formatAge(age)} ago`);
+    return {
+      totalPR: cached.totalPR,
+      thisSeasonPR: cached.thisSeasonPR ?? 0,
+      prBand: cached.prBand ?? null,
+      recentEvents: cached.recentEvents ?? [],
+    };
+  }
+
+  console.log(
+    `[stats] contextual cache MISS for ${epicUsername} (${discordId}) context=${key} — `
+    + `${cached?.lastUpdated ? `stale (${formatAge(age)} old)` : 'never fetched for this context'}, scraping fresh`
+  );
+  const fresh = await scrapePlayer(epicUsername, region, epicId, platformSegment);
+  await PlayerModel.updateOne(
+    { guildId, discordId },
+    { $set: { [`statsByContext.${key}`]: toStatsFields(fresh) } }
+  );
+  return fresh;
+}
+
+// Single entry point queue.js's buildPlayer and creative-queue.js's buildCreativePlayer both call:
+// resolves WHICH (region, platform-segment) context actually applies to this queue attempt, then
+// fetches it (reusing the existing home-context cache when it's already the right context, so
+// nothing behaves differently for the overwhelmingly common case of a player queueing in their own
+// home region on their registered platform's default segment).
+//
+// Region (#3): always the region actually being queued for, not homeRegion — that's the whole
+// point, a player's genuine standing is wherever they're actually about to play.
+// Platform (#6): only ever overridden for a Console player — gamepad for a console-exclusive
+// tournament, kbm otherwise — per config.ftPlatformSegments. tournamentConsoleOnly is a caller-
+// supplied boolean (false for creative queue, which has no console-exclusive-mode concept the way
+// tournaments' consoleOnly flag does) rather than this function inferring it.
+//
+// Returns both the stats AND prContext — the single indicator #6 asks for combining #3's region
+// transparency and #6's platform transparency, rather than two separate ad-hoc signals (embeds.js's
+// buildPrContextNote renders it).
+async function getStatsForContext(guildId, discordId, epicUsername, epicId, { homeRegion, queueRegion, platform, tournamentConsoleOnly }) {
+  const region = queueRegion ?? homeRegion;
+  const platformSegment = platform === 'Console'
+    ? (tournamentConsoleOnly ? config.ftPlatformSegments.Console : config.ftPlatformSegments.PC)
+    : 'all';
+
+  const isHomeRegion = region === homeRegion;
+  const isHomePlatform = platformSegment === 'all';
+
+  const stats = (isHomeRegion && isHomePlatform)
+    ? await getPlayerStats(guildId, discordId, epicUsername, epicId, homeRegion)
+    : await getContextualPlayerStats(guildId, discordId, epicUsername, epicId, region, platformSegment);
+
+  return { stats, prContext: { region, platformSegment, isHomeRegion, isHomePlatform } };
 }
 
 // Called by channel-manager.js when a tournament's beginTime passes (upcoming -> past). Used to
@@ -270,9 +381,15 @@ module.exports = {
   linkEpicAccount,
   unlinkEpicAccount,
   getPlayerStats,
+  getContextualPlayerStats,
+  getStatsForContext,
   refreshPlayerStats,
   forceRefreshStats,
   rescrapeRegisteredPlayers,
   findCanonicalByEpicUsername,
   getAllScoredPlayers,
+  cacheTtlMsFor,
+  RECENT_ACTIVITY_CACHE_TTL_MS,
+  SETTLED_CACHE_TTL_MS,
+  SETTLED_ACTIVITY_WINDOW_DAYS,
 };

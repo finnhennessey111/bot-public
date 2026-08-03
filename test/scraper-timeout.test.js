@@ -3,7 +3,7 @@
 // local HTTP server whose response timing we fully control, so this measures the actual configured
 // timeout value rather than assuming it's wired through correctly.
 //
-// config.ftUrls[region] is a plain string template ('https://fortnitetracker.com/...{slug}...') —
+// config.ftUrlTemplate is a plain string template ('https://fortnitetracker.com/...{slug}...') —
 // temporarily pointing it at our local server (then restoring it) is how scrapePlayerOnce gets
 // pointed at a controllable target without touching scraper.js's production code at all.
 //
@@ -49,12 +49,12 @@ function startDelayedServer(delayMs) {
 }
 
 async function withOverriddenFtUrl(url, fn) {
-  const original = config.ftUrls[TEST_REGION];
-  config.ftUrls[TEST_REGION] = url;
+  const original = config.ftUrlTemplate;
+  config.ftUrlTemplate = url;
   try {
     return await fn();
   } finally {
-    config.ftUrls[TEST_REGION] = original;
+    config.ftUrlTemplate = original;
   }
 }
 

@@ -33,9 +33,9 @@ const RESTORE_WINDOW_MS = 24 * 60 * 60 * 1000;
 // How often the expiry sweep runs — own interval (not piggybacked on channel-manager.js's
 // tournament-check tick) specifically to avoid a require cycle: this module already needs
 // channel-manager.js's createTournamentChannel to restore a channel, so channel-manager.js can't
-// also require this module to trigger the sweep without a circular require between them. 20 minutes
-// is the same granularity tournament-approval.js's expirePendingApprovals uses for its own 20-min-
-// piggybacked sweep — being off by up to that much against a 24h deadline is immaterial.
+// also require this module to trigger the sweep without a circular require between them. 20
+// minutes chosen on its own merits here — being off by up to that much against a 24h restore
+// deadline is immaterial, regardless of what cadence any other module's sweep happens to use.
 const EXPIRY_SWEEP_INTERVAL_MS = 20 * 60 * 1000;
 
 // Same audit-log-lookup shape as index.js's guardModRoleGrant (MatchMaker Mod role grants) — most

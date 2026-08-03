@@ -14,7 +14,7 @@
 // exactly what index.js's handler destructures off the resulting pinnedMessages entry ->
 // queue.js's real buildPlayer/isCompatiblePlatform. guild-config.js is stubbed at the require-cache
 // level purely to avoid hitting MongoDB (test/team-redesign.test.js's established precedent); so is
-// players.js's getPlayerStats (avoids a real Puppeteer scrape) — everything downstream of those two
+// players.js's getStatsForContext (avoids a real Puppeteer scrape) — everything downstream of those two
 // stubs is the real, unmodified production code path.
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -137,7 +137,14 @@ test('an already-tracked channel missing consoleOnly (pre-fix data) gets backfil
 
 test('honest check: queue.js\'s isCompatiblePlatform was NOT gracefully degrading — with consoleOnly undefined it silently allowed PC+Console to match a "console-only" tournament', async () => {
   await withStubbedModule('../players', {
-    getPlayerStats: async () => ({ totalPR: 100, thisSeasonPR: 0, recentEvents: [] }),
+    // queue.js's buildPlayer calls getStatsForContext (not getPlayerStats directly) — see
+    // players.js's real implementation. These tests don't exercise region/platform-context
+    // resolution itself, just isCompatiblePlatform downstream of it, so a fixed home-context
+    // response is enough.
+    getStatsForContext: async () => ({
+      stats: { totalPR: 100, thisSeasonPR: 0, recentEvents: [] },
+      prContext: { region: 'EU', platformSegment: 'all', isHomeRegion: true, isHomePlatform: true },
+    }),
     getPlayer: async () => null,
   }, async () => {
     const queue = freshRequire('../queue');
@@ -165,7 +172,14 @@ test('honest check: queue.js\'s isCompatiblePlatform was NOT gracefully degradin
 
 test('with the fix: isCompatiblePlatform correctly blocks a PC player from a console-only tournament, once consoleOnly is properly populated', async () => {
   await withStubbedModule('../players', {
-    getPlayerStats: async () => ({ totalPR: 100, thisSeasonPR: 0, recentEvents: [] }),
+    // queue.js's buildPlayer calls getStatsForContext (not getPlayerStats directly) — see
+    // players.js's real implementation. These tests don't exercise region/platform-context
+    // resolution itself, just isCompatiblePlatform downstream of it, so a fixed home-context
+    // response is enough.
+    getStatsForContext: async () => ({
+      stats: { totalPR: 100, thisSeasonPR: 0, recentEvents: [] },
+      prContext: { region: 'EU', platformSegment: 'all', isHomeRegion: true, isHomePlatform: true },
+    }),
     getPlayer: async () => null,
   }, async () => {
     const queue = freshRequire('../queue');

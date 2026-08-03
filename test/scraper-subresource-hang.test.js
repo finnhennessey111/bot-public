@@ -55,12 +55,12 @@ function startServerWithHangingSubResource() {
 }
 
 async function withOverriddenFtUrl(url, fn) {
-  const original = config.ftUrls[TEST_REGION];
-  config.ftUrls[TEST_REGION] = url;
+  const original = config.ftUrlTemplate;
+  config.ftUrlTemplate = url;
   try {
     return await fn();
   } finally {
-    config.ftUrls[TEST_REGION] = original;
+    config.ftUrlTemplate = original;
   }
 }
 

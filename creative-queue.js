@@ -142,6 +142,20 @@ function describeUnit(unit) {
 
 // Greedy pairing, same approach as queue.js's attemptMatchingForQueue — fine at realistic
 // creative-queue sizes, and runs fully synchronously so overlapping calls can't double-match.
+//
+// Deliberately reads ONLY unit.totalPR/unit.matchScore (snapshotted once at join time by
+// buildCreativePlayer/joinCreativeQueue below) — investigated a real hypothesis that a long-stuck
+// queued player (one real report: waited 96477s, ~26.8h, well past players.js's 24h stats cache
+// TTL) might get silently re-scraped on every sweep tick once their cache goes stale, which would
+// explain sustained scraping traffic with no obvious cause. Confirmed FALSE: this function (and
+// queue.js's identical-shape equivalent) never calls playerStore.getPlayerStats or any scraping
+// function at all — see test/creative-queue-sweep-no-rescrape.test.js, which proves the fetch
+// count stays at exactly 1 across many sweep ticks over a simulated 26+ hour stale wait. The real
+// separate bug behind that specific stuck player: config.js's creativeWideningSchedule has no
+// unlimited final tier (unlike tournamentWideningSchedule's Infinity tier) — it permanently caps
+// at maxLogPRDiff:60 after 25s, so a genuine PR outlier with nobody comparable ever simultaneously
+// queued can wait forever with no eventual forced match. Flagged, not fixed here — whether creative
+// should ever get an unlimited-widening tier the way tournaments do is a real product decision.
 function attemptMatchingForQueue(mode, region) {
   const now = Date.now();
   const pool = getQueue(mode, region);
@@ -213,19 +227,26 @@ function startCreativeMatchSweep() {
 }
 
 async function buildCreativePlayer({ guildId, guildName, discordId, discordUsername, discordTag, epicUsername, epicId, mode, region, platform }) {
-  const playerData = await playerStore.getPlayerStats(guildId, discordId, epicUsername, epicId, region);
-
   // homeRegion (the player's registered region) vs region (the region they're queueing this
-  // creative match in) — same distinction queue.js's buildPlayer draws for tournaments, needed
-  // so calculateMatchScore's cross-region penalty applies here too, not just in tournaments.
+  // creative match in) — same distinction queue.js's buildPlayer draws for tournaments, needed so
+  // getStatsForContext knows whether this join's region genuinely differs from home (#3).
   const registered = await playerStore.getPlayer(guildId, discordId);
   const homeRegion = registered?.region ?? region;
+  const resolvedPlatform = platform ?? 'PC';
 
-  // tournamentName is deliberately the creative mode string (e.g. "1v1 Realistics"), not a real
-  // scraped tournament — no scraped event will ever have this name, so ownTournamentModifier
-  // correctly comes out to 0 with no special-casing needed. The solo-cup performance modifier and
-  // season-PR weighting still apply normally, since neither depends on tournamentName.
-  const { matchScore, soloModifier } = computeMatchScoreBreakdown(playerData, mode, homeRegion, region);
+  // Creative queue has no console-exclusive-mode concept the way a tournament's consoleOnly flag
+  // does (every mode here is open to any platform) — so tournamentConsoleOnly is always false;
+  // only region (never platform segment) can put a Console player on a non-home context here.
+  const { stats: playerData, prContext } = await playerStore.getStatsForContext(
+    guildId, discordId, epicUsername, epicId,
+    { homeRegion, queueRegion: region, platform: resolvedPlatform, tournamentConsoleOnly: false }
+  );
+
+  // mode is deliberately the creative mode string (e.g. "1v1 Realistics"), not a real scraped
+  // tournament — no scraped event will ever have this name, so ownTournamentModifier correctly
+  // comes out to 0 with no special-casing needed. The solo-cup performance modifier and season-PR
+  // weighting still apply normally, since neither depends on the name passed here.
+  const { matchScore, soloModifier } = computeMatchScoreBreakdown(playerData, mode);
 
   return {
     guildId,
@@ -237,7 +258,8 @@ async function buildCreativePlayer({ guildId, guildName, discordId, discordUsern
     epicId,
     mode,
     region,
-    platform: platform ?? 'PC',
+    homeRegion,
+    platform: resolvedPlatform,
     totalPR: playerData.totalPR,
     thisSeasonPR: playerData.thisSeasonPR,
     matchScore,
@@ -245,6 +267,9 @@ async function buildCreativePlayer({ guildId, guildName, discordId, discordUsern
     // scoring inputs at match time without re-deriving them later — see scraper.js's
     // computeMatchScoreBreakdown doc comment.
     soloModifier,
+    // The region/platform context totalPR/soloModifier/matchScore above were actually computed
+    // from — see players.js's getStatsForContext doc comment.
+    prContext,
     joinedAt: new Date(),
   };
 }
@@ -292,6 +317,7 @@ module.exports = {
   findCreativeUnitByDiscordId,
   isInCreativeQueue,
   getCreativeQueueCount,
+  sweepAllCreativeQueues,
   startCreativeMatchSweep,
   creativeMatchEvents,
   toLogPR,

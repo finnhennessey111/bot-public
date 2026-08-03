@@ -95,7 +95,7 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName('force-refresh')
-    .setDescription('[Mod] Force a fresh Fortnite Tracker scrape for a player, ignoring the 24h cache')
+    .setDescription('[Mod] Force a fresh Fortnite Tracker scrape for a player, ignoring the cache')
     .addUserOption(o => o.setName('user').setDescription('Player to refresh').setRequired(true)),
 
   new SlashCommandBuilder()

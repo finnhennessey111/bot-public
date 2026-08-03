@@ -246,8 +246,20 @@ async function buildPlayer({
   ageBracket,
   bio,
 }) {
-  const playerData = await playerStore.getPlayerStats(guildId, discordId, epicUsername, epicId, homeRegion);
-  const { matchScore, soloModifier } = computeMatchScoreBreakdown(playerData, tournamentName, homeRegion, queueRegion);
+  const resolvedPlatform = platform ?? 'PC';
+  const resolvedConsoleOnly = consoleOnly ?? false;
+
+  // Resolves and fetches the (region, platform-segment) context this queue attempt actually needs
+  // — the queued-for region's own PR (#3), and a Console player's platform-appropriate segment for
+  // this specific tournament (#6) — rather than always using the cached home snapshot regardless
+  // of where/what they're actually queueing for. prContext is stamped onto the returned player so
+  // embeds.js can show the "true home vs. currently-displayed PR context" indicator when it
+  // diverges from home.
+  const { stats: playerData, prContext } = await playerStore.getStatsForContext(
+    guildId, discordId, epicUsername, epicId,
+    { homeRegion, queueRegion, platform: resolvedPlatform, tournamentConsoleOnly: resolvedConsoleOnly }
+  );
+  const { matchScore, soloModifier } = computeMatchScoreBreakdown(playerData, tournamentName);
 
   return {
     guildId,
@@ -261,8 +273,8 @@ async function buildPlayer({
     homeRegion,
     queueRegion,
     queueType,
-    platform: platform ?? 'PC',
-    consoleOnly: consoleOnly ?? false,
+    platform: resolvedPlatform,
+    consoleOnly: resolvedConsoleOnly,
     ingameRoles: ingameRoles ?? [],
     languages: languages ?? [],
     ageBracket: ageBracket ?? null,
@@ -274,6 +286,9 @@ async function buildPlayer({
     // scoring inputs at match time without re-deriving them later — see scraper.js's
     // computeMatchScoreBreakdown doc comment.
     soloModifier,
+    // The region/platform context totalPR/soloModifier/matchScore above were actually computed
+    // from — see players.js's getStatsForContext doc comment.
+    prContext,
     recentEvents: playerData.recentEvents,
     joinedAt: new Date(),
   };

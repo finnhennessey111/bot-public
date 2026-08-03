@@ -142,9 +142,11 @@ async function decide(eventId, decision) {
 
 // Sweeps every still-pending record whose tournament's own start time has passed and marks it
 // 'expired' — see this module's doc comment for why this doesn't auto-approve instead. Piggybacks
-// on channel-manager.js's existing 20-minute tournament-check tick rather than its own timer;
-// missing a start time by up to ~20 minutes is immaterial here (the tournament's channel, had it
-// been approved in time, would already be live well before that anyway).
+// on channel-manager.js's existing tournament-check tick (TOURNAMENT_CHECK_INTERVAL_MS, 4 hours as
+// of this writing) rather than its own timer; missing a start time by up to that long is still
+// immaterial here — a still-PENDING record was never approved, so no channel was ever live for it
+// regardless of how promptly this sweep runs. This is pure "stop showing stale Approve/Reject
+// buttons on an old DM" bookkeeping, not anything that gates a real channel's timing.
 async function expirePendingApprovals(client) {
   const overdue = await TournamentApprovalModel.find({
     status: 'pending',

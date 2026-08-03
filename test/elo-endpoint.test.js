@@ -32,11 +32,10 @@ test('computeMatchScoreBreakdown: extracting computeOwnTournamentModifier did no
     ],
   };
 
-  const result = computeMatchScoreBreakdown(playerData, 'Some Cup', 'EU', 'EU');
+  const result = computeMatchScoreBreakdown(playerData, 'Some Cup');
   assert.ok(result.ownTournamentModifier > 0, 'must still pick up the 2 matching "Some Cup" events');
-  assert.equal(result.regionPenalty, 0);
 
-  const noMatch = computeMatchScoreBreakdown(playerData, 'Nonexistent Cup', 'EU', 'EU');
+  const noMatch = computeMatchScoreBreakdown(playerData, 'Nonexistent Cup');
   assert.equal(noMatch.ownTournamentModifier, 0);
   assert.equal(noMatch.matchScore, Math.round(noMatch.base * (1 + noMatch.soloModifier)));
 });
@@ -62,7 +61,7 @@ test('elo.js creative score genuinely matches what creative-queue.js\'s real 1v1
   // — confirms elo.js's generic "creative" calculation is genuinely equivalent to the real system,
   // not just self-consistent.
   const realModeResults = ['1v1 Realistics', '1v1 Zone Wars', '2v2 Realistics', '2v2 Zone Wars']
-    .map(mode => computeMatchScoreBreakdown(playerData, mode, 'EU', 'EU').matchScore);
+    .map(mode => computeMatchScoreBreakdown(playerData, mode).matchScore);
 
   assert.ok(realModeResults.every(s => s === realModeResults[0]), '1v1 and 2v2 (and both their sub-modes) must all score identically — confirmed by the real system itself, not assumed');
 
@@ -72,7 +71,7 @@ test('elo.js creative score genuinely matches what creative-queue.js\'s real 1v1
   // publicly — instead assert the documented invariant: the real system's own score (any of the
   // 4 real modes) equals computeMatchScoreBreakdown's raw output for the same inputs, which is
   // exactly what elo.js's buildCreativeElo wraps.
-  assert.equal(realModeResults[0], computeMatchScoreBreakdown(playerData, '__whatever_nonmatching__', 'EU', 'EU').matchScore);
+  assert.equal(realModeResults[0], computeMatchScoreBreakdown(playerData, '__whatever_nonmatching__').matchScore);
 });
 
 test('elo.js: a permanent tournament type with NO recorded history scores IDENTICALLY to the creative score (confirms — does not assume — the shared-base behavior)', async () => {
@@ -348,10 +347,9 @@ test('elo.js: real recent history that raises soloModifier/ownTournamentModifier
     assert.equal(baseline, 4500);
 
     // Real formula (scraper.js computeMatchScoreBreakdown/computeOwnTournamentModifier) never
-    // produces a NEGATIVE soloModifier/ownTournamentModifier — getPlacementScore floors at 0 and
-    // this endpoint always calls with homeRegion === queueRegion (regionPenalty always 0) — so the
-    // only real directions are "at baseline" (0%) or "above baseline" (>0%), never below. Confirmed
-    // here rather than assumed: exercising this with strong (not just any) recent history.
+    // produces a NEGATIVE soloModifier/ownTournamentModifier — getPlacementScore floors at 0 — so
+    // the only real directions are "at baseline" (0%) or "above baseline" (>0%), never below.
+    // Confirmed here rather than assumed: exercising this with strong (not just any) recent history.
     assert.ok(result.creative.score >= baseline, 'creative score must never fall below its own PR baseline given the real formula');
     assert.ok(result.creative.vsBaselinePercent > 0, 'strong solo history must show as performing ABOVE baseline');
     assert.equal(
@@ -434,7 +432,7 @@ test('elo.js: a player registered under multiple guilds only counts ONCE in the 
 // Computed independently here (via the real computeMatchScoreBreakdown, not elo.js internals) so
 // this is a genuine cross-check, not just asserting elo.js agrees with itself.
 function expectedVsBaselinePercent(totalPR, thisSeasonPR, recentEvents) {
-  const { base, soloModifier } = computeMatchScoreBreakdown({ totalPR, thisSeasonPR, recentEvents }, '__never_matches__', 'EU', 'EU');
+  const { base, soloModifier } = computeMatchScoreBreakdown({ totalPR, thisSeasonPR, recentEvents }, '__never_matches__');
   const baseline = Math.round(base);
   const total = Math.round(base * (1 + soloModifier));
   return Math.round(((total / baseline) - 1) * 1000) / 10;

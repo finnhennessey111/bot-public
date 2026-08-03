@@ -13,6 +13,12 @@ const DeletedTournamentChannelModel = require('./models/DeletedTournamentChannel
 
 const EMBED_REFRESH_INTERVAL_MS = 60 * 1000;
 
+// How often startScheduler's tournament-check tick (runTournamentCheckTick) runs — see that
+// setInterval call's own doc comment for why 4 hours (widened from 20 minutes) costs nothing real:
+// every newly-detected tournament already sits behind tournament-approval.js's manual DM-approval
+// gate, so scrape cadence was never what determined how fast a channel actually went live.
+const TOURNAMENT_CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000;
+
 // How long after a tournament's last session begins its queue channel stays up before auto-deleting.
 const CHANNEL_DELETE_BUFFER_MS = 2 * 60 * 60 * 1000;
 
@@ -672,30 +678,35 @@ function startScheduler(client, pinnedMessages) {
   // up to a minute's delay.
   runEmbedRefreshTick(client, pinnedMessages);
 
-  // Every 20 minutes — briefly dropped to once a day over Cloudflare-IP-block risk (each tick is
-  // a full Puppeteer navigation via scrapeUpcomingTournaments), but a working residential proxy is
-  // now in place (see proxy-config.js), so that risk no longer applies. Daily was too slow anyway:
-  // short-notice skin cups are sometimes posted only 1-2 days out, and a tournament entering the
-  // 48h creation window between daily ticks could sit unnoticed for up to ~24h before its channel
-  // appeared — players would queue elsewhere in the meantime. This log fires unconditionally on
-  // every tick (independent of whether checkAndCreateChannels itself finds anything to do) so a
-  // live deployment's logs make it obvious the interval is still alive, rather than only ever
-  // seeing evidence when a channel actually gets created.
+  // Every 4 hours (widened from 20 minutes) — detection speed was never actually the bottleneck
+  // for real-world responsiveness: every newly-detected tournament already sits behind
+  // tournament-approval.js's manual DM-approval gate before it goes live anywhere, so a channel
+  // never appears faster than the owner actually approves it regardless of how often this tick
+  // runs. Checking every 20 minutes only paid off if approvals themselves happened within minutes
+  // of detection — in practice approval turnaround, not scrape cadence, is what determines how
+  // fast a channel actually shows up. 4 hours costs nothing real while cutting this category of
+  // scraping traffic (a full Puppeteer navigation via scrapeUpcomingTournaments) roughly 12x
+  // compared to the old 20-min cadence. (The earlier once-a-day/Cloudflare-IP-block concern this
+  // interval used to be tuned around no longer applies either — a working residential proxy is in
+  // place, see proxy-config.js.) This log fires unconditionally on every tick (independent of
+  // whether checkAndCreateChannels itself finds anything to do) so a live deployment's logs make
+  // it obvious the interval is still alive, rather than only ever seeing evidence when a channel
+  // actually gets created.
   setInterval(async () => {
     const now = new Date();
     console.log(`⏰ Scheduler tick fired — UTC hour ${now.getUTCHours()} (${now.toISOString()}) — running tournament check`);
     await runTournamentCheckTick(client, pinnedMessages);
-  }, 20 * 60 * 1000);
+  }, TOURNAMENT_CHECK_INTERVAL_MS);
 
   setInterval(() => {
     runEmbedRefreshTick(client, pinnedMessages).catch(console.error);
   }, EMBED_REFRESH_INTERVAL_MS);
 
-  console.log('📅 Tournament scheduler started — 20min tournament check + 60s embed refresh armed');
+  console.log('📅 Tournament scheduler started — 4hr tournament check + 60s embed refresh armed');
 }
 
 module.exports = {
   startScheduler, checkAndCreateChannels, managedChannels, buildChannelName, abbreviateBuildMode,
   createTournamentChannel, createTournamentChannelsAcrossGuilds, CHANNEL_DELETE_BUFFER_MS,
-  updateActiveTournamentEmbeds,
+  updateActiveTournamentEmbeds, TOURNAMENT_CHECK_INTERVAL_MS,
 };

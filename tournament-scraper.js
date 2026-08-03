@@ -1,4 +1,5 @@
 const puppeteer = require('puppeteer');
+const config = require('./config');
 const { proxyLaunchArgs, authenticatePage, blockUnnecessaryResources, logProxyMode, withBrowserSlot, closeBrowserSafely } = require('./proxy-config');
 const { resolveRosterSize, inferRosterSize } = require('./roster-size');
 
@@ -203,9 +204,12 @@ function isBareBuildModeLabel(nameLower) {
 // ---------------------------------------------------------------------------------------------
 // Fortnite Tracker (fortnitetracker.com/events) — sole tournament data source. The official
 // fortnite.com/competitive/schedule was tried as a primary source for a while (Fortnite Tracker
-// load reduction was the goal), but that's already solved separately (20-min scrape interval
-// instead of hourly, one shared scrape fanned out to every guild instead of per-guild, capped
-// event history) — and the official schedule's rendered text turned out to be genuinely ambiguous
+// load reduction was the goal), but that's already solved separately (a several-hour scrape
+// interval — channel-manager.js's TOURNAMENT_CHECK_INTERVAL_MS, 4h as of this writing, widened
+// from an original 20min since every detected tournament already sits behind a manual approval
+// gate regardless of scrape cadence — instead of hourly, one shared scrape fanned out to every
+// guild instead of per-guild, capped event history) — and the official schedule's rendered text
+// turned out to be genuinely ambiguous
 // (byte-identical visible text for a cup's Battle Royale and Zero Build variants, one generic
 // label covering multiple FNCS stages), which was the root cause of nearly every tournament-
 // naming bug fixed while it was in use. Fortnite Tracker's own titles don't have that problem —
@@ -216,11 +220,17 @@ function isBareBuildModeLabel(nameLower) {
 // slug-based detection is needed against this source at all.
 // ---------------------------------------------------------------------------------------------
 
-// Loads the events page and pulls out the raw `imp_calendar` JSON blob. The browser's whole
-// launch-through-close lifetime runs inside withBrowserSlot (proxy-config.js) so no more than
+// Loads the events page for ONE playlist and pulls out the raw `imp_calendar` JSON blob.
+// competitive=pr + playlist=<playlist> are real Fortnite Tracker query params (confirmed live,
+// e.g. fortnitetracker.com/profile/kbm/finn444.../events?playlist=trios existing as a real,
+// indexed page) — server-side filtering to exactly what this bot ever wants (real PR tournaments,
+// Duos/Trios only — Solo is BLOCKED_KEYWORDS-rejected client-side today and Squads was never a
+// real competitive format this bot supports) instead of downloading every playlist/every non-PR
+// listing and discarding most of it in buildTournamentGroups. The browser's whole launch-through-
+// close lifetime runs inside withBrowserSlot (proxy-config.js) so no more than
 // MAX_CONCURRENT_BROWSERS headless Chromium processes are ever alive at once across the whole bot
 // — see that function's header comment for why.
-async function fetchRawCalendar() {
+async function fetchRawCalendarForPlaylist(playlist) {
   return withBrowserSlot(async () => {
     const browser = await puppeteer.launch({
       headless: 'new',
@@ -235,7 +245,7 @@ async function fetchRawCalendar() {
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
       );
 
-      await page.goto('https://fortnitetracker.com/events', {
+      await page.goto(`https://fortnitetracker.com/events?competitive=pr&playlist=${playlist}`, {
         waitUntil: 'networkidle2',
         timeout: 30000,
       });
@@ -255,6 +265,28 @@ async function fetchRawCalendar() {
       await closeBrowserSafely(browser);
     }
   });
+}
+
+// Fetches every playlist config.ftCalendarPlaylists lists (duos, trios) and concatenates the raw
+// entries — a real tournament never straddles two playlist fetches (a title is either the Duos or
+// the Trios listing for its region, never both), and buildTournamentGroups' existing title+region
+// keying already merges/dedupes correctly if a title somehow did appear in more than one fetch, so
+// a plain concatenation here is safe. One navigation per playlist (2 today) rather than one big
+// unfiltered fetch — a real added cost (an extra Puppeteer launch per calendar check), but this
+// only runs on channel-manager.js's TOURNAMENT_CHECK_INTERVAL_MS tick (hours apart), nowhere near
+// the per-player scrape hot path #2/#3 are about, so doubling it here is a real but low-frequency
+// trade against downloading (and then discarding, client-side) every other playlist/every non-PR
+// listing on every single tick.
+async function fetchRawCalendar() {
+  const perPlaylist = await Promise.all(
+    config.ftCalendarPlaylists.map(playlist => fetchRawCalendarForPlaylist(playlist))
+  );
+
+  if (perPlaylist.every(entries => !entries)) {
+    return null;
+  }
+
+  return perPlaylist.flatMap(entries => entries ?? []);
 }
 
 // THIRD roster-size signal (after title keyword + the manual override map, both in

@@ -173,7 +173,7 @@ test('post-match-feedback: computeMatchScoreBreakdown produces the EXACT SAME sc
     ],
   };
 
-  const before = computeMatchScoreBreakdown(playerData, '__no_match__', 'EU', 'EU');
+  const before = computeMatchScoreBreakdown(playerData, '__no_match__');
 
   // Record the most extreme possible feedback for this exact player — "too hard", a loss — the
   // scenario most likely to tempt a future "adjust their score down" shortcut, if one ever existed.
@@ -181,7 +181,7 @@ test('post-match-feedback: computeMatchScoreBreakdown produces the EXACT SAME sc
   await PostMatchFeedback.create({ matchId, kind: 'creative-pairwise', mode: '1v1 Realistics', region: 'EU', players: [{ discordId: 'reporter-1' }] });
   await postMatchFeedback.submitResponse(matchId, 'reporter-1', 'loss', 'hard');
 
-  const after = computeMatchScoreBreakdown(playerData, '__no_match__', 'EU', 'EU');
+  const after = computeMatchScoreBreakdown(playerData, '__no_match__');
 
   assert.deepEqual(before, after, 'recording a feedback response must have ZERO effect on computeMatchScoreBreakdown\'s output for the same inputs');
 }));
