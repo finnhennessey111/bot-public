@@ -15,6 +15,12 @@ const guildSchema = new mongoose.Schema({
   channelIds: { type: mongoose.Schema.Types.Mixed, default: {} },
   roleIds: { type: mongoose.Schema.Types.Mixed, default: {} },
   categoryIds: { type: mongoose.Schema.Types.Mixed, default: {} },
+  // Forum tag IDs — parallel to categoryIds, but for the forum-post-based tournament channels
+  // (channelIds.tournamentForum holds the forum channel itself). Region used to be expressed by
+  // which category a tournament's text channel lived in; a forum post can't be parented into a
+  // per-region category the same way (one shared forum holds every region's posts), so region is
+  // instead an applied TAG on the post — tagIds.EU/NAC/ME hold that forum's tag IDs for this guild.
+  tagIds: { type: mongoose.Schema.Types.Mixed, default: {} },
   pinnedMessages: { type: mongoose.Schema.Types.Mixed, default: {} },
   creativeChannels: { type: mongoose.Schema.Types.Mixed, default: {} },
   setupMessageIds: { type: mongoose.Schema.Types.Mixed, default: {} },

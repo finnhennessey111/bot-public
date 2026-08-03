@@ -74,6 +74,14 @@ function makeFakeGuild() {
         channel.position = pos;
       },
       delete: async () => { throw new Error('unexpected delete'); },
+      // Forum-channel shape (matchmaker-setup.js's ensureTournamentForum) — every fake channel gets
+      // this, not just the one actually created as a forum, since it's harmless on the others and
+      // this file's tests aren't about the forum itself.
+      availableTags: [],
+      setAvailableTags: async (tags) => {
+        channel.availableTags = tags.map(t => ({ id: t.id ?? nextId('tag'), name: t.name }));
+        return channel;
+      },
     };
     return channel;
   }

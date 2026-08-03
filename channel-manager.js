@@ -1,11 +1,11 @@
 // channel-manager.js - Automated tournament channel creation and deletion
 
-const { ChannelType, PermissionFlagsBits } = require('discord.js');
+const { ThreadAutoArchiveDuration } = require('discord.js');
 const { scrapeUpcomingTournaments, isBareBuildModeLabel, isRankedCupTitle } = require('./tournament-scraper');
 const { savePinnedMessages } = require('./store');
 const { buildTournamentEmbed, buildRankedCupTournamentEmbed, buildRankedCupQueueButtons, rankedCupPoolName, RANK_TIERS } = require('./embeds');
 const { getQueueCount } = require('./queue');
-const { getRoleId, getCategoryId } = require('./guild-config');
+const { getChannelId, getTagId } = require('./guild-config');
 const playerStore = require('./players');
 const tournamentApproval = require('./tournament-approval');
 const { markSelfDeletion } = require('./self-deletion-tracker');
@@ -160,11 +160,19 @@ function refreshPermanentBeginTime(channelId, latestBeginTime, pinnedMessages, g
 // shipped left its old, now-incorrectly-named channels sitting as duplicates until their own
 // deletion timer eventually cleared them, across every server, each time.
 //
-// Falls back to the old exact-name-in-category match (unchanged from before) when there's no
-// eventId (a raw session that somehow arrived without one) or no pinnedMessages entry matches it
-// yet (e.g. a channel that predates this field, or one created manually via /setup-tournament) —
-// so a genuinely untracked-but-correctly-named channel still isn't duplicated either.
-async function findExistingTournamentChannel(guild, pinnedMessages, tournament, categoryId, channelName) {
+// Falls back to a name+forum+tag match when there's no eventId (a raw session that somehow
+// arrived without one) or no pinnedMessages entry matches it yet (e.g. a post that predates this
+// field) — so a genuinely untracked-but-correctly-named post still isn't duplicated either.
+//
+// Region used to disambiguate same-named tournaments in different regions via category membership
+// (parentId) alone, since each region had its own category. One shared forum now holds every
+// region's posts, so parentId alone would incorrectly treat "ZB Mongraal Cup" in EU and in NAC as
+// the same post — appliedTags (the region tag) is what actually disambiguates them now; parentId
+// is kept alongside it purely to scope the search to this guild's own tournament forum. A pre-
+// migration plain-text channel (legacy, still tracked via its own pinnedMessages entry) has no
+// appliedTags at all, so it naturally never matches here — it's still found via the eventId path
+// above regardless of its channel type.
+async function findExistingTournamentChannel(guild, pinnedMessages, tournament, forumChannelId, regionTagId, channelName) {
   if (tournament.eventId) {
     const match = Object.entries(pinnedMessages).find(
       ([, pinned]) => pinned.guildId === guild.id && pinned.tournamentEventId === tournament.eventId
@@ -178,7 +186,11 @@ async function findExistingTournamentChannel(guild, pinnedMessages, tournament, 
     }
   }
 
-  const existing = guild.channels.cache.find(c => c.name === channelName && c.parentId === (categoryId ?? null));
+  const existing = guild.channels.cache.find(c =>
+    c.name === channelName
+    && c.parentId === (forumChannelId ?? null)
+    && (!regionTagId || c.appliedTags?.includes(regionTagId))
+  );
   if (existing) return { channel: existing, pinnedEntry: pinnedMessages[existing.id] ?? null, matchedBy: 'name' };
 
   return null;
@@ -234,14 +246,14 @@ async function createTournamentChannel(guild, tournament, pinnedMessages) {
   const dateStr = perDay ? getDateStr(beginTime) : null;
   const channelName = buildChannelName(name, dateStr);
 
-  console.log(`  🔧 createTournamentChannel("${name}", ${region}) → channel name "${channelName}"`);
+  console.log(`  🔧 createTournamentChannel("${name}", ${region}) → post title "${channelName}"`);
 
-  // Region is no longer baked into the name (channels live in per-region categories instead),
-  // so the same tournament in a different region produces an identical name — scope the
-  // dedup check to this region's category or same-name channels across regions would
-  // incorrectly appear as duplicates of each other.
-  const categoryId = getCategoryId(guild.id, region);
-  const found = await findExistingTournamentChannel(guild, pinnedMessages, tournament, categoryId, channelName);
+  // Region is no longer baked into the name (one shared forum holds every region's posts,
+  // disambiguated by tag instead — see findExistingTournamentChannel's own doc comment), so the
+  // same tournament in a different region produces an identical title.
+  const forumChannelId = getChannelId(guild.id, 'tournamentForum');
+  const regionTagId = getTagId(guild.id, region);
+  const found = await findExistingTournamentChannel(guild, pinnedMessages, tournament, forumChannelId, regionTagId, channelName);
   if (found) {
     const { channel: existing, pinnedEntry, matchedBy } = found;
 
@@ -285,35 +297,29 @@ async function createTournamentChannel(guild, tournament, pinnedMessages) {
   // No mobile/solo/FNCS-Major re-check here — tournament-scraper.js's BLOCKED_KEYWORDS already
   // filtered those out before this tournament ever reached us.
 
-  if (!categoryId) {
-    console.log(`  ⚠️ No ${region} category configured for this guild — channel will be created with no parent category`);
+  if (!forumChannelId) {
+    console.error(`  ❌ No tournament forum configured for this guild — run /matchmaker-setup (or wait for the next startup self-heal) before tournament posts can be created`);
+    return;
+  }
+  const forum = await guild.channels.fetch(forumChannelId).catch(() => null);
+  if (!forum) {
+    console.error(`  ❌ Configured tournament forum ${forumChannelId} no longer exists for this guild`);
+    return;
+  }
+  if (!regionTagId) {
+    console.log(`  ⚠️ No ${region} tag configured for this guild — post will be created untagged`);
   }
 
-  // Every tournament channel (any region, console-only or not) is visible to the whole server —
-  // region/console Discord roles no longer gate ViewChannel here (they still gate whether the
-  // Registered role has been granted at all — see index.js's queue_duo/lf2 handler — just not
-  // which channels a member can see). AttachFiles/EmbedLinks stays denied for @everyone regardless,
-  // matching every other queue channel's no-spam rule.
-  const permissionOverwrites = [
-    { id: guild.roles.everyone, allow: [PermissionFlagsBits.ViewChannel], deny: [PermissionFlagsBits.AttachFiles, PermissionFlagsBits.EmbedLinks] },
-    { id: guild.client.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages] },
-  ];
-
-  const modRoleId = getRoleId(guild.id, 'mod');
-  if (modRoleId) {
-    permissionOverwrites.push({ id: modRoleId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages] });
-  }
+  // Visibility/attachment-lock permissions are NOT set per-post here — a forum THREAD can't hold
+  // its own overwrites independent of its parent forum channel (confirmed via discord.js source:
+  // ThreadChannel has no .permissionOverwrites at all, and GuildForumThreadManager#create's
+  // options don't accept any). The forum CHANNEL's own overwrites (matchmaker-setup.js's
+  // ensureTournamentForum + permissions.js's enforcePermissions) are what every post inherits —
+  // same @everyone-ViewChannel-allow/AttachFiles-EmbedLinks-deny + mod-role-allow rule as before,
+  // just applied once at the forum level instead of once per post.
 
   try {
-    console.log(`  🚀 Calling guild.channels.create("${channelName}")...`);
-    const channel = await guild.channels.create({
-      name: channelName,
-      type: ChannelType.GuildText,
-      parent: categoryId ?? null,
-      permissionOverwrites,
-    });
-
-    console.log(`✅ Created channel: ${channelName} (id: ${channel.id})`);
+    console.log(`  🚀 Calling forum.threads.create("${channelName}")...`);
 
     // Permanent tournaments never get a deleteAt at all — never scheduled for deletion, by
     // design (see the class-level comment on PERMANENT_KEYWORDS in tournament-scraper.js).
@@ -324,11 +330,27 @@ async function createTournamentChannel(guild, tournament, pinnedMessages) {
       ? buildRankedCupTournamentEmbed(name, region, computeRankCounts(guild.id, name, region), isTrios, beginTime, deleteAfter, isPermanent, tournament.eventId ?? null)
       : buildTournamentEmbed(name, region, 0, isTrios, beginTime, deleteAfter, isPermanent, tournament.eventId ?? null);
     const components = isRankedCup ? buildRankedCupQueueButtons(isTrios) : [buildQueueButtons(isTrios)];
-    const msg = await channel.send({ embeds: [embed], components });
-    await msg.pin();
 
-    pinnedMessages[channel.id] = {
-      messageId: msg.id,
+    const thread = await forum.threads.create({
+      name: channelName,
+      message: { embeds: [embed], components },
+      appliedTags: regionTagId ? [regionTagId] : [],
+      // Max available (1 week) — not enough on its own for a genuinely permanent post (FNCS
+      // Divisionals can go quiet longer than that with no new messages, and editing the starter
+      // message — which the periodic refresh does — does NOT reset this timer, only a new message
+      // does), so updateActiveTournamentEmbeds below proactively un-archives permanent tournament
+      // threads every refresh tick as the real fix. This just keeps every OTHER (much shorter-
+      // lived, days-not-weeks) post from ever archiving during its normal lifetime at all.
+      autoArchiveDuration: ThreadAutoArchiveDuration.OneWeek,
+    });
+
+    console.log(`✅ Created forum post: ${channelName} (id: ${thread.id})`);
+
+    pinnedMessages[thread.id] = {
+      // A forum post's starter message shares the thread's own ID (confirmed via discord.js's
+      // ThreadChannel#fetchStarterMessage source, which fetches `{message: this.id}`) — no
+      // separate message-creation/fetch/pin step needed the way a normal channel required.
+      messageId: thread.id,
       guildId: guild.id,
       tournamentName: name,
       tournamentEventId: tournament.eventId ?? null,
@@ -351,13 +373,13 @@ async function createTournamentChannel(guild, tournament, pinnedMessages) {
     savePinnedMessages(guild.id);
 
     if (isPermanent) {
-      console.log(`  ♾️ Permanent tournament — no deletion timer armed for ${channel.id}`);
+      console.log(`  ♾️ Permanent tournament — no deletion timer armed for ${thread.id}`);
     } else {
-      armDeletionTimer(guild, channel.id, { tournamentName: name, region, beginTime, deleteAt: deleteAfter }, pinnedMessages);
+      armDeletionTimer(guild, thread.id, { tournamentName: name, region, beginTime, deleteAt: deleteAfter }, pinnedMessages);
     }
 
   } catch (err) {
-    console.error(`  ❌ Failed to create channel ${channelName}:`, err.message);
+    console.error(`  ❌ Failed to create forum post ${channelName}:`, err.message);
   }
 }
 
@@ -546,6 +568,24 @@ async function updateActiveTournamentEmbeds(guild, pinnedMessages, backfillTourn
         continue;
       }
 
+      // CRITICAL for permanent tournaments: a forum thread auto-archives after inactivity (max 1
+      // week — see createTournamentChannel's autoArchiveDuration comment), and editing the starter
+      // message below does NOT reset that timer, only a genuinely new message does. A permanent
+      // tournament (never deleted, could plausibly go quiet for over a week between real events)
+      // would otherwise silently auto-archive with nothing to ever un-stick it. This tick runs
+      // every EMBED_REFRESH_INTERVAL_MS (60s), so proactively un-archiving here means the worst
+      // case is well under a minute of being archived before this self-heals — not "forever."
+      // channel.archived is undefined (falsy) on a pre-migration plain-text channel, so this is a
+      // natural no-op for those.
+      if (pinned.permanent && channel.archived) {
+        try {
+          await channel.setArchived(false);
+          console.log(`  🔓 Un-archived permanent tournament thread ${channelId} (${pinned.tournamentName}) — had auto-archived from inactivity`);
+        } catch (err) {
+          console.error(`  ❌ Failed to un-archive permanent tournament thread ${channelId} (${pinned.tournamentName}):`, err.message);
+        }
+      }
+
       const msg = await channel.messages.fetch(pinned.messageId);
 
       // isRankedCup used to only ever be set at fresh-creation time and never revisited — a
@@ -709,4 +749,8 @@ module.exports = {
   startScheduler, checkAndCreateChannels, managedChannels, buildChannelName, abbreviateBuildMode,
   createTournamentChannel, createTournamentChannelsAcrossGuilds, CHANNEL_DELETE_BUFFER_MS,
   updateActiveTournamentEmbeds, TOURNAMENT_CHECK_INTERVAL_MS,
+  // Exported for testability (same precedent as buildChannelName/abbreviateBuildMode above) — the
+  // forum-post migration's #5 item specifically asked to verify this deletion path works with
+  // ThreadChannel.delete() the same way it always did with a normal channel's.
+  deleteManagedChannel,
 };

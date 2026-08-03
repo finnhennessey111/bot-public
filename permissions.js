@@ -29,6 +29,14 @@ const { PermissionFlagsBits } = require('discord.js');
 const { pinnedMessages } = require('./store');
 const { getChannelId, getRoleId, getCreativeChannelInfo } = require('./guild-config');
 
+// Tournament posts became forum threads — a thread has no .permissionOverwrites of its own at all
+// (confirmed via discord.js source: ThreadChannel extends BaseChannel directly, not GuildChannel,
+// which is the only place permissionOverwrites gets set up), so editOverwrite() on one would throw
+// "Cannot read properties of undefined (reading 'edit')" on every single enforcePermissions() run.
+// enforceQueueChannels below skips these — enforceTournamentForumChannel is what actually sets
+// visibility/attachment-lock now, once on the shared forum channel itself (guild-config.js's
+// channelIds.tournamentForum), which every post inherits.
+
 // Visible to a brand new member with no roles at all — the very first thing they see.
 const ENTRY_CHANNEL_KEYS = ['register'];
 
@@ -204,6 +212,15 @@ async function enforceQueueChannels(guild) {
     .map(([channelId]) => channelId);
 
   for (const channelId of guildPinnedChannelIds) {
+    // Forum-post tournament channels are threads and have no .permissionOverwrites of their own
+    // to lock down (see this file's header comment) — skip them here entirely, rather than
+    // letting editOverwrite() fail+log on every one of them every single run. Their visibility/
+    // attachment-lock rule lives on the shared forum channel instead (enforceTournamentForumChannel
+    // below). A pre-migration plain-text channel still tracked in pinnedMessages isn't a thread,
+    // so it's unaffected and still gets locked down here exactly as before.
+    const channel = await guild.channels.fetch(channelId).catch(() => null);
+    if (channel?.isThread?.()) continue;
+
     await lockQueueChannelAttachments(guild, channelId);
   }
 
@@ -214,6 +231,31 @@ async function enforceQueueChannels(guild) {
   for (const channelId of creativeChannelIds) {
     await lockQueueChannelAttachments(guild, channelId, { resetViewChannel: true });
   }
+
+  await enforceTournamentForumChannel(guild);
+}
+
+// The forum-level equivalent of lockQueueChannelAttachments — sets it ONCE on the shared
+// tournament forum (channelIds.tournamentForum) instead of once per post, since a forum thread
+// can't hold its own overwrites (see this file's header comment). Every existing post inherits
+// this automatically; nothing needs to touch them individually. Same visibility rule tournament
+// channels have always had: visible to @everyone (no Registered-role gate on ViewChannel — see
+// this file's module doc comment), files/embeds locked down, mods always allowed in.
+async function enforceTournamentForumChannel(guild) {
+  const forumChannelId = getChannelId(guild.id, 'tournamentForum');
+  if (!forumChannelId) return; // not set up yet — guild-config.js's self-heal migration handles this
+
+  const forum = await guild.channels.fetch(forumChannelId).catch(() => null);
+  if (!forum) return;
+
+  await editOverwrite(forum, guild.roles.everyone, { ViewChannel: true, AttachFiles: false, EmbedLinks: false }, '@everyone');
+
+  const modRoleId = getRoleId(guild.id, 'mod');
+  if (modRoleId) {
+    await editOverwrite(forum, modRoleId, { ViewChannel: true, SendMessages: true }, 'mod role');
+  }
+
+  await grantBotAccess(guild, forum);
 }
 
 async function enforcePermissions(guild) {

@@ -10,10 +10,10 @@
 const GuildModel = require('./models/Guild');
 const { buildWelcomeDmEmbed } = require('./embeds');
 
-const cache = {}; // { [guildId]: { channelIds, roleIds, categoryIds, creativeChannels, setupMessageIds, secrets } }
+const cache = {}; // { [guildId]: { channelIds, roleIds, categoryIds, tagIds, creativeChannels, setupMessageIds, secrets } }
 
 function emptyConfig() {
-  return { channelIds: {}, roleIds: {}, categoryIds: {}, creativeChannels: {}, setupMessageIds: {}, secrets: {} };
+  return { channelIds: {}, roleIds: {}, categoryIds: {}, tagIds: {}, creativeChannels: {}, setupMessageIds: {}, secrets: {} };
 }
 
 function toCacheEntry(doc) {
@@ -21,6 +21,7 @@ function toCacheEntry(doc) {
     channelIds: doc.channelIds ?? {},
     roleIds: doc.roleIds ?? {},
     categoryIds: doc.categoryIds ?? {},
+    tagIds: doc.tagIds ?? {},
     creativeChannels: doc.creativeChannels ?? {},
     setupMessageIds: doc.setupMessageIds ?? {},
     secrets: doc.secrets ?? {},
@@ -93,6 +94,24 @@ const GUILD_CONFIG_MIGRATIONS = [
       return `created role "MatchMaker Verified" (${role.id})`;
     },
   },
+  {
+    // Forum-post tournament channel migration — a guild that ran /matchmaker-setup before this
+    // shipped has no tournament forum or region tags yet at all. Self-heals it here (same
+    // precedent as roleIds.verified above) so channel-manager.js's createTournamentChannel has
+    // somewhere to post without every existing server needing an admin to manually re-run setup.
+    name: 'channelIds.tournamentForum',
+    isMissing: (config) => !config.channelIds?.tournamentForum,
+    apply: async (guild) => {
+      // Deferred require: matchmaker-setup.js requires guild-config.js at the top level, so
+      // requiring it back at module load here would be a real circular require — only
+      // ensureTournamentForum is needed, and only once this migration actually runs.
+      const { ensureTournamentForum } = require('./matchmaker-setup');
+      const config = getGuildConfig(guild.id);
+      const { channelId, tagIds } = await ensureTournamentForum(guild, config.channelIds, config.tagIds ?? {});
+      await setGuildConfig(guild.id, { channelIds: { tournamentForum: channelId }, tagIds });
+      return `created tournament forum "tournaments" (${channelId}) with EU/NAC/ME tags`;
+    },
+  },
 ];
 
 // Startup self-heal: for every guild the bot is currently in, check each known migration against
@@ -163,6 +182,13 @@ function getCategoryId(guildId, key) {
   return cache[guildId]?.categoryIds?.[key] ?? null;
 }
 
+// Forum tag ID for a region (matchmaker-setup.js's ensureTournamentForum — key is 'EU'/'NAC'/'ME',
+// same keys categoryIds used to use). null until the tournament forum's tags have been created —
+// channel-manager.js's createTournamentChannel treats that as "post untagged" rather than failing.
+function getTagId(guildId, key) {
+  return cache[guildId]?.tagIds?.[key] ?? null;
+}
+
 function getCreativeChannelInfo(guildId, category) {
   return cache[guildId]?.creativeChannels?.[category] ?? null;
 }
@@ -178,6 +204,7 @@ async function setGuildConfig(guildId, partial) {
     channelIds: { ...current.channelIds, ...partial.channelIds },
     roleIds: { ...current.roleIds, ...partial.roleIds },
     categoryIds: { ...current.categoryIds, ...partial.categoryIds },
+    tagIds: { ...current.tagIds, ...partial.tagIds },
     creativeChannels: {
       ...current.creativeChannels,
       ...Object.fromEntries(
@@ -209,6 +236,7 @@ module.exports = {
   getChannelId,
   getRoleId,
   getCategoryId,
+  getTagId,
   getCreativeChannelInfo,
   setGuildConfig,
 };

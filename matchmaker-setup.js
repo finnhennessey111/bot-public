@@ -39,10 +39,13 @@ const ROLE_SPECS = [
   { key: 'verified', name: 'MatchMaker Verified' },
 ];
 
+// EU/NAC/ME used to be here (one category per region, tournament text channels parented into the
+// matching one) — replaced by ensureTournamentForum below: one shared forum channel with region
+// expressed as a tag instead of a parent category (see models/Guild.js's tagIds doc comment for
+// why a forum post can't be parented per-region the way a text channel was). A guild that already
+// has old EU/NAC/ME categories from before this migration keeps them untouched — nothing here
+// deletes a pre-existing category, they're just no longer created/managed for new setups.
 const CATEGORY_SPECS = [
-  { key: 'EU', name: 'EU Tournaments' },
-  { key: 'NAC', name: 'NAC Tournaments' },
-  { key: 'ME', name: 'ME Tournaments' },
   // Parent for register/get-roles/how-to-use/access (CHANNEL_SPECS' `category: 'matchmaker'`
   // entries below) — groups the bot's generically-named, member-facing channels together instead
   // of scattering them at server root next to a server's own channels, where names like
@@ -93,6 +96,18 @@ const CREATIVE_CHANNEL_SPECS = [
   { key: '2v2', name: 'creative-2v2' },
   { key: '6s', name: 'creative-6s' },
   { key: '8s', name: 'creative-8s' },
+];
+
+// One shared forum channel for every region's tournament posts — ensureTournamentForum below.
+const TOURNAMENT_FORUM_SPEC = { key: 'tournamentForum', name: 'tournaments' };
+
+// Same region set tournament-scraper.js's SUPPORTED_REGIONS covers — deliberately not imported
+// from there (that module is scraper-side, this is guild-setup-side; duplicating three short
+// strings is cheaper than adding a cross-cutting dependency between them for it).
+const REGION_TAG_SPECS = [
+  { key: 'EU', name: 'EU' },
+  { key: 'NAC', name: 'NAC' },
+  { key: 'ME', name: 'ME' },
 ];
 
 const runningGuilds = new Set();
@@ -151,6 +166,49 @@ async function ensureChannel(guild, existingChannelIds, spec, { parentId, parent
     ...(parentId ? { parent: parentId } : {}),
   });
   return created.id;
+}
+
+// Fetch-or-create the shared tournament forum, then reconcile its available tags to exactly
+// REGION_TAG_SPECS. Tag identity is preserved across re-runs by ID (existingTagIds — the guild's
+// currently-stored tagIds map), not by matching on name: passing a tag WITH its existing id back
+// into setAvailableTags keeps that same id (confirmed against discord.js's ThreadOnlyChannel
+// source — GuildForumTagData's `id` is optional specifically so an entry without one gets a fresh
+// id assigned while one that includes it is preserved). Without this, a routine /matchmaker-setup
+// re-run would mint three brand new tag IDs every time and orphan every already-created post's
+// appliedTags reference to the old ones. A region whose stored id no longer exists on the forum
+// (deleted out-of-band, in Discord's UI) safely falls back to getting a fresh one, same as a
+// first-ever run.
+async function ensureTournamentForum(guild, existingChannelIds, existingTagIds) {
+  let channel = existingChannelIds.tournamentForum
+    ? await guild.channels.fetch(existingChannelIds.tournamentForum).catch(() => null)
+    : null;
+
+  if (!channel) {
+    channel = await guild.channels.create({ name: TOURNAMENT_FORUM_SPEC.name, type: ChannelType.GuildForum });
+  }
+
+  const currentById = new Map((channel.availableTags ?? []).map(tag => [tag.id, tag]));
+  const desiredTags = REGION_TAG_SPECS.map(spec => {
+    const existingId = existingTagIds[spec.key];
+    const existingTag = existingId ? currentById.get(existingId) : null;
+    return existingTag ? { id: existingTag.id, name: spec.name } : { name: spec.name };
+  });
+
+  const updated = await channel.setAvailableTags(desiredTags);
+
+  const tagIds = {};
+  for (const spec of REGION_TAG_SPECS) {
+    tagIds[spec.key] = updated.availableTags.find(tag => tag.name === spec.name)?.id ?? null;
+  }
+
+  // permissionOverwrites deliberately NOT set here — a forum THREAD can't hold its own overwrites
+  // independent of its parent forum channel (confirmed via discord.js source: ThreadChannel
+  // extends BaseChannel directly, not GuildChannel, so it has no .permissionOverwrites at all;
+  // GuildForumThreadManager#create's options don't accept permissionOverwrites either). The
+  // forum CHANNEL's own overwrites are what every post inherits — permissions.js's
+  // enforcePermissions (called right after this, at the end of runMatchmakerSetup, and again on
+  // every bot startup) is the single place that sets them, same as every other managed channel.
+  return { channelId: channel.id, tagIds };
 }
 
 // One-time migration for servers that ran /matchmaker-setup before a given channel's category
@@ -255,7 +313,7 @@ async function runMatchmakerSetup(guild) {
 
   try {
     const config = getGuildConfig(guild.id);
-    let channelIds, creativeChannelIds, roleIds;
+    let channelIds, creativeChannelIds, roleIds, tagIds;
 
     try {
       roleIds = {};
@@ -279,7 +337,11 @@ async function runMatchmakerSetup(guild) {
         const parentId = spec.category ? categoryIds[spec.category] : undefined;
         channelIds[spec.key] = await ensureChannel(guild, config.channelIds, spec, { parentId, parentLabel: 'MatchMaker' });
       }
-      await setGuildConfig(guild.id, { channelIds });
+
+      const forum = await ensureTournamentForum(guild, config.channelIds, config.tagIds ?? {});
+      channelIds.tournamentForum = forum.channelId;
+      tagIds = forum.tagIds;
+      await setGuildConfig(guild.id, { channelIds, tagIds });
 
       creativeChannelIds = {};
       for (const spec of CREATIVE_CHANNEL_SPECS) {
@@ -338,17 +400,20 @@ async function runMatchmakerSetup(guild) {
       const missingCategories = missing(CATEGORY_SPECS, saved.categoryIds);
       const missingChannels = missing(CHANNEL_SPECS, saved.channelIds);
       const missingCreative = CREATIVE_CHANNEL_SPECS.filter(s => !saved.creativeChannels?.[s.key]?.channelId).map(s => s.name);
+      const missingForum = !saved.channelIds?.tournamentForum;
 
       console.error(`❌ /matchmaker-setup failed partway through for guild ${guild.id}: ${err.message}`);
       console.error(
         `   Confirmed so far — roles: ${ROLE_SPECS.length - missingRoles.length}/${ROLE_SPECS.length}, `
         + `categories: ${CATEGORY_SPECS.length - missingCategories.length}/${CATEGORY_SPECS.length}, `
         + `channels: ${CHANNEL_SPECS.length - missingChannels.length}/${CHANNEL_SPECS.length}, `
+        + `tournament forum: ${missingForum ? '0/1' : '1/1'}, `
         + `creative channels: ${CREATIVE_CHANNEL_SPECS.length - missingCreative.length}/${CREATIVE_CHANNEL_SPECS.length}`
       );
       if (missingRoles.length) console.error(`   Not yet created: roles [${missingRoles.join(', ')}]`);
       if (missingCategories.length) console.error(`   Not yet created: categories [${missingCategories.join(', ')}]`);
       if (missingChannels.length) console.error(`   Not yet created: channels [${missingChannels.join(', ')}]`);
+      if (missingForum) console.error('   Not yet created: tournament forum');
       if (missingCreative.length) console.error(`   Not yet created: creative channels [${missingCreative.join(', ')}]`);
       console.error('   Nothing that already existed was deleted or altered — fix the permission gap above and re-run /matchmaker-setup, it will resume from here instead of duplicating what already exists.');
       throw err;
@@ -363,6 +428,7 @@ async function runMatchmakerSetup(guild) {
         `Roles: ${ROLE_SPECS.map(s => s.name).join(', ')}\n` +
         `Categories: ${CATEGORY_SPECS.map(s => s.name).join(', ')}\n` +
         `Channels: ${CHANNEL_SPECS.map(s => `<#${channelIds[s.key]}>`).join(', ')}\n` +
+        `Tournament forum: <#${channelIds.tournamentForum}> (tags: ${REGION_TAG_SPECS.map(s => s.name).join(', ')})\n` +
         `Creative channels: ${CREATIVE_CHANNEL_SPECS.map(s => `<#${creativeChannelIds[s.key]}>`).join(', ')}\n` +
         verifiedRoleLine,
     };
@@ -402,8 +468,13 @@ async function refreshAllSetupEmbeds(client) {
 module.exports = {
   runMatchmakerSetup,
   refreshAllSetupEmbeds,
+  // ensureTournamentForum: called directly by guild-config.js's self-heal migration (a guild
+  // missing channelIds.tournamentForum shouldn't need a full /matchmaker-setup re-run just to get
+  // one) — see that migration's own doc comment for why it's a deferred require rather than a
+  // top-level one.
+  ensureTournamentForum,
   // Specs exported for testing (e.g. a regression guard confirming no "general" text/voice
   // channel is ever added back) — runMatchmakerSetup itself needs a live Discord guild object to
   // exercise, so asserting against these directly is how that's verified without one.
-  ROLE_SPECS, CATEGORY_SPECS, CHANNEL_SPECS, CREATIVE_CHANNEL_SPECS,
+  ROLE_SPECS, CATEGORY_SPECS, CHANNEL_SPECS, CREATIVE_CHANNEL_SPECS, TOURNAMENT_FORUM_SPEC, REGION_TAG_SPECS,
 };

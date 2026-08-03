@@ -14,15 +14,9 @@ const assert = require('node:assert/strict');
 const { isRankedCupTitle } = require('../tournament-scraper');
 const { RANK_TIERS, rankedCupPoolName, buildRankedCupQueueButtons, buildRankedCupTournamentEmbed, buildQueueButtons } = require('../embeds');
 const { joinQueue, matchEvents, removeFromQueueAnywhere, findUnitByDiscordId, getQueueCount } = require('../queue');
-const channelManager = require('../channel-manager');
-
-function clearAllManagedTimers() {
-  for (const key of Object.keys(channelManager.managedChannels)) {
-    clearTimeout(channelManager.managedChannels[key].deleteTimer);
-    delete channelManager.managedChannels[key];
-  }
-}
-test.afterEach(clearAllManagedTimers);
+// channel-manager.js itself is required fresh (with guild-config stubbed) inside
+// withGuildConfigStub below, right where section 4's tests actually need it — not at module scope,
+// since those are the only tests here that touch createTournamentChannel at all.
 
 // ── 1. DETECTION ─────────────────────────────────────────────────────────────
 test('isRankedCupTitle: matches real Ranked Cup titles, not similarly-named cups', () => {
@@ -121,22 +115,71 @@ test('buildQueueButtons (non-ranked path) is completely unaffected — still a s
 });
 
 // ── 4. channel-manager.js integration ─────────────────────────────────────────
-function makeFakeChannel(id, name) {
-  const channel = {
-    id, name, parentId: null,
-    sentPayload: null,
-    async setName(n) { channel.name = n; return channel; },
-    async send(payload) {
-      channel.sentPayload = payload;
-      return { id: `msg-${id}`, async pin() {} };
+// createTournamentChannel now posts via forum.threads.create (message: {embeds, components}) —
+// this fake forum captures that message payload directly instead of a separate channel.send().
+// DeletedTournamentChannelModel.findOne is stubbed (createTournamentChannel calls it for every
+// eventId-bearing tournament, which both tests below have) and guild-config's getChannelId/
+// getTagId are stubbed to point at a fake tournament forum — same "stub the Model"/require-cache
+// precedent as test/tournament-channel-rename.test.js.
+const DeletedTournamentChannelModel = require('../models/DeletedTournamentChannel');
+
+const FORUM_ID = 'forum-1';
+
+async function withGuildConfigStub(fn) {
+  const guildConfigPath = require.resolve('../guild-config');
+  const channelManagerPath = require.resolve('../channel-manager');
+  const previousGuildConfig = require.cache[guildConfigPath];
+  delete require.cache[guildConfigPath];
+  delete require.cache[channelManagerPath];
+
+  require.cache[guildConfigPath] = {
+    id: guildConfigPath, filename: guildConfigPath, loaded: true,
+    exports: {
+      getChannelId: (g, k) => (k === 'tournamentForum' ? FORUM_ID : null),
+      getTagId: () => 'region-tag-id',
+      getRoleId: () => null,
     },
   };
-  return channel;
+
+  const originalFindOne = DeletedTournamentChannelModel.findOne;
+  DeletedTournamentChannelModel.findOne = () => ({ lean: async () => null });
+
+  const freshChannelManager = require('../channel-manager');
+  try {
+    return await fn(freshChannelManager);
+  } finally {
+    for (const key of Object.keys(freshChannelManager.managedChannels)) {
+      clearTimeout(freshChannelManager.managedChannels[key].deleteTimer);
+      delete freshChannelManager.managedChannels[key];
+    }
+    delete require.cache[guildConfigPath];
+    delete require.cache[channelManagerPath];
+    if (previousGuildConfig) require.cache[guildConfigPath] = previousGuildConfig;
+    DeletedTournamentChannelModel.findOne = originalFindOne;
+  }
 }
 
 function makeFakeGuild(id) {
   const channelsById = new Map();
   let nextId = 5000;
+  let lastMessage = null;
+
+  const forum = {
+    id: FORUM_ID,
+    threads: {
+      async create({ name, message, appliedTags }) {
+        lastMessage = message;
+        const thread = {
+          id: String(nextId++), name, parentId: FORUM_ID, appliedTags: appliedTags ?? [],
+          async setName(n) { thread.name = n; return thread; },
+        };
+        channelsById.set(thread.id, thread);
+        return thread;
+      },
+    },
+  };
+  channelsById.set(FORUM_ID, forum);
+
   return {
     guild: {
       id,
@@ -145,14 +188,10 @@ function makeFakeGuild(id) {
       channels: {
         cache: { find: predicate => [...channelsById.values()].find(predicate) },
         fetch: async cid => channelsById.get(cid) ?? null,
-        async create({ name }) {
-          const channel = makeFakeChannel(String(nextId++), name);
-          channelsById.set(channel.id, channel);
-          return channel;
-        },
       },
     },
     channelsById,
+    getLastMessage: () => lastMessage,
   };
 }
 
@@ -161,45 +200,51 @@ function futureIso(hoursFromNow) {
 }
 
 test('createTournamentChannel: a Ranked Cup title gets the per-rank buttons + breakdown embed', async () => {
-  const { guild, channelsById } = makeFakeGuild(`guild_${Math.random()}`);
-  const pinnedMessages = {};
+  await withGuildConfigStub(async (cm) => {
+    const { guild, channelsById, getLastMessage } = makeFakeGuild(`guild_${Math.random()}`);
+    const pinnedMessages = {};
 
-  const tournament = {
-    name: 'Duos Ranked Cup (Battle Royale)', region: 'EU', beginTime: futureIso(20), lastBeginTime: futureIso(20),
-    isTrios: false, consoleOnly: false, isPermanent: false, eventId: 'epicgames_rankedcup_EU', isRankedCup: true,
-  };
+    const tournament = {
+      name: 'Duos Ranked Cup (Battle Royale)', region: 'EU', beginTime: futureIso(20), lastBeginTime: futureIso(20),
+      isTrios: false, consoleOnly: false, isPermanent: false, eventId: 'epicgames_rankedcup_EU', isRankedCup: true,
+    };
 
-  await channelManager.createTournamentChannel(guild, tournament, pinnedMessages);
+    await cm.createTournamentChannel(guild, tournament, pinnedMessages);
 
-  const created = [...channelsById.values()][0];
-  assert.ok(created, 'channel should have been created');
-  assert.equal(created.sentPayload.components.length, 2, 'expected 2 button rows for the 6 rank buttons');
-  const allButtons = created.sentPayload.components.flatMap(r => r.toJSON().components);
-  assert.equal(allButtons.length, 6);
-  assert.ok(allButtons.every(b => b.custom_id.startsWith('queue_rank_')), 'every button must be rank-scoped');
+    const created = [...channelsById.values()].find(c => c.id !== FORUM_ID);
+    assert.ok(created, 'a forum post should have been created');
+    const message = getLastMessage();
+    assert.equal(message.components.length, 2, 'expected 2 button rows for the 6 rank buttons');
+    const allButtons = message.components.flatMap(r => r.toJSON().components);
+    assert.equal(allButtons.length, 6);
+    assert.ok(allButtons.every(b => b.custom_id.startsWith('queue_rank_')), 'every button must be rank-scoped');
 
-  const pinnedEntry = Object.values(pinnedMessages)[0];
-  assert.equal(pinnedEntry.isRankedCup, true, 'pinnedMessages entry must record isRankedCup for the embed-refresh loop');
+    const pinnedEntry = Object.values(pinnedMessages)[0];
+    assert.equal(pinnedEntry.isRankedCup, true, 'pinnedMessages entry must record isRankedCup for the embed-refresh loop');
+  });
 });
 
 test('createTournamentChannel: a normal (non-Ranked-Cup) tournament is completely unaffected — single button, no isRankedCup', async () => {
-  const { guild, channelsById } = makeFakeGuild(`guild_${Math.random()}`);
-  const pinnedMessages = {};
+  await withGuildConfigStub(async (cm) => {
+    const { guild, channelsById, getLastMessage } = makeFakeGuild(`guild_${Math.random()}`);
+    const pinnedMessages = {};
 
-  const tournament = {
-    name: 'Mongraal Cup', region: 'EU', beginTime: futureIso(20), lastBeginTime: futureIso(20),
-    isTrios: false, consoleOnly: false, isPermanent: false, eventId: 'epicgames_mongraal_EU', isRankedCup: false,
-  };
+    const tournament = {
+      name: 'Mongraal Cup', region: 'EU', beginTime: futureIso(20), lastBeginTime: futureIso(20),
+      isTrios: false, consoleOnly: false, isPermanent: false, eventId: 'epicgames_mongraal_EU', isRankedCup: false,
+    };
 
-  await channelManager.createTournamentChannel(guild, tournament, pinnedMessages);
+    await cm.createTournamentChannel(guild, tournament, pinnedMessages);
 
-  const created = [...channelsById.values()][0];
-  assert.ok(created, 'channel should have been created');
-  assert.equal(created.sentPayload.components.length, 1, 'expected exactly 1 row (the normal generic button)');
-  const buttons = created.sentPayload.components[0].toJSON().components;
-  assert.equal(buttons.length, 1);
-  assert.equal(buttons[0].custom_id, 'queue_duo');
+    const created = [...channelsById.values()].find(c => c.id !== FORUM_ID);
+    assert.ok(created, 'a forum post should have been created');
+    const message = getLastMessage();
+    assert.equal(message.components.length, 1, 'expected exactly 1 row (the normal generic button)');
+    const buttons = message.components[0].toJSON().components;
+    assert.equal(buttons.length, 1);
+    assert.equal(buttons[0].custom_id, 'queue_duo');
 
-  const pinnedEntry = Object.values(pinnedMessages)[0];
-  assert.equal(pinnedEntry.isRankedCup, false);
+    const pinnedEntry = Object.values(pinnedMessages)[0];
+    assert.equal(pinnedEntry.isRankedCup, false);
+  });
 });

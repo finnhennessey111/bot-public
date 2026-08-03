@@ -598,9 +598,14 @@ client.on('guildMemberUpdate', (oldMember, newMember) => {
 
 // ── ACCIDENTAL TOURNAMENT CHANNEL DELETION ──────────────────────────────────
 // See channel-deletion-undo.js's doc comment for the full flow — fast no-op for anything that
-// isn't an externally-deleted, tracked tournament channel.
+// isn't an externally-deleted, tracked tournament channel. Both events are needed: tournament
+// posts are forum threads now, and Discord fires threadDelete (not channelDelete) for those — a
+// channelDelete-only listener would never see a deleted tournament post at all.
 client.on('channelDelete', channel => {
   channelDeletionUndo.handleChannelDelete(client, channel).catch(console.error);
+});
+client.on('threadDelete', thread => {
+  channelDeletionUndo.handleChannelDelete(client, thread).catch(console.error);
 });
 
 async function guardModRoleGrant(oldMember, newMember) {

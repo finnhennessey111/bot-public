@@ -6,18 +6,65 @@
 // running the same real tournament (models/DeletedTournamentChannel.js's compound guildId+eventId
 // key — the bug a naive eventId-only key would have reintroduced).
 //
+// Tournament posts are forum threads now (see channel-manager.js's createTournamentChannel):
+// every fake "channel" here is thread-shaped (isThread() -> true, no parent category), and
+// guild-config is stubbed (require-cache swap, done once for the whole file in test.before/after
+// since every test needs the same fixed forum/tag values) so createTournamentChannel has
+// somewhere to post. handleChannelDelete's audit-log lookup now also depends on isThread() to pick
+// AuditLogEvent.ThreadDelete vs .ChannelDelete — covered directly near the bottom of this file.
+//
 // Same "stub the Model with a small real in-memory collection, not the module" precedent as
 // test/tournament-approval.test.js — the actual production channel-deletion-undo.js code runs
 // unmodified against realistic query/update semantics, including the atomic
 // status:'pending_confirmation' guard.
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const { AuditLogEvent } = require('discord.js');
 
 const DeletedTournamentChannelModel = require('../models/DeletedTournamentChannel');
-const channelManager = require('../channel-manager');
-const channelDeletionUndo = require('../channel-deletion-undo');
 const selfDeletionTracker = require('../self-deletion-tracker');
 const store = require('../store');
+
+const FORUM_ID = 'forum-1';
+const REGION_TAG_IDS = { EU: 'tag-eu', NAC: 'tag-nac', ME: 'tag-me' };
+
+// channelManager/channelDeletionUndo are (re)required fresh inside test.before, AFTER the
+// guild-config require-cache swap below — a plain top-level require() here would run before
+// test.before ever fires, capturing the REAL (unstubbed) guild-config into their own module-level
+// destructuring, too late for the stub to matter at all.
+let channelManager;
+let channelDeletionUndo;
+
+const guildConfigPath = require.resolve('../guild-config');
+const channelManagerPath = require.resolve('../channel-manager');
+const channelDeletionUndoPath = require.resolve('../channel-deletion-undo');
+let previousGuildConfig;
+
+test.before(() => {
+  previousGuildConfig = require.cache[guildConfigPath];
+  delete require.cache[guildConfigPath];
+  delete require.cache[channelManagerPath];
+  delete require.cache[channelDeletionUndoPath];
+
+  require.cache[guildConfigPath] = {
+    id: guildConfigPath, filename: guildConfigPath, loaded: true,
+    exports: {
+      getChannelId: (g, k) => (k === 'tournamentForum' ? FORUM_ID : null),
+      getTagId: (g, region) => REGION_TAG_IDS[region] ?? null,
+      getRoleId: () => null,
+    },
+  };
+
+  channelManager = require('../channel-manager');
+  channelDeletionUndo = require('../channel-deletion-undo');
+});
+
+test.after(() => {
+  delete require.cache[guildConfigPath];
+  delete require.cache[channelManagerPath];
+  delete require.cache[channelDeletionUndoPath];
+  if (previousGuildConfig) require.cache[guildConfigPath] = previousGuildConfig;
+});
 
 function getPath(obj, path) {
   return path.split('.').reduce((o, k) => (o == null ? undefined : o[k]), obj);
@@ -84,20 +131,39 @@ function withFakeModel(fn) {
   return Promise.resolve(fn(fake)).finally(() => Object.assign(DeletedTournamentChannelModel, originals));
 }
 
-function makeFakeChannel(id, name, parentId = null) {
+// Thread-shaped — real ThreadChannel#isThread() reads a type field internally; this fake just
+// hardcodes the answer, since that's the only part of it these tests actually depend on.
+function makeFakeThread(id, name, parentId = FORUM_ID) {
   return {
     id, name, parentId,
+    isThread: () => true,
     async setName(newName) { this.name = newName; return this; },
-    async send() { return { id: `msg-${id}`, async pin() {} }; },
   };
 }
 
-// auditEntries: [{ targetId, executor }] — most-recent-first, same shape guild.fetchAuditLogs
-// returns for real (GuildAuditLogsEntry.target/.executor).
-function makeFakeGuild(id, { auditEntries = [], existingChannels = [] } = {}) {
-  const channelsById = new Map(existingChannels.map(c => [c.id, c]));
+// auditEntries: [{ targetId, executor, type }] — most-recent-first, same shape guild.fetchAuditLogs
+// returns for real (GuildAuditLogsEntry.target/.executor). `type` lets a test simulate the real
+// AuditLogEvent.ThreadDelete vs .ChannelDelete split — fetchAuditLogs below only returns entries
+// matching the type it was actually called with, same as the real Discord API filtering server-side.
+function makeFakeGuild(id, { auditEntries = [] } = {}) {
+  const channelsById = new Map();
   let nextChanId = 5000;
   const createCalls = [];
+  const fetchAuditLogCalls = [];
+
+  const forum = {
+    id: FORUM_ID,
+    threads: {
+      async create({ name, appliedTags }) {
+        const thread = makeFakeThread(String(nextChanId++), name);
+        thread.appliedTags = appliedTags ?? [];
+        channelsById.set(thread.id, thread);
+        createCalls.push(thread);
+        return thread;
+      },
+    },
+  };
+  channelsById.set(FORUM_ID, forum);
 
   const guild = {
     id,
@@ -106,19 +172,14 @@ function makeFakeGuild(id, { auditEntries = [], existingChannels = [] } = {}) {
     channels: {
       cache: { find: predicate => [...channelsById.values()].find(predicate) },
       fetch: async cid => channelsById.get(cid) ?? null,
-      async create({ name }) {
-        const channel = makeFakeChannel(String(nextChanId++), name);
-        channelsById.set(channel.id, channel);
-        createCalls.push(channel);
-        return channel;
-      },
     },
-    fetchAuditLogs: async () => ({
-      entries: auditEntries.map(e => ({ target: { id: e.targetId }, executor: e.executor })),
-    }),
+    fetchAuditLogs: async ({ type }) => {
+      fetchAuditLogCalls.push(type);
+      return { entries: auditEntries.filter(e => e.type === undefined || e.type === type).map(e => ({ target: { id: e.targetId }, executor: e.executor })) };
+    },
   };
 
-  return { guild, channelsById, createCalls };
+  return { guild, channelsById, createCalls, fetchAuditLogCalls };
 }
 
 function makeFakeClient(guildsById) {
@@ -180,7 +241,7 @@ function makePinnedEntry(overrides = {}) {
     isRankedCup: false,
     consoleOnly: false,
     beginTime: futureIso(20),
-    deleteAt: Date.now() + (20 * 3600_000) + channelManager.CHANNEL_DELETE_BUFFER_MS,
+    deleteAt: Date.now() + (20 * 3600_000) + 2 * 3600_000,
     permanent: false,
     ...overrides,
   };
@@ -190,8 +251,7 @@ test.afterEach(() => {
   // handleChannelDelete/restoreChannel write into the real store.pinnedMessages (not a test-local
   // object — see channel-deletion-undo.js's doc comment on why: it's the shared, live tracking
   // state channel-manager.js itself reads) and createTournamentChannel arms a real setTimeout
-  // deletion timer on every successful (re)creation — both need clearing between tests, same
-  // precedent as test/tournament-channel-rename.test.js's clearAllManagedTimers.
+  // deletion timer on every successful (re)creation — both need clearing between tests.
   for (const key of Object.keys(store.pinnedMessages)) delete store.pinnedMessages[key];
   for (const key of Object.keys(channelManager.managedChannels)) {
     clearTimeout(channelManager.managedChannels[key].deleteTimer);
@@ -208,7 +268,8 @@ test('handleChannelDelete: a self-initiated deletion (markSelfDeletion) is never
 
     const { guild } = makeFakeGuild('guild-1');
     const { client, sentDMs } = makeFakeClient({});
-    const channel = { id: 'chan-1', guild };
+    const channel = makeFakeThread('chan-1', 'test-cup');
+    channel.guild = guild;
 
     await channelDeletionUndo.handleChannelDelete(client, channel);
 
@@ -227,7 +288,8 @@ test('handleChannelDelete: a channel with no pinnedMessages entry (never tracked
   return withFakeModel(async (fake) => {
     const { guild } = makeFakeGuild('guild-1');
     const { client, sentDMs } = makeFakeClient({});
-    const channel = { id: 'chan-untracked', guild };
+    const channel = makeFakeThread('chan-untracked', 'untracked');
+    channel.guild = guild;
 
     await channelDeletionUndo.handleChannelDelete(client, channel);
 
@@ -241,7 +303,8 @@ test('handleChannelDelete: a tracked channel with no eventId (e.g. manually /set
     store.pinnedMessages['chan-manual'] = makePinnedEntry({ tournamentEventId: undefined });
     const { guild } = makeFakeGuild('guild-1');
     const { client, sentDMs } = makeFakeClient({});
-    const channel = { id: 'chan-manual', guild };
+    const channel = makeFakeThread('chan-manual', 'manual');
+    channel.guild = guild;
 
     await channelDeletionUndo.handleChannelDelete(client, channel);
 
@@ -254,10 +317,11 @@ test('handleChannelDelete: an external deletion with an identifiable deleter cre
   return withFakeModel(async (fake) => {
     store.pinnedMessages['chan-2'] = makePinnedEntry();
     const { guild } = makeFakeGuild('guild-1', {
-      auditEntries: [{ targetId: 'chan-2', executor: { id: 'mod-1', tag: 'SomeMod#0001' } }],
+      auditEntries: [{ targetId: 'chan-2', executor: { id: 'mod-1', tag: 'SomeMod#0001' }, type: AuditLogEvent.ThreadDelete }],
     });
     const { client, sentDMs } = makeFakeClient({});
-    const channel = { id: 'chan-2', guild };
+    const channel = makeFakeThread('chan-2', 'test-cup');
+    channel.guild = guild;
 
     await channelDeletionUndo.handleChannelDelete(client, channel);
 
@@ -277,7 +341,8 @@ test('handleChannelDelete: no identifiable deleter (audit log lookup finds nothi
     store.pinnedMessages['chan-3'] = makePinnedEntry();
     const { guild } = makeFakeGuild('guild-1', { auditEntries: [] }); // nothing matches this channel id
     const { client, sentDMs } = makeFakeClient({});
-    const channel = { id: 'chan-3', guild };
+    const channel = makeFakeThread('chan-3', 'test-cup');
+    channel.guild = guild;
 
     await channelDeletionUndo.handleChannelDelete(client, channel);
 
@@ -291,10 +356,11 @@ test('handleChannelDelete: the bot itself as executor (defense in depth) is trea
   return withFakeModel(async (fake) => {
     store.pinnedMessages['chan-4'] = makePinnedEntry();
     const { guild } = makeFakeGuild('guild-1', {
-      auditEntries: [{ targetId: 'chan-4', executor: { id: 'bot-id', tag: 'MatchMaker#0000' } }],
+      auditEntries: [{ targetId: 'chan-4', executor: { id: 'bot-id', tag: 'MatchMaker#0000' }, type: AuditLogEvent.ThreadDelete }],
     });
     const { client, sentDMs } = makeFakeClient({});
-    const channel = { id: 'chan-4', guild };
+    const channel = makeFakeThread('chan-4', 'test-cup');
+    channel.guild = guild;
 
     await channelDeletionUndo.handleChannelDelete(client, channel);
 
@@ -313,15 +379,81 @@ test('handleChannelDelete: a later deletion of the same (guild, eventId) after a
 
     store.pinnedMessages['chan-5'] = makePinnedEntry({ tournamentName: 'Test Cup Again' });
     const { guild } = makeFakeGuild('guild-1', {
-      auditEntries: [{ targetId: 'chan-5', executor: { id: 'mod-2', tag: 'Mod2#0002' } }],
+      auditEntries: [{ targetId: 'chan-5', executor: { id: 'mod-2', tag: 'Mod2#0002' }, type: AuditLogEvent.ThreadDelete }],
     });
     const { client } = makeFakeClient({});
+    const channel = makeFakeThread('chan-5', 'test-cup-again');
+    channel.guild = guild;
 
-    await channelDeletionUndo.handleChannelDelete(client, { id: 'chan-5', guild });
+    await channelDeletionUndo.handleChannelDelete(client, channel);
 
     assert.equal(fake.docs.length, 1, 'same (guildId, eventId) must reuse the one record, not create a second');
     assert.equal(fake.docs[0].status, 'pending_confirmation');
     assert.equal(fake.docs[0].tournamentName, 'Test Cup Again', 'snapshot/name must be refreshed, not left stale from the prior cycle');
+  });
+});
+
+// ── Thread vs. normal channel: distinct Discord audit-log event types ────────────────────────
+// A forum post's deletion is logged under AuditLogEvent.ThreadDelete (112), a genuinely separate
+// type from AuditLogEvent.ChannelDelete (12) — confirmed via discord-api-types' own enum. Querying
+// the wrong type would find nothing and silently misattribute every real deletion to "no
+// identifiable deleter".
+
+test('handleChannelDelete: a THREAD deletion (isThread() true) queries AuditLogEvent.ThreadDelete, not ChannelDelete', () => {
+  return withFakeModel(async (fake) => {
+    store.pinnedMessages['chan-6'] = makePinnedEntry();
+    const { guild, fetchAuditLogCalls } = makeFakeGuild('guild-1', {
+      auditEntries: [{ targetId: 'chan-6', executor: { id: 'mod-1', tag: 'Mod#1' }, type: AuditLogEvent.ThreadDelete }],
+    });
+    const { client, sentDMs } = makeFakeClient({});
+    const channel = makeFakeThread('chan-6', 'test-cup');
+    channel.guild = guild;
+
+    await channelDeletionUndo.handleChannelDelete(client, channel);
+
+    assert.deepEqual(fetchAuditLogCalls, [AuditLogEvent.ThreadDelete]);
+    assert.equal(sentDMs.length, 1, 'the executor must actually be found via the correct audit-log type');
+    assert.equal(fake.docs[0].status, 'pending_confirmation');
+  });
+});
+
+test('handleChannelDelete: a NORMAL channel deletion (isThread() false — a legacy pre-migration channel) still queries AuditLogEvent.ChannelDelete', () => {
+  return withFakeModel(async (fake) => {
+    store.pinnedMessages['chan-7'] = makePinnedEntry();
+    const { guild, fetchAuditLogCalls } = makeFakeGuild('guild-1', {
+      auditEntries: [{ targetId: 'chan-7', executor: { id: 'mod-1', tag: 'Mod#1' }, type: AuditLogEvent.ChannelDelete }],
+    });
+    const { client, sentDMs } = makeFakeClient({});
+    const channel = { id: 'chan-7', name: 'legacy-channel', isThread: () => false, guild };
+
+    await channelDeletionUndo.handleChannelDelete(client, channel);
+
+    assert.deepEqual(fetchAuditLogCalls, [AuditLogEvent.ChannelDelete]);
+    assert.equal(sentDMs.length, 1, 'a legacy plain-text channel must still resolve its real deleter');
+    assert.equal(fake.docs[0].status, 'pending_confirmation');
+  });
+});
+
+test('handleChannelDelete: querying the WRONG audit-log type (regression demonstration) would have found nobody — confirms why isThread() routing matters', () => {
+  return withFakeModel(async (fake) => {
+    store.pinnedMessages['chan-8'] = makePinnedEntry();
+    // The real deletion IS logged (as a real ThreadDelete entry) — but this guild's fake audit log
+    // only serves entries matching the type it was actually queried with, exactly like the real
+    // Discord API. If handleChannelDelete queried ChannelDelete for a thread (the pre-fix bug),
+    // this entry would never be found.
+    const { guild } = makeFakeGuild('guild-1', {
+      auditEntries: [{ targetId: 'chan-8', executor: { id: 'mod-1', tag: 'Mod#1' }, type: AuditLogEvent.ThreadDelete }],
+    });
+    const { client, sentDMs } = makeFakeClient({});
+    const channel = makeFakeThread('chan-8', 'test-cup');
+    channel.guild = guild;
+
+    await channelDeletionUndo.handleChannelDelete(client, channel);
+
+    // The real fix (querying ThreadDelete for a thread) means this DOES find the executor —
+    // proving the routing is actually correct, not just plausible.
+    assert.equal(sentDMs.length, 1);
+    assert.equal(fake.docs[0].deletedBy.id, 'mod-1');
   });
 });
 
@@ -333,7 +465,9 @@ test('handleChannelDelete + createTournamentChannel: a permanent deletion in one
     store.pinnedMessages['chan-g1'] = makePinnedEntry({ guildId: 'guild-1' });
     const { guild: guild1 } = makeFakeGuild('guild-1', { auditEntries: [] });
     const { client } = makeFakeClient({});
-    await channelDeletionUndo.handleChannelDelete(client, { id: 'chan-g1', guild: guild1 });
+    const channel1 = makeFakeThread('chan-g1', 'test-cup');
+    channel1.guild = guild1;
+    await channelDeletionUndo.handleChannelDelete(client, channel1);
     assert.equal(fake.docs.find(d => d.guildId === 'guild-1').status, 'permanently_deleted');
 
     // The exact same eventId, in an unrelated guild-2, must still create normally.
@@ -435,7 +569,7 @@ test('restoreChannel: a pending record is settled to restored and the channel is
         tournamentName: 'Restore Me Cup', region: 'NAC', tournamentEventId: 'evt_restore_me',
         isTrios: true, isRankedCup: false, consoleOnly: false, permanent: false,
         beginTime: futureIso(10),
-        deleteAt: Date.now() + (10 * 3600_000) + channelManager.CHANNEL_DELETE_BUFFER_MS,
+        deleteAt: Date.now() + (10 * 3600_000) + 2 * 3600_000,
       },
       deletedBy: { id: 'mod-1', tag: 'SomeMod#0001' },
       deletedAt: new Date(), expiresAt: new Date(Date.now() + 3600_000),

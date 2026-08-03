@@ -101,6 +101,14 @@ function makeFakeGuild({ failChannelSend = null } = {}) {
       },
       setParent: async (pid) => { channel.parentId = pid; },
       delete: assertNoDelete(`channel #${name}`),
+      // Forum-channel shape (matchmaker-setup.js's ensureTournamentForum) — every fake channel gets
+      // this, not just the one actually created as a forum, since it's harmless on the others and
+      // this file's tests aren't about the forum itself.
+      availableTags: [],
+      setAvailableTags: async (tags) => {
+        channel.availableTags = tags.map(t => ({ id: t.id ?? nextId('tag'), name: t.name }));
+        return channel;
+      },
     };
     return channel;
   }
@@ -149,10 +157,12 @@ test('matchmaker-setup: roles/categories/channels created before a partial failu
 
     const saved = getCurrent();
     assert.equal(Object.keys(saved.roleIds).length, 11, 'all 11 roles should be saved even though the run failed later');
-    assert.ok(saved.categoryIds.EU && saved.categoryIds.NAC && saved.categoryIds.ME && saved.categoryIds.creative,
-      'all 4 categories should be saved even though the run failed later');
+    assert.ok(saved.categoryIds.matchmaker && saved.categoryIds.creative,
+      'both categories should be saved even though the run failed later');
     assert.ok(saved.channelIds.register && saved.channelIds.getRoles && saved.channelIds.howto,
       'channels created before the failing #setup embed post should be saved');
+    assert.ok(saved.channelIds.tournamentForum,
+      'the tournament forum (created before the failing #setup embed post) should be saved too');
   });
 });
 

@@ -18,17 +18,31 @@
 // stubs is the real, unmodified production code path.
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const DeletedTournamentChannelModel = require('../models/DeletedTournamentChannel');
 
-function withStubbedModule(modPath, stubExports, fn) {
+const FORUM_ID = 'forum-1';
+
+// async + awaiting fn(...) (not just returning its promise) matters here: the
+// DeletedTournamentChannelModel.findOne stub is a property mutation on a shared singleton, unlike
+// the require-cache module swap below (which channel-manager.js captures by destructuring at its
+// own require() time — safe to unwind immediately). Restoring findOne before fn's own async body
+// actually reaches its createTournamentChannel call would silently put the real, Mongo-backed one
+// back before it's needed.
+async function withStubbedModule(modPath, stubExports, fn) {
   const resolved = require.resolve(modPath);
   const previous = require.cache[resolved];
   delete require.cache[resolved];
   require.cache[resolved] = { id: resolved, filename: resolved, loaded: true, exports: stubExports };
+
+  const originalFindOne = DeletedTournamentChannelModel.findOne;
+  DeletedTournamentChannelModel.findOne = () => ({ lean: async () => null });
+
   try {
-    return fn();
+    return await fn();
   } finally {
     delete require.cache[resolved];
     if (previous) require.cache[resolved] = previous;
+    DeletedTournamentChannelModel.findOne = originalFindOne;
   }
 }
 
@@ -41,33 +55,53 @@ function futureIso(hoursFromNow) {
   return new Date(Date.now() + hoursFromNow * 3600_000).toISOString();
 }
 
+// Tournament posts are forum threads now — this fake guild's forum channel is what
+// createTournamentChannel actually calls .threads.create() on (guild-config's getChannelId stub
+// below points 'tournamentForum' at FORUM_ID).
 function makeFakeGuild() {
   const channelsById = new Map();
+  let nextId = 0;
+
+  const forum = {
+    id: FORUM_ID,
+    threads: {
+      async create({ name, appliedTags }) {
+        const thread = {
+          id: String(1000 + nextId++),
+          name,
+          parentId: FORUM_ID,
+          appliedTags: appliedTags ?? [],
+          async setName(n) { thread.name = n; return thread; },
+        };
+        channelsById.set(thread.id, thread);
+        return thread;
+      },
+    },
+  };
+  channelsById.set(FORUM_ID, forum);
+
   const guild = {
     id: 'guild1',
     roles: { everyone: 'everyone-role-id' },
     client: { user: { id: 'bot-id' } },
     channels: {
-      cache: { find: () => undefined },
+      cache: { find: predicate => [...channelsById.values()].find(predicate) },
       fetch: async (id) => channelsById.get(id) ?? null,
-      async create({ name }) {
-        const channel = {
-          id: String(1000 + channelsById.size),
-          name,
-          async send() { return { id: 'msg-1', async pin() {} }; },
-        };
-        channelsById.set(channel.id, channel);
-        return channel;
-      },
     },
   };
-  return guild;
+  return { guild, channelsById };
 }
 
+const GUILD_CONFIG_STUB = {
+  getRoleId: () => null,
+  getChannelId: (g, k) => (k === 'tournamentForum' ? FORUM_ID : null),
+  getTagId: () => 'eu-tag-id',
+};
+
 test('a known console-only tournament: consoleOnly flows all the way from the scraper-shaped tournament object to pinnedMessages', async () => {
-  await withStubbedModule('../guild-config', { getRoleId: () => null, getCategoryId: () => null }, async () => {
+  await withStubbedModule('../guild-config', GUILD_CONFIG_STUB, async () => {
     const channelManager = freshRequire('../channel-manager');
-    const guild = makeFakeGuild();
+    const { guild } = makeFakeGuild();
     const pinnedMessages = {};
 
     // Shape channel-manager.js actually receives from tournament-scraper.js's buildTournamentGroups
@@ -100,10 +134,15 @@ test('a known console-only tournament: consoleOnly flows all the way from the sc
 });
 
 test('an already-tracked channel missing consoleOnly (pre-fix data) gets backfilled on the next tick', async () => {
-  await withStubbedModule('../guild-config', { getRoleId: () => null, getCategoryId: () => null }, async () => {
+  await withStubbedModule('../guild-config', GUILD_CONFIG_STUB, async () => {
     const channelManager = freshRequire('../channel-manager');
-    const guild = makeFakeGuild();
-    const existingChannel = await guild.channels.create({ name: 'console-duos-zb-cash-cup' });
+    const { guild, channelsById } = makeFakeGuild();
+
+    // Simulates a pre-existing forum post — the thread already exists (tracked by eventId in
+    // pinnedMessages below), so createTournamentChannel must find and reuse it via the eventId
+    // match, not call forum.threads.create() again.
+    const existingChannel = { id: 'existing-thread-1', name: 'console-duos-zb-cash-cup', parentId: FORUM_ID, appliedTags: ['eu-tag-id'], async setName(n) { this.name = n; return this; } };
+    channelsById.set(existingChannel.id, existingChannel);
 
     // Simulates a real pre-fix pinnedMessages entry — created before this fix shipped, so it has
     // every other field but never got consoleOnly written at all (exactly the bug being fixed).

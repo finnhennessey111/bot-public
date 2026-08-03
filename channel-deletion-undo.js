@@ -41,9 +41,17 @@ const EXPIRY_SWEEP_INTERVAL_MS = 20 * 60 * 1000;
 // Same audit-log-lookup shape as index.js's guardModRoleGrant (MatchMaker Mod role grants) — most
 // recent matching entry for this exact channel id, since the channel itself is gone from cache by
 // the time this runs (GuildAuditLogsEntry falls back to a bare {id} target for a delete entry).
-async function findDeletionExecutor(guild, channelId, client) {
+//
+// isThread matters here: Discord logs a thread's deletion under AuditLogEvent.ThreadDelete (112),
+// a genuinely separate event type from AuditLogEvent.ChannelDelete (12) — confirmed against
+// discord-api-types' own AuditLogEvent enum. Tournament posts are threads now (forum posts), so
+// querying ChannelDelete unconditionally would never find a matching entry for one, meaning
+// executor would always come back null and every accidental post deletion would get silently
+// marked permanently_deleted instead of asking whoever actually deleted it.
+async function findDeletionExecutor(guild, channelId, client, isThread) {
   try {
-    const auditLogs = await guild.fetchAuditLogs({ type: AuditLogEvent.ChannelDelete, limit: 5 });
+    const auditLogType = isThread ? AuditLogEvent.ThreadDelete : AuditLogEvent.ChannelDelete;
+    const auditLogs = await guild.fetchAuditLogs({ type: auditLogType, limit: 5 });
     const entry = auditLogs.entries.find(e => e.target?.id === channelId);
     const executor = entry?.executor ?? null;
     // Shouldn't be reachable — self-deletion-tracker.js's mark already filters out every deletion
@@ -92,9 +100,15 @@ async function settleStatus(recordId, newStatus) {
   ).lean();
 }
 
-// The channelDelete gateway listener (index.js) — client.on('channelDelete', channel =>
-// handleChannelDelete(client, channel)). Fires for every deleted channel across every guild the bot
-// is in; everything not a tracked, externally-deleted tournament channel is a fast no-op below.
+// The channelDelete AND threadDelete gateway listeners (index.js) both route here —
+// client.on('channelDelete', channel => handleChannelDelete(client, channel)) and
+// client.on('threadDelete', thread => handleChannelDelete(client, thread)). Two separate Discord
+// gateway events are needed because tournament posts are forum threads now: Discord fires
+// THREAD_DELETE (not CHANNEL_DELETE) when a thread is deleted, a genuinely distinct event
+// discord.js surfaces as its own client event — a channelDelete-only listener would simply never
+// fire for a deleted tournament post at all. Fires for every deleted channel/thread across every
+// guild the bot is in; everything not a tracked, externally-deleted tournament channel is a fast
+// no-op below.
 async function handleChannelDelete(client, channel) {
   if (!channel.guild) return; // not a guild channel
 
@@ -104,7 +118,7 @@ async function handleChannelDelete(client, channel) {
   if (!pinned || !pinned.tournamentEventId) return; // not a tracked, scraper-managed tournament channel
 
   const guild = channel.guild;
-  const executor = await findDeletionExecutor(guild, channel.id, client);
+  const executor = await findDeletionExecutor(guild, channel.id, client, channel.isThread());
 
   // Snapshot before clearing — once this entry is gone, this is the only place the data needed to
   // recreate the channel identically still exists.
