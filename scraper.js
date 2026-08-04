@@ -2,6 +2,7 @@ const puppeteer = require('puppeteer');
 const config = require('./config');
 const { proxyLaunchArgs, authenticatePage, blockUnnecessaryResources, logProxyMode, withBrowserSlot, closeBrowserSafely } = require('./proxy-config');
 const { resolveRosterSize } = require('./roster-size');
+const epicApi = require('./epic-api');
 
 logProxyMode('scraper');
 
@@ -297,7 +298,39 @@ function calculateMatchScore(playerData, tournamentName) {
   return computeMatchScoreBreakdown(playerData, tournamentName).matchScore;
 }
 
+// Real-tournament-only upgrade path: computes the exact same breakdown as
+// computeMatchScoreBreakdown above (base + soloModifier both stay Fortnite-Tracker-sourced, per
+// the explicit decision to keep those two on FT — Epic's own PR only covers the top 10,000 players,
+// and its per-event history needs a player OAuth token this bot can't require of everyone), then
+// tries to upgrade ownTournamentModifier specifically using Epic's own recorded placement data
+// (epic-api.js's getEpicOwnTournamentModifier) — a direct rank/points lookup for this exact
+// tournament+region+player instead of scanning Fortnite Tracker's capped recentEvents for a name
+// match. `tournament` needs { name, eventId, region } — eventId is tournament-scraper.js's own
+// scraped identifier (confirmed live to be the same real Epic eventId the matches endpoint wants).
+// Falls back to the plain FT-derived breakdown on absolutely any gap (no eventId, no Epic calendar
+// match, no player standing found, a network/API failure) — this never throws, and never leaves a
+// queue-join without a score. Only queue.js's buildPlayer (real tournaments) calls this;
+// creative-queue.js and elo.js keep calling the plain synchronous computeMatchScoreBreakdown
+// unchanged, since neither has a real Epic-trackable tournament to look up.
+async function computeMatchScoreBreakdownWithEpic(playerData, tournament, accountId) {
+  const breakdown = computeMatchScoreBreakdown(playerData, tournament?.name);
+
+  if (!tournament?.eventId || !accountId) return breakdown;
+
+  let epicResult = null;
+  try {
+    epicResult = await epicApi.getEpicOwnTournamentModifier(tournament, accountId, { getPlacementScore });
+  } catch (err) {
+    console.warn(`[scraper] Epic own-tournament lookup threw for "${tournament.name}" — falling back to Fortnite Tracker history: ${err.message}`);
+  }
+
+  if (!epicResult) return breakdown;
+
+  const matchScore = Math.round(breakdown.base * (1 + breakdown.soloModifier + epicResult.modifier));
+  return { ...breakdown, matchScore, ownTournamentModifier: epicResult.modifier, ownTournamentSource: 'epic' };
+}
+
 module.exports = {
   scrapePlayer, scrapePlayerOnce, calculateMatchScore, computeMatchScoreBreakdown,
-  computeOwnTournamentModifier, getPlacementScore,
+  computeMatchScoreBreakdownWithEpic, computeOwnTournamentModifier, getPlacementScore,
 };

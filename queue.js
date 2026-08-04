@@ -24,7 +24,7 @@
 // and survives a bot restart with no extra state to reconstruct.
 
 const { EventEmitter } = require('events');
-const { computeMatchScoreBreakdown } = require('./scraper');
+const { computeMatchScoreBreakdownWithEpic } = require('./scraper');
 const { queues, saveQueues } = require('./store');
 const config = require('./config');
 const playerStore = require('./players');
@@ -236,6 +236,7 @@ async function buildPlayer({
   epicUsername,
   epicId,
   tournamentName,
+  tournamentEventId,
   homeRegion,
   queueRegion,
   queueType,
@@ -259,7 +260,15 @@ async function buildPlayer({
     guildId, discordId, epicUsername, epicId,
     { homeRegion, queueRegion, platform: resolvedPlatform, tournamentConsoleOnly: resolvedConsoleOnly }
   );
-  const { matchScore, soloModifier } = computeMatchScoreBreakdown(playerData, tournamentName);
+  // tournamentEventId (index.js threads this through from pinnedMessages' tournament-scraper.js-
+  // sourced eventId) lets this try Epic's own placement data for ownTournamentModifier — see
+  // scraper.js's computeMatchScoreBreakdownWithEpic doc comment. Falls back to the plain
+  // Fortnite-Tracker-derived breakdown (identical to the old computeMatchScoreBreakdown call this
+  // replaces) whenever tournamentEventId is missing (e.g. a legacy pinned entry) or the Epic lookup
+  // can't resolve anything — never a queue-join failure either way.
+  const { matchScore, soloModifier } = await computeMatchScoreBreakdownWithEpic(
+    playerData, { name: tournamentName, eventId: tournamentEventId, region: queueRegion }, epicId
+  );
 
   return {
     guildId,

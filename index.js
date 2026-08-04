@@ -1541,7 +1541,7 @@ async function handleInteraction(interaction) {
         return replyAndDismiss(interaction, { content: '❌ Could not find tournament info for this channel.' });
       }
 
-      const { tournamentName, region, isTrios, consoleOnly } = pinned;
+      const { tournamentName, tournamentEventId, region, isTrios, consoleOnly } = pinned;
       const queueType = customId.replace('queue_', '');
       const joinKey = `${guild.id}:${user.id}`;
 
@@ -1606,6 +1606,7 @@ async function handleInteraction(interaction) {
           epicUsername,
           epicId,
           tournamentName,
+          tournamentEventId,
           homeRegion,
           queueRegion: region,
           queueType,
@@ -1657,7 +1658,7 @@ async function handleInteraction(interaction) {
         return replyAndDismiss(interaction, { content: '❌ Unknown rank tier.' });
       }
 
-      const { tournamentName: realTournamentName, region, isTrios, consoleOnly } = pinned;
+      const { tournamentName: realTournamentName, tournamentEventId, region, isTrios, consoleOnly } = pinned;
       const poolTournamentName = rankedCupPoolName(realTournamentName, rankKey);
       const joinKey = `${guild.id}:${user.id}`;
 
@@ -1724,6 +1725,7 @@ async function handleInteraction(interaction) {
           epicUsername,
           epicId,
           tournamentName: realTournamentName,
+          tournamentEventId,
           homeRegion,
           queueRegion: region,
           queueType,

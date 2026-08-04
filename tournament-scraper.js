@@ -2,7 +2,8 @@ const puppeteer = require('puppeteer');
 const config = require('./config');
 const { proxyLaunchArgs, authenticatePage, blockUnnecessaryResources, logProxyMode, withBrowserSlot, closeBrowserSafely } = require('./proxy-config');
 const { resolveRosterSize, inferRosterSize } = require('./roster-size');
-const { detectBuildMode } = require('./build-mode');
+const { detectBuildMode, detectBuildModeFromEpicId } = require('./build-mode');
+const epicApi = require('./epic-api');
 
 logProxyMode('tournament-scraper');
 
@@ -374,6 +375,41 @@ async function enrichWithDescriptionRosterSize(groups) {
   return groups;
 }
 
+// Cross-checks/upgrades each group's auto-detected build mode (title-word based — detectBuildMode)
+// against Epic's own id-string pattern (epic-api.js's findEventEntryByName + build-mode.js's
+// detectBuildModeFromEpicId) — a structural signal straight from Epic's own naming. Only ever
+// OVERRIDES group.buildMode when Epic actually has a matching calendar entry (by exact name) AND
+// that entry's id(s) contain an explicit ZB/Reload marker; leaves the existing title-based default
+// untouched otherwise (no Epic match, FORTNITE_API_KEY unset, an API failure, or an id with no
+// explicit marker — see detectBuildModeFromEpicId's doc comment on why a "no marker" id isn't
+// treated as confirmation of Battle Royale). Logs whenever Epic's signal would have DISAGREED with
+// the title-based default, to surface any real case the id pattern doesn't hold for. A mod can
+// still manually correct the result either way via the approval DM's build-mode select menu
+// (tournament-approval.js's setBuildMode) before a channel is ever created. Same
+// "enrich in place, log failures, never abort the rest" shape as enrichWithDescriptionRosterSize
+// above.
+async function enrichWithEpicBuildMode(groups) {
+  for (const group of groups) {
+    let entry;
+    try {
+      entry = await epicApi.findEventEntryByName(group.name);
+    } catch (err) {
+      console.error(`  ⚠️ Epic build-mode lookup failed for "${group.name}":`, err.message);
+      continue;
+    }
+    if (!entry) continue;
+
+    const epicBuildMode = detectBuildModeFromEpicId(entry.id, entry.eventWindows?.[0]?.eventTemplateId);
+    if (!epicBuildMode) continue;
+
+    if (epicBuildMode !== group.buildMode) {
+      console.log(`  🔀 Build mode for "${group.name}" (${group.region}): title-based detection said "${group.buildMode}", Epic's id says "${epicBuildMode}" — using Epic's.`);
+    }
+    group.buildMode = epicBuildMode;
+  }
+  return groups;
+}
+
 async function scrapeTrackerCalendar() {
   const rawCalendar = await fetchRawCalendar();
 
@@ -411,7 +447,8 @@ async function scrapeTrackerCalendar() {
   }
 
   const groups = buildTournamentGroups(rawSessions);
-  return enrichWithDescriptionRosterSize(groups);
+  const withRosterSize = await enrichWithDescriptionRosterSize(groups);
+  return module.exports.enrichWithEpicBuildMode(withRosterSize);
 }
 
 // Returns global tournament-calendar data — identical regardless of which guild (if any) asks,
@@ -427,7 +464,7 @@ async function scrapeUpcomingTournaments() {
 module.exports = {
   scrapeUpcomingTournaments, buildTournamentGroups, isBareBuildModeLabel, scrapeTrackerCalendar,
   isRankedCupTitle, fetchEventDescriptionRosterSize, enrichWithDescriptionRosterSize,
-  PERMANENT_KEYWORDS,
+  enrichWithEpicBuildMode, PERMANENT_KEYWORDS,
 };
 
 // Test run
