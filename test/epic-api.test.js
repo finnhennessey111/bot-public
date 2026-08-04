@@ -143,9 +143,9 @@ test('pickEventWindowsForRegion: matches EU via the eventWindowId trailing suffi
   assert.equal(euWindows.length, 1);
   assert.equal(euWindows[0].eventWindowId, 'S41_RankedCupDuosZB_Event7_EU');
 
-  // NAC's candidate set (['NAC', 'NAE']) never includes 'BR', so the Brazil-suffixed window is
-  // correctly excluded from an NAC lookup — this is the real-world case that matters (Epic
-  // enrichment for one region must never accidentally serve a different region's window).
+  // NAC's candidate set (['NAC']) never includes 'BR', so the Brazil-suffixed window is correctly
+  // excluded from an NAC lookup — this is the real-world case that matters (Epic enrichment for one
+  // region must never accidentally serve a different region's window).
   const nacWindows = epicApi.pickEventWindowsForRegion(windows, 'NAC');
   assert.equal(nacWindows.length, 0);
 });
@@ -159,10 +159,22 @@ test('pickEventWindowsForRegion: onlyPast excludes a window whose endTime is sti
   assert.deepEqual(windows.map(w => w.eventWindowId), ['X_Event2_EU', 'X_Event1_EU']);
 });
 
-test('pickEventWindowsForRegion: NAC also matches the older NAE code (unconfirmed live, included defensively)', () => {
-  const windows = [{ eventWindowId: 'X_Event1_NAE', endTime: '2020-01-01T00:00:00Z' }];
+// NAC's real Epic-side suffix is now confirmed live ("S41_MobileTestCup_Round1_NAC" — see
+// REGION_SUFFIX_CANDIDATES' doc comment), the same certainty level as EU. The old NAE fallback
+// (a guess for the pre-rename Epic region name) has been removed entirely, not just deprioritized —
+// this proves NAC resolves via its own real suffix exactly the same way EU does, with zero
+// dependency on NAE ever matching anything.
+test('pickEventWindowsForRegion: NAC resolves via its own confirmed "_NAC" suffix, same as EU', () => {
+  const windows = [{ eventWindowId: 'S41_MobileTestCup_Round1_NAC', endTime: '2020-01-01T00:00:00Z' }];
   const nacWindows = epicApi.pickEventWindowsForRegion(windows, 'NAC');
   assert.equal(nacWindows.length, 1);
+  assert.equal(nacWindows[0].eventWindowId, 'S41_MobileTestCup_Round1_NAC');
+});
+
+test('pickEventWindowsForRegion: NAC no longer falls back to the old NAE code — an NAE-suffixed window is NOT matched', () => {
+  const windows = [{ eventWindowId: 'S41_MobileTestCup_Round1_NAE', endTime: '2020-01-01T00:00:00Z' }];
+  const nacWindows = epicApi.pickEventWindowsForRegion(windows, 'NAC');
+  assert.equal(nacWindows.length, 0, 'NAE was only ever a defensive guess for the unconfirmed NAC code — now that NAC itself is confirmed, NAE must not match');
 });
 
 test('getPlayerEventMatches: parses the real v1 matches response and caches it (fetchJson only called once)', async () => {

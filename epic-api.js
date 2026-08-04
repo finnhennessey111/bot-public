@@ -11,12 +11,11 @@
 // Fortnite Tracker stays the PRIMARY tournament-calendar source (region/consoleOnly/rosterSize all
 // come from real, already-confirmed FT fields — see tournament-scraper.js). Real Epic payloads
 // (pasted from live manual testing, not guessed) have no region/platform field on an event window
-// at all — only an eventWindowId whose trailing suffix happens to encode region (confirmed "EU"
-// and "BR" live; "NAC" — one of this bot's three supported regions — is unconfirmed, see
-// REGION_SUFFIX_CANDIDATES below). Making Epic the primary discovery source risked silently
-// dropping an entire region's tournaments if that guess were wrong (Epic "succeeding" with zero
-// NAC results looks identical to "no NAC tournaments right now" — the FT fallback below only fires
-// on an actual Epic failure, not on a suspiciously-empty result). Epic is used here purely as an
+// at all — only an eventWindowId whose trailing suffix happens to encode region (all three of this
+// bot's supported regions are now confirmed live: "EU", "BR" — Brazil, not Battle Royale — and
+// "NAC", e.g. "S41_MobileTestCup_Round1_NAC" — see REGION_SUFFIX_CANDIDATES below). Region-code
+// uncertainty is no longer why Epic isn't primary — it's the missing consoleOnly/rosterSize fields
+// on Epic's own payload, which FT still uniquely provides. Epic is used here purely as an
 // enrichment/cross-check on top of FT's already-correct discovery, never as something whose
 // failure or gap can make a real tournament disappear.
 //
@@ -160,18 +159,18 @@ async function findEventEntryByName(name) {
   return fromHistory ?? null;
 }
 
-// Real Epic region codes confirmed live in this session's manual testing: "EU" and "BR" (Brazil —
-// a real Fortnite competitive region, not Battle Royale; it's the code seen trailing a Zero Build
-// event's own eventWindowId, "S41_RankedCupDuosZB_Event7_BR"). NAC has no confirmed live example —
-// NAE was the older Epic region name NAC effectively replaced, so it's included as a plausible
-// second candidate, not a verified one. This is only ever used to pick which of an already-
-// name-matched event's windows to use for enrichment (build-mode cross-check, placement lookup) —
-// never to decide whether a tournament exists at all (that's still entirely Fortnite Tracker's
-// job), so a wrong/missing mapping here just means that one enrichment quietly falls back to the
-// existing FT-only behavior, not a disappearing tournament.
+// Real Epic region codes confirmed live in this session's manual testing: "EU" (e.g.
+// "S41_FNCSDivisionalCup_Division3_Event8_2_EU"), "BR" (Brazil — a real Fortnite competitive
+// region, not Battle Royale; "S41_RankedCupDuosZB_Event7_BR"), and "NAC"
+// ("S41_MobileTestCup_Round1_NAC") — all three of this bot's supported regions now have a real
+// confirmed suffix, no guessed fallback needed for any of them. This is only ever used to pick
+// which of an already-name-matched event's windows to use for enrichment (build-mode cross-check,
+// placement lookup) — never to decide whether a tournament exists at all (that's still entirely
+// Fortnite Tracker's job), so a wrong/missing mapping here just means that one enrichment quietly
+// falls back to the existing FT-only behavior, not a disappearing tournament.
 const REGION_SUFFIX_CANDIDATES = {
   EU: ['EU'],
-  NAC: ['NAC', 'NAE'],
+  NAC: ['NAC'],
   ME: ['ME'],
 };
 
