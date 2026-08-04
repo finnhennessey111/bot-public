@@ -30,11 +30,27 @@ const PLAYER_DATA = {
   recentEvents: [{ name: 'Duos Ranked Cup (Zero Build)', placement: 800, rosterSize: 2 }],
 };
 
-test('computeMatchScoreBreakdownWithEpic: no tournament.eventId — Epic is never even attempted, result is identical to the plain FT breakdown', async () => {
-  const tournament = { name: 'Duos Ranked Cup (Zero Build)', region: 'EU' }; // no eventId
+// tournament.eventId is NOT required anymore — epicApi.getEpicOwnTournamentModifier resolves
+// Epic's own real per-region eventId itself now (see epic-api.js's doc comment on why trusting a
+// caller-supplied eventId was dropped). Only name/region/accountId gate whether Epic is attempted.
+test('computeMatchScoreBreakdownWithEpic: no tournament.region — Epic is never even attempted, result is identical to the plain FT breakdown', async () => {
+  const tournament = { name: 'Duos Ranked Cup (Zero Build)' }; // no region
   const result = await scraperModule.computeMatchScoreBreakdownWithEpic(PLAYER_DATA, tournament, 'myaccount');
   const plain = computeMatchScoreBreakdown(PLAYER_DATA, tournament.name);
   assert.deepEqual(result, plain);
+});
+
+test('computeMatchScoreBreakdownWithEpic: eventId absent is NOT a reason to skip Epic anymore — it\'s still attempted (and succeeds) using just name+region', async () => {
+  const tournament = { name: 'Duos Ranked Cup (Zero Build)', region: 'EU' }; // no eventId at all
+  const epicModifier = 0.30;
+
+  await withStubbedEpicOwnTournamentModifier(async (t) => {
+    assert.equal(t.eventId, undefined, 'the caller never even needs to supply an eventId');
+    return { modifier: epicModifier, hasHistory: true, source: 'epic', matchedWindows: [] };
+  }, async () => {
+    const result = await scraperModule.computeMatchScoreBreakdownWithEpic(PLAYER_DATA, tournament, 'myaccount');
+    assert.equal(result.ownTournamentSource, 'epic');
+  });
 });
 
 test('computeMatchScoreBreakdownWithEpic: no accountId — Epic is never even attempted', async () => {
@@ -118,7 +134,7 @@ test('enrichWithEpicBuildMode: Epic lookup throws — group.buildMode is left un
 test('enrichWithEpicBuildMode: Epic\'s id disagrees with the title-based default — Epic wins', async () => {
   await withStubbedFindEventEntryByName(async (name) => {
     assert.equal(name, 'Duos Ranked Cup (Zero Build)');
-    return { id: 'Season41_RankedCupDuosZB', name, eventWindows: [] };
+    return { id: 'Season41_RankedCupDuosZB', name, regions: { EU: [{ eventWindows: [] }] } };
   }, async () => {
     // Title-based detection wrongly said battle_royale (e.g. a title-text edge case) — Epic's id
     // clearly says zero_build, so the override should win.
@@ -129,7 +145,7 @@ test('enrichWithEpicBuildMode: Epic\'s id disagrees with the title-based default
 });
 
 test('enrichWithEpicBuildMode: Epic\'s id has no explicit marker (real counter-example: shared id across build-mode variants) — leaves the title-based default alone', async () => {
-  await withStubbedFindEventEntryByName(async () => ({ id: 'S41_FNCSCommunityCup', name: 'Champion Aphrodite FNCS Cup', eventWindows: [] }), async () => {
+  await withStubbedFindEventEntryByName(async () => ({ id: 'S41_FNCSCommunityCup', name: 'Champion Aphrodite FNCS Cup', regions: { EU: [{ eventWindows: [] }] } }), async () => {
     const groups = [baseGroup({ name: 'Champion Aphrodite FNCS Cup', buildMode: 'battle_royale' })];
     await tournamentScraperModule.enrichWithEpicBuildMode(groups);
     assert.equal(groups[0].buildMode, 'battle_royale', 'no Epic signal at all means the existing title-based value must survive unchanged');

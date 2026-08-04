@@ -46,28 +46,33 @@ const PERMANENT_KEYWORDS = [
 // but the bot only has role/category config for these three.
 const SUPPORTED_REGIONS = ['EU', 'NAC', 'ME'];
 
-// Epic's own calendar payload has no console/platform-restriction field at all (confirmed absent
-// from every real example seen this session — no platformMappings/additionalRequirements or
-// similar). Every real console-exclusive example seen so far says "Console" directly in its own
-// name/id ("Console Duos ZB Cash Cup", "Console Solo Victory Cup (ZB)", "S41_ConsoleVCC_SolosZB")
-// — 100% correlation in the data available, so detectConsoleOnlyFromEpic below uses that as a text
-// heuristic rather than a structured flag. This override map exists specifically because a text
-// heuristic WILL eventually meet a counter-example (a console-exclusive tournament that doesn't say
-// "console", or one that mentions "console" without being exclusive) — same philosophy and shape as
-// roster-size.js's KNOWN_TOURNAMENT_ROSTER_SIZES: keep this small, only add an entry once it's
-// actually confirmed wrong, matched by substring against the combined lowercased name+id.
+// Console-only detection for Epic-sourced tournaments — three layers, most-confident first:
+//   1. CONSOLE_ONLY_OVERRIDES (manual, always wins) — for a real confirmed counter-example to
+//      either of the two signals below. Same philosophy/shape as roster-size.js's
+//      KNOWN_TOURNAMENT_ROSTER_SIZES: keep this small, only add an entry once it's actually
+//      confirmed wrong.
+//   2. epicApi.consoleOnlyFromPlatforms — the real regionEntry.platforms field (confirmed live,
+//      e.g. ["PS4","PS5"]). Definitive when present and every code is recognized.
+//   3. The "console" name/id keyword heuristic — falls back to this whenever platforms is
+//      missing/empty or contains an unrecognized code. Confirmed NOT sufficient on its own: real
+//      live data included "PlayStation Typical Gamer Icon Cup" (platforms ["PS4","PS5"], genuinely
+//      console-exclusive) with no "console" substring anywhere in its name or id — the keyword
+//      heuristic alone would have wrongly let PC players into it. Kept as a fallback rather than
+//      removed, since it's still the only signal available for other, non-console-restricted
+//      tournaments with an unrecognized/absent platforms field.
 const CONSOLE_ONLY_OVERRIDES = {
   // 'some future tournament name': true, // or false, once a real counter-example is confirmed
 };
 
-// See CONSOLE_ONLY_OVERRIDES above for why this is a text heuristic, not a confirmed structured
-// signal — used only by scrapeEpicCalendar below (Fortnite Tracker's own consoleOnly detection,
-// window.platformGroups, is unaffected and untouched).
-function detectConsoleOnlyFromEpic(name, id) {
+function detectConsoleOnlyFromEpic(name, id, platforms) {
   const combined = `${name ?? ''} ${id ?? ''}`.toLowerCase();
   for (const [known, value] of Object.entries(CONSOLE_ONLY_OVERRIDES)) {
     if (combined.includes(known.toLowerCase())) return value;
   }
+
+  const fromPlatforms = epicApi.consoleOnlyFromPlatforms(platforms);
+  if (fromPlatforms != null) return fromPlatforms;
+
   return /console/.test(combined);
 }
 
@@ -384,12 +389,13 @@ async function fetchEventDescriptionRosterSize(eventId) {
 // a fake implementation without a real Puppeteer/network round trip.
 async function enrichWithDescriptionRosterSize(groups) {
   for (const group of groups) {
-    // A synthetic "epic_..." eventId (scrapeEpicCalendar's stand-in for a real Fortnite Tracker
-    // event id — see its doc comment) would never resolve to a real fortnitetracker.com/events/
-    // page, so this would always fail. Skipping it outright avoids launching a full Puppeteer
-    // browser for a fetch that's guaranteed to 404 — both a correctness no-op and, more to the
-    // point, exactly the kind of wasted Fortnite Tracker traffic flipping to Epic-primary discovery
-    // was meant to reduce.
+    // scrapeEpicCalendar now populates real Epic-native eventIds (epicgames_..._REGION — confirmed
+    // live to be the exact same format Fortnite Tracker's own scraped eventId uses, so this URL
+    // should resolve correctly regardless of which source discovered the group). The "epic_..."
+    // prefix guard below is a defensive leftover, not currently reachable from either scraper —
+    // kept in case some future code path ever produces a genuinely synthetic, FT-unrecognized id,
+    // so that case skips this fetch (which would otherwise launch a full Puppeteer browser for a
+    // guaranteed 404) rather than silently trying and failing per-group.
     if (group.rosterSize != null || !group.eventId || group.eventId.startsWith('epic_')) continue;
 
     try {
@@ -430,7 +436,11 @@ async function enrichWithEpicBuildMode(groups) {
     }
     if (!entry) continue;
 
-    const epicBuildMode = detectBuildModeFromEpicId(entry.id, entry.eventWindows?.[0]?.eventTemplateId);
+    // eventWindows lives under a specific region (entry.regions[region][0].eventWindows — see
+    // epic-api.js's getRegionEntry doc comment on the real confirmed structure), not on entry
+    // itself — group.region picks the right bucket.
+    const regionEntry = epicApi.getRegionEntry(entry, group.region);
+    const epicBuildMode = detectBuildModeFromEpicId(entry.id, regionEntry?.eventWindows?.[0]?.eventTemplateId);
     if (!epicBuildMode) continue;
 
     if (epicBuildMode !== group.buildMode) {
@@ -459,7 +469,10 @@ async function enrichWithEpicRosterSize(groups) {
     }
     if (!entry) continue;
 
-    const epicRosterSize = detectRosterSizeFromEpicId(entry.id, entry.eventWindows?.[0]?.eventTemplateId);
+    // See enrichWithEpicBuildMode above — eventWindows lives under a specific region, not on
+    // entry itself.
+    const regionEntry = epicApi.getRegionEntry(entry, group.region);
+    const epicRosterSize = detectRosterSizeFromEpicId(entry.id, regionEntry?.eventWindows?.[0]?.eventTemplateId);
     if (epicRosterSize == null) continue;
 
     if (epicRosterSize !== group.rosterSize) {
@@ -482,12 +495,16 @@ async function enrichWithEpicRosterSize(groups) {
 // tournament handling really does carry over unchanged, rather than re-implementing that logic
 // against Epic's shape and hoping it stays in sync.
 //
-// What Epic's own payload genuinely does NOT provide (confirmed absent from every real example
-// seen this session, not assumed): a structured platform/console-restriction field (see
-// CONSOLE_ONLY_OVERRIDES/detectConsoleOnlyFromEpic above for the text-heuristic stand-in), and the
-// real "epicgames_..._REGION"-shaped eventId Epic's own placement-lookup API expects (only ever
-// confirmed via Fortnite Tracker's scrape — see the synthetic eventId comment below). Region,
-// build-mode, and roster-size ARE all confirmed derivable from Epic's own data.
+// One rawSession per (tournament, region, eventWindow) — mirrors Fortnite Tracker's own shape below
+// (one raw session per window in entry.customData.windows), so buildTournamentGroups' existing
+// earliest/latest-across-multiple-raw-sessions grouping (Stage 3) works identically for Epic's own
+// multi-round journeys (e.g. Qualifier + Final) as it already does for FT's.
+//
+// Region comes from a direct object key on the real confirmed structure (entry.regions.EU/.NAC/.ME
+// — see epic-api.js's getRegionEntry), not from parsing an id/suffix. Each region's own entry
+// carries its own real eventId (epicgames_..._REGION — the same format Epic's own placement API
+// expects, confirmed live) and its own platforms array (confirmed live, e.g. ["PS4","PS5"]) — both
+// genuinely derivable from Epic's own data now, not synthesized/guessed.
 //
 // Returns null (not []) when Epic's fetch itself fails outright (no key set, rate limited, network
 // error, empty/unrecognized payload) — same "null means try the fallback, [] means a real but
@@ -505,38 +522,35 @@ async function scrapeEpicCalendar() {
 
     const title = entry.name.trim();
     const titleLower = title.toLowerCase();
-    const consoleOnly = detectConsoleOnlyFromEpic(entry.name, entry.id);
 
-    for (const window of entry.eventWindows ?? []) {
-      const suffix = epicApi.windowRegionSuffix(window);
-      const region = SUPPORTED_REGIONS.find(r => (epicApi.REGION_SUFFIX_CANDIDATES[r] ?? [r]).includes(suffix));
-      if (!region) continue; // not one of this bot's 3 regions (or an unrecognized suffix)
+    for (const region of SUPPORTED_REGIONS) {
+      const regionEntry = epicApi.getRegionEntry(entry, region);
+      if (!regionEntry?.eventId) continue; // this tournament isn't offered in this region
 
-      rawSessions.push({
-        key: `${title}-${region}`,
-        name: title,
-        titleLower,
-        region,
-        beginTime: window.beginTime,
-        consoleOnly,
-        // Only the consoleOnly boolean above is actually read downstream (channel-manager.js/
-        // queue.js's isCompatiblePlatform) — this array itself is never inspected, so a synthetic
-        // single-entry stand-in is enough to keep the rawSession shape consistent with Fortnite
-        // Tracker's (which populates a real platformGroups-derived array here).
-        platforms: consoleOnly ? ['Console'] : [],
-        // Epic's own calendar payload never exposes the real "epicgames_..._REGION" identifier its
-        // OWN placement-lookup API (epic-api.js's getPlayerEventMatches) expects — only ever
-        // confirmed via Fortnite Tracker's scraped window.eventId. This synthetic value is stable
-        // and unique per tournament+region (entry.id is Epic's own persistent identifier, constant
-        // across a recurring tournament's rounds/weeks — confirmed via the real "Season41_..." ids
-        // seen this session), which is ALL channel-manager.js's dedup/rename actually needs (any
-        // consistent value works there — see its findExistingTournamentChannel doc comment). It is
-        // NOT a value Epic's real matches endpoint will recognize: getEpicOwnTournamentModifier
-        // already fails soft on an unrecognized eventId (falls back to Fortnite-Tracker-derived
-        // data), so this is safe — it just means that specific enrichment won't engage for a
-        // tournament discovered via this path, until a real derivation is confirmed.
-        eventId: `epic_${entry.id}_${region}`,
-      });
+      const consoleOnly = detectConsoleOnlyFromEpic(entry.name, entry.id, regionEntry.platforms);
+
+      for (const window of regionEntry.eventWindows ?? []) {
+        if (!window?.beginTime) continue;
+
+        rawSessions.push({
+          key: `${title}-${region}`,
+          name: title,
+          titleLower,
+          region,
+          beginTime: window.beginTime,
+          consoleOnly,
+          // Only the consoleOnly boolean above is actually read downstream (channel-manager.js/
+          // queue.js's isCompatiblePlatform) — the real platforms array is what consoleOnly was
+          // derived from, kept here for parity with Fortnite Tracker's own rawSession shape (which
+          // populates a real platformGroups-derived array in this same field) rather than because
+          // anything downstream inspects it directly.
+          platforms: regionEntry.platforms ?? [],
+          // Epic's own real per-region eventId — confirmed live to match the exact format Epic's
+          // placement-lookup API expects (epicgames_..._REGION), so getEpicOwnTournamentModifier
+          // can actually engage for a tournament discovered via this path, not just fall back.
+          eventId: regionEntry.eventId,
+        });
+      }
     }
   }
 

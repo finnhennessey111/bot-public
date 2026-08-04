@@ -1,29 +1,40 @@
 // epic-api.js - Client for api-fortnite.com, an unofficial wrapper around Epic's own real
-// competitive-tournament backend (NOT Fortnite Tracker). Two things this bot actually gets from
-// Epic here that Fortnite Tracker can't provide as well:
-//   1. A structural (id-string-based) build-mode cross-check for tournament-scraper.js's existing
-//      title-word detection (build-mode.js's detectBuildModeFromEpicId).
-//   2. A more precise per-tournament placement lookup for scraper.js's ownTournamentModifier
+// competitive-tournament backend (NOT Fortnite Tracker). Three things this bot gets from Epic here:
+//   1. Primary tournament-calendar discovery (tournament-scraper.js's scrapeEpicCalendar) — the
+//      bandwidth/cost reduction this whole integration exists for, with Fortnite Tracker as a
+//      genuine fallback only when Epic's own call fails outright.
+//   2. A structural (id-string-based) build-mode/roster-size cross-check for tournament-scraper.js's
+//      title-word detection (build-mode.js's detectBuildModeFromEpicId, roster-size.js's
+//      detectRosterSizeFromEpicId).
+//   3. A precise per-tournament placement lookup for scraper.js's ownTournamentModifier
 //      (getEpicOwnTournamentModifier) — Epic's own recorded rank/points for a specific player in a
-//      specific tournament window, instead of scanning Fortnite Tracker's capped 20-event
-//      recentEvents history for a name match.
+//      specific tournament window.
 //
-// Fortnite Tracker stays the PRIMARY tournament-calendar source (region/consoleOnly/rosterSize all
-// come from real, already-confirmed FT fields — see tournament-scraper.js). Real Epic payloads
-// (pasted from live manual testing, not guessed) have no region/platform field on an event window
-// at all — only an eventWindowId whose trailing suffix happens to encode region (all three of this
-// bot's supported regions are now confirmed live: "EU", "BR" — Brazil, not Battle Royale — and
-// "NAC", e.g. "S41_MobileTestCup_Round1_NAC" — see REGION_SUFFIX_CANDIDATES below). Region-code
-// uncertainty is no longer why Epic isn't primary — it's the missing consoleOnly/rosterSize fields
-// on Epic's own payload, which FT still uniquely provides. Epic is used here purely as an
-// enrichment/cross-check on top of FT's already-correct discovery, never as something whose
-// failure or gap can make a real tournament disappear.
+// REAL confirmed structure (live data, not guessed) for both /api/v1/events/global and
+// /api/v1/events/global/history — the SAME shape for both, confirmed directly: a flat array of
+// tournament objects, each shaped:
+//   { id: "S41_PSTypicalGamer_ZB::s41_ps_typical_zb", name: "PlayStation Typical Gamer Icon Cup",
+//     regions: {
+//       EU: [{ eventId: "epicgames_S41_PSTypicalGamer_ZB_EU", beginTime, endTime,
+//              regions: ["EU"], platforms: ["PS4","PS5"], eventWindows: [{...}, {...}], link }],
+//       ME: [{ ... }], NAE: [{ ... }], NAC: [{ ...byte-identical to NAE... }], NAW: [{ ... }],
+//       BR: [{ ... }],
+//     } }
+// Region is a direct object KEY on `regions` — not something to reverse-engineer from an
+// eventWindowId suffix (an earlier version of this file did exactly that, based on an incomplete
+// picture of the real shape, and silently returned zero results because of it — see
+// getRegionEntry below). "BR" here is Brazil, a real Fortnite competitive region — entirely
+// unrelated to Battle Royale build mode, which lives in the tournament's own name/id (presence/
+// absence of "ZB"/"Reload"). Never conflate the two.
+//
+// regions.NAE and regions.NAC hold byte-identical content in every real example seen — confirmed
+// live — so only NAC is ever read; NAE is simply never looked up, no fallback logic needed.
 //
 // Every public function here fails soft: any network error, non-2xx response, rate limit, or
 // unexpected payload shape returns null (or the FT-derived fallback the caller already has),
 // logged clearly, never thrown up into a queue-join or channel-creation path. This API has a real
-// credit system on top of its rate limits, so every entry point is cached — see CACHE_TTL_MS below
-// for each cache's reasoning.
+// credit system on top of its rate limits, so every entry point is cached — see the TTL constants
+// below for each cache's reasoning.
 
 const BASE_URL = 'https://prod.api-fortnite.com';
 
@@ -41,7 +52,7 @@ const MATCHES_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
 // ---------------------------------------------------------------------------------------------
 // Minimal in-memory TTL cache — same "small hand-rolled utility over a dependency" precedent as
-// rate-limit.js's createRateLimiter. One shared Map for all three cache namespaces below (calendar
+// rate-limit.js's createRateLimiter. One shared Map for both cache namespaces below (calendar
 // global/history, per-window matches), disambiguated by key prefix.
 // ---------------------------------------------------------------------------------------------
 const cache = new Map(); // key -> { value, expiresAt }
@@ -101,6 +112,10 @@ async function fetchJson(path) {
 // Calendar discovery (upcoming + history)
 // ---------------------------------------------------------------------------------------------
 
+// The outer shape (a bare array) is confirmed live for /global — the `data?.events` fallback below
+// is kept as a defensive secondary check in case /global/history's own wrapper ever genuinely
+// diverges (not independently re-confirmed against this exact nested-regions shape at the time of
+// writing), never as the primary assumption.
 async function fetchGlobalEvents() {
   const cached = getCached('global');
   if (cached !== undefined) return cached;
@@ -121,22 +136,33 @@ async function fetchGlobalEventsHistory() {
   return list;
 }
 
-// The exact JSON key names for the list-view payload weren't confirmed byte-for-byte (the real
-// example pasted from manual testing was reformatted for readability, not raw JSON) — only that
-// each entry carries an id-like field, a display name, and (per the one full raw entry that WAS
-// confirmed) a nested per-window array. Tolerant field access here means a slightly different real
-// key name (e.g. `title` instead of `name`) still works instead of silently matching nothing.
+// Tolerant field access on id/name only (a slightly different real key, e.g. `title` instead of
+// `name`, still works) — but `regions` is read as the confirmed real structural field, not guessed
+// at with fallback names, since its exact shape (an object keyed by region code) is what
+// getRegionEntry below depends on.
 function normalizeEventEntry(raw) {
   if (!raw || typeof raw !== 'object') return null;
   const id = raw.id ?? raw.eventId ?? raw.templateId ?? null;
   const name = raw.name ?? raw.title ?? raw.displayName ?? null;
-  const eventWindows = raw.eventWindows ?? raw.windows ?? [];
+  const regions = (raw.regions && typeof raw.regions === 'object' && !Array.isArray(raw.regions)) ? raw.regions : {};
   if (!id || !name) return null;
-  return { id, name, eventWindows, raw };
+  return { id, name, regions, raw };
 }
 
 function normalizeName(name) {
   return String(name ?? '').trim().toLowerCase();
+}
+
+// Direct region-keyed lookup — region is a real structural key on the confirmed payload
+// (entry.regions.EU / .NAC / .ME), each holding an array (every real example seen has exactly one
+// element) of a fully region-scoped tournament entry: its own real eventId, beginTime/endTime,
+// platforms, and eventWindows (the actual round-by-round schedule, e.g. Qualifier/Final). No
+// suffix-parsing needed — region membership is never ambiguous. Returns null when this tournament
+// simply isn't offered in the requested region (a normal, expected case — not an error).
+function getRegionEntry(entry, region) {
+  const bucket = entry?.regions?.[region];
+  if (!Array.isArray(bucket) || bucket.length === 0) return null;
+  return bucket[0];
 }
 
 // Searches the upcoming list first, then history — mirrors why the task asked for both endpoints
@@ -159,42 +185,25 @@ async function findEventEntryByName(name) {
   return fromHistory ?? null;
 }
 
-// Real Epic region codes confirmed live in this session's manual testing: "EU" (e.g.
-// "S41_FNCSDivisionalCup_Division3_Event8_2_EU"), "BR" (Brazil — a real Fortnite competitive
-// region, not Battle Royale; "S41_RankedCupDuosZB_Event7_BR"), and "NAC"
-// ("S41_MobileTestCup_Round1_NAC") — all three of this bot's supported regions now have a real
-// confirmed suffix, no guessed fallback needed for any of them. This is only ever used to pick
-// which of an already-name-matched event's windows to use for enrichment (build-mode cross-check,
-// placement lookup) — never to decide whether a tournament exists at all (that's still entirely
-// Fortnite Tracker's job), so a wrong/missing mapping here just means that one enrichment quietly
-// falls back to the existing FT-only behavior, not a disappearing tournament.
-const REGION_SUFFIX_CANDIDATES = {
-  EU: ['EU'],
-  NAC: ['NAC'],
-  ME: ['ME'],
-};
+// Real console platform codes confirmed live ("PS4","PS5" — "PlayStation Typical Gamer Icon Cup").
+// Xbox/Switch codes are inferred from the same naming convention (not independently confirmed live
+// yet) but are low-risk: this set is only ever used to recognize an OBVIOUS all-console platforms
+// array, never to assert PC-inclusion from an absence, so an unrecognized code just falls through
+// to detectConsoleOnlyFromEpic's keyword-heuristic fallback (tournament-scraper.js) rather than
+// guessing wrong.
+const KNOWN_CONSOLE_PLATFORM_CODES = new Set(['PS4', 'PS5', 'XSX', 'XB1', 'SWITCH', 'CONSOLE']);
+const KNOWN_PC_PLATFORM_CODES = new Set(['PC', 'KBM', 'WIN', 'WINDOWS']);
 
-// eventWindowId (or, if absent, link.code) trailing token — both confirmed real examples end in a
-// region code with no other separator convention observed ("S41_RankedCupDuosZB_Event7_BR",
-// "S41_FNCSDivisionalCup_Division3_Event8_2_EU").
-function windowRegionSuffix(window) {
-  const idLike = window?.eventWindowId ?? window?.link?.code ?? '';
-  const parts = String(idLike).split('_');
-  return parts.length ? parts[parts.length - 1].toUpperCase() : null;
-}
-
-// Returns eventWindows matching `region` (via REGION_SUFFIX_CANDIDATES), most-recent-first by
-// endTime. onlyPast restricts to windows that have already concluded (endTime in the past) — what
-// getEpicOwnTournamentModifier wants, since a player's OWN history can only come from tournaments
-// they've already played.
-function pickEventWindowsForRegion(eventWindows, region, { onlyPast = false } = {}) {
-  const candidates = REGION_SUFFIX_CANDIDATES[region] ?? [region];
-  const now = Date.now();
-
-  return (eventWindows ?? [])
-    .filter(w => candidates.includes(windowRegionSuffix(w)))
-    .filter(w => !onlyPast || (w.endTime && new Date(w.endTime).getTime() < now))
-    .sort((a, b) => new Date(b.endTime ?? 0) - new Date(a.endTime ?? 0));
+// true/false when platforms is present and every code is one this module recognizes (definitive
+// either way); null when platforms is missing/empty or contains anything unrecognized — signals
+// "no confident answer from this field," letting the caller fall back to its own heuristic instead
+// of risking a wrong guess on an unfamiliar platform code.
+function consoleOnlyFromPlatforms(platforms) {
+  if (!Array.isArray(platforms) || platforms.length === 0) return null;
+  const codes = platforms.map(p => String(p).toUpperCase());
+  if (codes.some(c => KNOWN_PC_PLATFORM_CODES.has(c))) return false;
+  if (codes.every(c => KNOWN_CONSOLE_PLATFORM_CODES.has(c))) return true;
+  return null; // at least one unrecognized, non-PC code — not confident enough to call it either way
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -227,17 +236,35 @@ async function getPlayerEventMatches(eventId, eventWindowId, accountId, rankHint
   return data;
 }
 
+// Returns eventWindows (from a single already-region-scoped regionEntry — see getRegionEntry)
+// whose endTime has already passed, most-recent-first, capped at `limit`. Region-agnostic on
+// purpose: by the time this runs, the caller has already narrowed to one region's own eventWindows,
+// which (per the confirmed real structure) never mix in other regions' windows.
+function pickPastEventWindows(eventWindows, limit) {
+  const now = Date.now();
+  return (eventWindows ?? [])
+    .filter(w => w.endTime && new Date(w.endTime).getTime() < now)
+    .sort((a, b) => new Date(b.endTime) - new Date(a.endTime))
+    .slice(0, limit);
+}
+
 // Same shape/weight as scraper.js's computeOwnTournamentModifier (up to 3 most recent matching
 // events, averaged placement score, /100 scale, 0.30 weight) — deliberately unchanged, since only
-// the DATA SOURCE is being upgraded here, not the scoring formula itself. tournament needs eventId
-// (Fortnite Tracker's own scraped identifier, tournament-scraper.js's session.eventId — confirmed
-// live to be the exact same real Epic eventId format the matches endpoint expects, e.g.
-// "epicgames_S41_FNCSDivisionalCup_Division3_EU") and region (one of SUPPORTED_REGIONS). Returns
-// null on absolutely any gap (no eventId, no calendar match, no eligible past window, no player
-// standing found) — callers fall back to the existing Fortnite Tracker-derived modifier whenever
-// this returns null, exactly the same as any other fetch failure here.
+// the DATA SOURCE is being upgraded here, not the scoring formula itself.
+//
+// tournament only needs { name, region } — NOT eventId. The real per-region eventId is resolved
+// fresh from Epic's own calendar right here (getRegionEntry(entry, tournament.region).eventId),
+// rather than trusting whatever tournament.eventId happens to be — that field means different
+// things depending on which discovery path produced it (a real Fortnite-Tracker-scraped id, or
+// tournament-scraper.js's own bookkeeping value), and re-resolving it from Epic directly makes this
+// function correct regardless of that history, with no dependency on the caller having threaded the
+// right value through.
+//
+// Returns null on absolutely any gap (no calendar match, no eligible past window for this region,
+// no player standing found) — callers fall back to the existing Fortnite Tracker-derived modifier
+// whenever this returns null, exactly the same as any other fetch failure here.
 async function getEpicOwnTournamentModifier(tournament, accountId, { getPlacementScore } = {}) {
-  if (!tournament?.eventId || !tournament?.name || !tournament?.region || !accountId) return null;
+  if (!tournament?.name || !tournament?.region || !accountId) return null;
 
   const entry = await module.exports.findEventEntryByName(tournament.name);
   if (!entry) {
@@ -245,14 +272,20 @@ async function getEpicOwnTournamentModifier(tournament, accountId, { getPlacemen
     return null;
   }
 
-  const windows = pickEventWindowsForRegion(entry.eventWindows, tournament.region, { onlyPast: true }).slice(0, 3);
+  const regionEntry = getRegionEntry(entry, tournament.region);
+  if (!regionEntry?.eventId) {
+    console.log(`[epic-api] "${tournament.name}" has no ${tournament.region} entry (or no eventId on it) — falling back to Fortnite Tracker history`);
+    return null;
+  }
+
+  const windows = pickPastEventWindows(regionEntry.eventWindows, 3);
   if (windows.length === 0) {
-    console.log(`[epic-api] no past ${tournament.region} window found for "${tournament.name}" — falling back to Fortnite Tracker history`);
+    console.log(`[epic-api] no past window found for "${tournament.name}" (${tournament.region}) — falling back to Fortnite Tracker history`);
     return null;
   }
 
   const results = await Promise.all(
-    windows.map(w => module.exports.getPlayerEventMatches(tournament.eventId, w.eventWindowId, accountId))
+    windows.map(w => module.exports.getPlayerEventMatches(regionEntry.eventId, w.eventWindowId, accountId))
   );
   const found = results.filter(r => r?.found && typeof r.rank === 'number');
   if (found.length === 0) return null;
@@ -273,12 +306,11 @@ module.exports = {
   fetchGlobalEvents,
   fetchGlobalEventsHistory,
   findEventEntryByName,
-  pickEventWindowsForRegion,
+  normalizeEventEntry,
+  getRegionEntry,
+  consoleOnlyFromPlatforms,
   getPlayerEventMatches,
   getEpicOwnTournamentModifier,
-  normalizeEventEntry,
-  windowRegionSuffix,
-  REGION_SUFFIX_CANDIDATES,
   // Test-only escape hatch — same precedent as rate-limit.js's middleware.stopSweep. The calendar/
   // matches cache above is module-level and long-TTL by design (that's the whole point in
   // production), which means it needs to be clearable between tests that stub different fetchJson

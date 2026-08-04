@@ -315,7 +315,12 @@ function calculateMatchScore(playerData, tournamentName) {
 async function computeMatchScoreBreakdownWithEpic(playerData, tournament, accountId) {
   const breakdown = computeMatchScoreBreakdown(playerData, tournament?.name);
 
-  if (!tournament?.eventId || !accountId) return breakdown;
+  // getEpicOwnTournamentModifier no longer needs tournament.eventId — it resolves Epic's own real
+  // per-region eventId itself, from a fresh name+region calendar lookup (see epic-api.js's doc
+  // comment on why: the value threaded through here meant different things depending on which
+  // discovery path produced it, so trusting Epic's own freshly-resolved id is both simpler and more
+  // correct). Only name/region/accountId are actually required to attempt it.
+  if (!tournament?.name || !tournament?.region || !accountId) return breakdown;
 
   let epicResult = null;
   try {

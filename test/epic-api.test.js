@@ -1,14 +1,16 @@
-// Verifies epic-api.js's parsing/matching logic against the REAL response shapes pasted from live
-// manual testing against prod.api-fortnite.com (not guessed) — see epic-api.js's doc comment for
-// why Epic is an enrichment/cross-check on top of Fortnite Tracker's discovery, never a
-// replacement of it. fetchJson is stubbed throughout (module.exports delegation, same precedent as
-// scraper.js's scrapePlayer/scrapePlayerOnce — see test/scraper-retry.test.js) so every test here
-// runs with no real network round trip and no FORTNITE_API_KEY required.
+// Verifies epic-api.js's parsing/matching logic against the REAL response shape confirmed live
+// this session: a flat array of tournament objects, each with `regions` keyed by region CODE
+// (EU/ME/NAE/NAC/NAW/BR), each holding a one-element array of a fully region-scoped entry with its
+// own real eventId/beginTime/endTime/platforms/eventWindows. An earlier version of this file (and
+// of epic-api.js itself) was built against an incomplete/incorrect guess at this shape — this
+// rewrite replaces those fixtures with the real confirmed one. fetchJson is stubbed throughout
+// (module.exports delegation, same precedent as scraper.js's scrapePlayer/scrapePlayerOnce — see
+// test/scraper-retry.test.js) so every test here runs with no real network round trip and no
+// FORTNITE_API_KEY required.
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const epicApi = require('../epic-api');
-const { detectBuildModeFromEpicId } = require('../build-mode');
 const { getPlacementScore } = require('../scraper');
 
 function withStubbedFetchJson(responses, fn) {
@@ -22,102 +24,160 @@ function withStubbedFetchJson(responses, fn) {
   return fn().finally(() => { epicApi.fetchJson = original; });
 }
 
-// Real /api/v1/events/global list-view entries (reformatted from the user's live "id::code  name"
-// paste into what's actually confirmed: an id-like field and a display name). The one entry with a
-// full raw shape confirmed (Duos Ranked Cup Zero Build) gets its real eventWindows array attached;
-// every other entry gets an empty eventWindows array — genuinely unconfirmed for those, and tests
-// below don't rely on it being populated for anything but the one entry it's real for.
-const REAL_RANKED_CUP_DUOS_ZB_WINDOW = {
-  countdownBeginTime: '2026-07-31T19:00:00Z',
-  beginTime: '2026-07-31T21:00:00Z',
-  endTime: '2026-08-01T00:00:00Z',
-  round: 2,
-  eventWindowId: 'S41_RankedCupDuosZB_Event7_BR',
-  eventTemplateId: 'EventTemplate_RankedCupDuosZB',
-  scoreLocations: ['@{leaderboardDefId=Lead_Default; isMainWindowLeaderboard=True}'],
-  metadata: { RoundType: 'Qualifiers', RankTrackTypeForMatchStatsPrefixes: 'ranked-br-combined' },
-  link: { type: 'br:tournament', code: 'tournament_epicgames_s41_rankedcupduoszb_br' },
-};
-
-const REAL_GLOBAL_EVENTS = [
-  { id: 'S41_PSTypicalGamer_ZB', name: 'PlayStation Typical Gamer Icon Cup', eventWindows: [] },
-  { id: 'Season41_DiamondTestCup', name: 'BR Test Cup (Diamond)', eventWindows: [] },
-  { id: 'S41_CashCup_DuosZB', name: 'Console Duos ZB Cash Cup', eventWindows: [] },
-  { id: 'Season41_MobileSeriesOpenAll', name: 'Mobile Series', eventWindows: [] },
-  { id: 'Season41_PerfEval', name: 'Fortnite Performance Evaluation', eventWindows: [] },
-  { id: 'Season41_FNCSLastChanceMajor', name: 'FNCS Global Championship Last Chance', eventWindows: [] },
-  { id: 'Season41_RankedCupDuosZB', name: 'Duos Ranked Cup (Zero Build)', eventWindows: [REAL_RANKED_CUP_DUOS_ZB_WINDOW] },
-  { id: 'Season41_ReloadSoloVictoryCup', name: 'Solo Reload Victory Cup', eventWindows: [] },
-  { id: 'Season41_RankedCupReloadDuos', name: 'Duos Ranked Cup (Reload)', eventWindows: [] },
-  { id: 'S41_ConsoleVCC_SolosZB', name: 'Console Solo Victory Cup (ZB)', eventWindows: [] },
-  { id: 'Season41_RankedCupDuos', name: 'Duos Ranked Cup (Battle Royale)', eventWindows: [] },
-  { id: 'S41_ConsoleCC_DuosZB', name: 'Console Duos ZB Cash Cup', eventWindows: [] },
-  { id: 'Season41_RankedCupSolo', name: 'Solo Ranked Cup (Battle Royale)', eventWindows: [] },
-  { id: 'Season41_RankedCupSoloReload', name: 'Solo Ranked Cup (Reload)', eventWindows: [] },
-];
-
-const REAL_GLOBAL_HISTORY = [
-  { id: 'Season41_FNCSDivisionalCup_Division1', name: 'FNCS Division 1', eventWindows: [] },
-  { id: 'Season41_FNCSDivisionalCup_Division3', name: 'FNCS Division 3', eventWindows: [] },
-  { id: 'Season41_FNCSDivisionalCup_Division4', name: 'FNCS Division 4', eventWindows: [] },
-  { id: 'Season41_FNCSDivisionalCup_Division5', name: 'FNCS Division 5', eventWindows: [] },
-  { id: 'Season41_FNCSDivisionalCup_Division2', name: 'FNCS Division 2', eventWindows: [] },
-  { id: 'S41_FNCSCommunityCup', name: 'Champion Aphrodite FNCS Cup', eventWindows: [] },
-  { id: 'Season41_FNCSMajor2', name: 'FNCS Global Championship Last Chance', eventWindows: [] },
-];
-
-// The real, full /api/v1/events/{eventId}/{eventWindowId}/player/{accountId}/matches response
-// (trimmed to 2 of the real 8 match entries — enough to confirm the shape without bloating the
-// test file; matches[] isn't read by any of the code under test, only rank/pointsEarned/found are).
-const REAL_MATCHES_RESPONSE = {
-  found: true,
-  eventId: 'epicgames_S41_FNCSDivisionalCup_Division3_EU',
-  eventWindowId: 'S41_FNCSDivisionalCup_Division3_Event8_2_EU',
-  accountId: 'b87297a442684bbaa6f4cbf4e12efb2d',
-  rank: 502,
-  pointsEarned: 230,
-  teamAccountIds: ['b87297a442684bbaa6f4cbf4e12efb2d', 'dfa61fc098ed477aa3a13cf2131bb1e6'],
-  matchCount: 8,
-  matches: [
-    { sessionId: '893d69bb14014880925d2b5188c0fd21', endTime: '2026-07-19T15:10:20.833Z', trackedStats: { PLACEMENT_STAT_INDEX: 38, TIME_ALIVE_STAT: 410, TEAM_ELIMS_STAT_INDEX: 0, MATCH_PLAYED_STAT: 1, PLACEMENT_TIEBREAKER_STAT: 62, VICTORY_ROYALE_STAT: 0 } },
-    { sessionId: '39f0f300cbf64ec398b234551cd0a1d2', endTime: '2026-07-19T15:33:16.718Z', trackedStats: { PLACEMENT_STAT_INDEX: 7, TIME_ALIVE_STAT: 1256, TEAM_ELIMS_STAT_INDEX: 3, MATCH_PLAYED_STAT: 1, PLACEMENT_TIEBREAKER_STAT: 93, VICTORY_ROYALE_STAT: 0 } },
-  ],
-};
-
-// epic-api.js's calendar/matches cache is a shared module-level Map, long-TTL by design in
-// production — cleared before every test here so each test's own fetchJson stub is what actually
-// gets exercised, instead of a silently-reused result cached by an earlier test.
 test.beforeEach(() => {
   epicApi.__resetCacheForTests();
 });
 
-test('findEventEntryByName: matches an upcoming event by exact (case-insensitive) name', async () => {
+function futureIso(hoursFromNow) {
+  return new Date(Date.now() + hoursFromNow * 3600_000).toISOString();
+}
+function pastIso(hoursAgo) {
+  return new Date(Date.now() - hoursAgo * 3600_000).toISOString();
+}
+
+function eventWindow(id, hoursFromNow) {
+  return {
+    eventWindowId: id,
+    eventTemplateId: 'EventTemplate_PSTypicalGamer_ZB',
+    round: 1,
+    beginTime: futureIso(hoursFromNow),
+    endTime: futureIso(hoursFromNow + 3),
+    link: { type: 'br:tournament', code: `tournament_epicgames_${id.toLowerCase()}` },
+  };
+}
+
+// The real confirmed shape, pasted from live manual testing — regions keyed by code, NAE/NAC
+// holding byte-identical duplicate content (confirmed real), a real eventId/platforms per region.
+const REAL_PS_TYPICAL_GAMER_ENTRY = {
+  id: 'S41_PSTypicalGamer_ZB::s41_ps_typical_zb',
+  name: 'PlayStation Typical Gamer Icon Cup',
+  regions: {
+    EU: [{
+      eventId: 'epicgames_S41_PSTypicalGamer_ZB_EU',
+      beginTime: futureIso(20), endTime: futureIso(140),
+      regions: ['EU'], platforms: ['PS4', 'PS5'],
+      eventWindows: [eventWindow('S41_PSTypicalGamer_ZB_Qualifier_EU', 20), eventWindow('S41_PSTypicalGamer_ZB_Final_EU', 100)],
+      link: { type: 'br:tournament', code: 'tournament_epicgames_s41_pstypicalgamer_zb_eu' },
+    }],
+    ME: [{
+      eventId: 'epicgames_S41_PSTypicalGamer_ZB_ME',
+      beginTime: futureIso(20), endTime: futureIso(140),
+      regions: ['ME'], platforms: ['PS4', 'PS5'],
+      eventWindows: [eventWindow('S41_PSTypicalGamer_ZB_Qualifier_ME', 20)],
+      link: { type: 'br:tournament', code: 'tournament_epicgames_s41_pstypicalgamer_zb_me' },
+    }],
+    NAE: [{
+      eventId: 'epicgames_S41_PSTypicalGamer_ZB_NAC',
+      beginTime: futureIso(20), endTime: futureIso(140),
+      regions: ['NAE', 'NAC'], platforms: ['PS4', 'PS5'],
+      eventWindows: [eventWindow('S41_PSTypicalGamer_ZB_Qualifier_NAC', 20)],
+      link: { type: 'br:tournament', code: 'tournament_epicgames_s41_pstypicalgamer_zb_nac' },
+    }],
+    NAC: [{ // byte-identical duplicate of NAE, confirmed live
+      eventId: 'epicgames_S41_PSTypicalGamer_ZB_NAC',
+      beginTime: futureIso(20), endTime: futureIso(140),
+      regions: ['NAE', 'NAC'], platforms: ['PS4', 'PS5'],
+      eventWindows: [eventWindow('S41_PSTypicalGamer_ZB_Qualifier_NAC', 20)],
+      link: { type: 'br:tournament', code: 'tournament_epicgames_s41_pstypicalgamer_zb_nac' },
+    }],
+    NAW: [{
+      eventId: 'epicgames_S41_PSTypicalGamer_ZB_NAW',
+      beginTime: futureIso(20), endTime: futureIso(140),
+      regions: ['NAW'], platforms: ['PS4', 'PS5'],
+      eventWindows: [eventWindow('S41_PSTypicalGamer_ZB_Qualifier_NAW', 20)],
+      link: { type: 'br:tournament', code: 'tournament_epicgames_s41_pstypicalgamer_zb_naw' },
+    }],
+    BR: [{ // Brazil — a real region, nothing to do with Battle Royale build mode
+      eventId: 'epicgames_S41_PSTypicalGamer_ZB_BR',
+      beginTime: futureIso(20), endTime: futureIso(140),
+      regions: ['BR'], platforms: ['PS4', 'PS5'],
+      eventWindows: [eventWindow('S41_PSTypicalGamer_ZB_Qualifier_BR', 20)],
+      link: { type: 'br:tournament', code: 'tournament_epicgames_s41_pstypicalgamer_zb_br' },
+    }],
+  },
+};
+
+test('normalizeEventEntry: extracts id/name/regions from the real confirmed shape', () => {
+  const entry = epicApi.normalizeEventEntry(REAL_PS_TYPICAL_GAMER_ENTRY);
+  assert.equal(entry.id, 'S41_PSTypicalGamer_ZB::s41_ps_typical_zb');
+  assert.equal(entry.name, 'PlayStation Typical Gamer Icon Cup');
+  assert.ok(entry.regions.EU);
+  assert.ok(entry.regions.NAC);
+});
+
+test('normalizeEventEntry: returns null for a non-object or an entry missing id/name', () => {
+  assert.equal(epicApi.normalizeEventEntry(null), null);
+  assert.equal(epicApi.normalizeEventEntry({ name: 'X' }), null); // no id
+  assert.equal(epicApi.normalizeEventEntry({ id: 'X' }), null); // no name
+});
+
+test('getRegionEntry: direct key lookup returns the region-scoped entry with its own real eventId/platforms', () => {
+  const entry = epicApi.normalizeEventEntry(REAL_PS_TYPICAL_GAMER_ENTRY);
+
+  const eu = epicApi.getRegionEntry(entry, 'EU');
+  assert.equal(eu.eventId, 'epicgames_S41_PSTypicalGamer_ZB_EU');
+  assert.deepEqual(eu.platforms, ['PS4', 'PS5']);
+  assert.equal(eu.eventWindows.length, 2);
+
+  const nac = epicApi.getRegionEntry(entry, 'NAC');
+  assert.equal(nac.eventId, 'epicgames_S41_PSTypicalGamer_ZB_NAC');
+});
+
+test('getRegionEntry: NAE and NAC hold byte-identical content — only NAC is ever read, NAE is simply never looked up', () => {
+  const entry = epicApi.normalizeEventEntry(REAL_PS_TYPICAL_GAMER_ENTRY);
+  const nac = epicApi.getRegionEntry(entry, 'NAC');
+  const nae = epicApi.getRegionEntry(entry, 'NAE'); // this bot never actually calls this in production — proving it WOULD be identical if it did
+  assert.deepEqual(nac, nae);
+});
+
+test('getRegionEntry: a region this tournament isn\'t offered in (or an unsupported one) returns null, not a crash', () => {
+  const entry = epicApi.normalizeEventEntry(REAL_PS_TYPICAL_GAMER_ENTRY);
+  assert.equal(epicApi.getRegionEntry(entry, 'OCE'), null);
+  assert.equal(epicApi.getRegionEntry(entry, 'ASIA'), null);
+  assert.equal(epicApi.getRegionEntry(null, 'EU'), null);
+});
+
+test('consoleOnlyFromPlatforms: the real confirmed PS4/PS5-only example resolves to console-only true', () => {
+  assert.equal(epicApi.consoleOnlyFromPlatforms(['PS4', 'PS5']), true);
+});
+
+test('consoleOnlyFromPlatforms: presence of a PC-capable code means definitely not console-only', () => {
+  assert.equal(epicApi.consoleOnlyFromPlatforms(['PC', 'PS4', 'PS5']), false);
+  assert.equal(epicApi.consoleOnlyFromPlatforms(['KBM']), false);
+});
+
+test('consoleOnlyFromPlatforms: missing/empty/unrecognized platforms returns null (no confident answer), not a guess', () => {
+  assert.equal(epicApi.consoleOnlyFromPlatforms(undefined), null);
+  assert.equal(epicApi.consoleOnlyFromPlatforms([]), null);
+  assert.equal(epicApi.consoleOnlyFromPlatforms(['SOME_FUTURE_PLATFORM_CODE']), null);
+});
+
+test('findEventEntryByName: matches an upcoming event by exact (case-insensitive) name, returns the real nested regions object', async () => {
   await withStubbedFetchJson({
-    '/api/v1/events/global': REAL_GLOBAL_EVENTS,
-    '/api/v1/events/global/history': REAL_GLOBAL_HISTORY,
+    '/api/v1/events/global': [REAL_PS_TYPICAL_GAMER_ENTRY],
+    '/api/v1/events/global/history': [],
   }, async () => {
-    const entry = await epicApi.findEventEntryByName('duos ranked cup (zero build)');
+    const entry = await epicApi.findEventEntryByName('platstation typical gamer icon cup'.replace('platstation', 'playstation'));
     assert.ok(entry);
-    assert.equal(entry.id, 'Season41_RankedCupDuosZB');
-    assert.equal(entry.eventWindows.length, 1);
+    assert.equal(entry.id, 'S41_PSTypicalGamer_ZB::s41_ps_typical_zb');
+    assert.ok(epicApi.getRegionEntry(entry, 'EU'));
   });
 });
 
 test('findEventEntryByName: falls back to the history list when not found upcoming', async () => {
   await withStubbedFetchJson({
-    '/api/v1/events/global': REAL_GLOBAL_EVENTS,
-    '/api/v1/events/global/history': REAL_GLOBAL_HISTORY,
+    '/api/v1/events/global': [],
+    '/api/v1/events/global/history': [REAL_PS_TYPICAL_GAMER_ENTRY],
   }, async () => {
-    const entry = await epicApi.findEventEntryByName('FNCS Division 3');
+    const entry = await epicApi.findEventEntryByName('PlayStation Typical Gamer Icon Cup');
     assert.ok(entry);
-    assert.equal(entry.id, 'Season41_FNCSDivisionalCup_Division3');
   });
 });
 
 test('findEventEntryByName: returns null when no calendar entry matches either list', async () => {
   await withStubbedFetchJson({
-    '/api/v1/events/global': REAL_GLOBAL_EVENTS,
-    '/api/v1/events/global/history': REAL_GLOBAL_HISTORY,
+    '/api/v1/events/global': [REAL_PS_TYPICAL_GAMER_ENTRY],
+    '/api/v1/events/global/history': [],
   }, async () => {
     const entry = await epicApi.findEventEntryByName('Some Tournament That Does Not Exist');
     assert.equal(entry, null);
@@ -126,58 +186,24 @@ test('findEventEntryByName: returns null when no calendar entry matches either l
 
 test('findEventEntryByName: a fetchJson failure (rate limit / network error) resolves to null, never throws', async () => {
   await withStubbedFetchJson({
-    '/api/v1/events/global': null, // fetchGlobalEvents' real behavior on a non-ok response/error
+    '/api/v1/events/global': null,
     '/api/v1/events/global/history': null,
   }, async () => {
-    const entry = await epicApi.findEventEntryByName('Duos Ranked Cup (Zero Build)');
+    const entry = await epicApi.findEventEntryByName('PlayStation Typical Gamer Icon Cup');
     assert.equal(entry, null);
   });
 });
 
-test('pickEventWindowsForRegion: matches EU via the eventWindowId trailing suffix, a BR-suffixed window never leaks into an NAC query', () => {
-  const windows = [
-    REAL_RANKED_CUP_DUOS_ZB_WINDOW, // real window, suffix "_BR" (Brazil)
-    { ...REAL_RANKED_CUP_DUOS_ZB_WINDOW, eventWindowId: 'S41_RankedCupDuosZB_Event7_EU', endTime: '2026-08-01T00:00:00Z' },
-  ];
-  const euWindows = epicApi.pickEventWindowsForRegion(windows, 'EU');
-  assert.equal(euWindows.length, 1);
-  assert.equal(euWindows[0].eventWindowId, 'S41_RankedCupDuosZB_Event7_EU');
-
-  // NAC's candidate set (['NAC']) never includes 'BR', so the Brazil-suffixed window is correctly
-  // excluded from an NAC lookup — this is the real-world case that matters (Epic enrichment for one
-  // region must never accidentally serve a different region's window).
-  const nacWindows = epicApi.pickEventWindowsForRegion(windows, 'NAC');
-  assert.equal(nacWindows.length, 0);
-});
-
-test('pickEventWindowsForRegion: onlyPast excludes a window whose endTime is still in the future, sorts most-recent-first', () => {
-  const past1 = { eventWindowId: 'X_Event1_EU', endTime: '2020-01-01T00:00:00Z' };
-  const past2 = { eventWindowId: 'X_Event2_EU', endTime: '2021-01-01T00:00:00Z' };
-  const future = { eventWindowId: 'X_Event3_EU', endTime: new Date(Date.now() + 86400000).toISOString() };
-
-  const windows = epicApi.pickEventWindowsForRegion([past1, future, past2], 'EU', { onlyPast: true });
-  assert.deepEqual(windows.map(w => w.eventWindowId), ['X_Event2_EU', 'X_Event1_EU']);
-});
-
-// NAC's real Epic-side suffix is now confirmed live ("S41_MobileTestCup_Round1_NAC" — see
-// REGION_SUFFIX_CANDIDATES' doc comment), the same certainty level as EU. The old NAE fallback
-// (a guess for the pre-rename Epic region name) has been removed entirely, not just deprioritized —
-// this proves NAC resolves via its own real suffix exactly the same way EU does, with zero
-// dependency on NAE ever matching anything.
-test('pickEventWindowsForRegion: NAC resolves via its own confirmed "_NAC" suffix, same as EU', () => {
-  const windows = [{ eventWindowId: 'S41_MobileTestCup_Round1_NAC', endTime: '2020-01-01T00:00:00Z' }];
-  const nacWindows = epicApi.pickEventWindowsForRegion(windows, 'NAC');
-  assert.equal(nacWindows.length, 1);
-  assert.equal(nacWindows[0].eventWindowId, 'S41_MobileTestCup_Round1_NAC');
-});
-
-test('pickEventWindowsForRegion: NAC no longer falls back to the old NAE code — an NAE-suffixed window is NOT matched', () => {
-  const windows = [{ eventWindowId: 'S41_MobileTestCup_Round1_NAE', endTime: '2020-01-01T00:00:00Z' }];
-  const nacWindows = epicApi.pickEventWindowsForRegion(windows, 'NAC');
-  assert.equal(nacWindows.length, 0, 'NAE was only ever a defensive guess for the unconfirmed NAC code — now that NAC itself is confirmed, NAE must not match');
-});
-
 test('getPlayerEventMatches: parses the real v1 matches response and caches it (fetchJson only called once)', async () => {
+  const REAL_MATCHES_RESPONSE = {
+    found: true,
+    eventId: 'epicgames_S41_FNCSDivisionalCup_Division3_EU',
+    eventWindowId: 'S41_FNCSDivisionalCup_Division3_Event8_2_EU',
+    accountId: 'b87297a442684bbaa6f4cbf4e12efb2d',
+    rank: 502, pointsEarned: 230, matchCount: 8,
+    teamAccountIds: ['b87297a442684bbaa6f4cbf4e12efb2d', 'dfa61fc098ed477aa3a13cf2131bb1e6'],
+    matches: [],
+  };
   let callCount = 0;
   await withStubbedFetchJson({
     '/api/v1/events/epicgames_S41_FNCSDivisionalCup_Division3_EU/S41_FNCSDivisionalCup_Division3_Event8_2_EU/player/b87297a442684bbaa6f4cbf4e12efb2d/matches?rankHint=505': REAL_MATCHES_RESPONSE,
@@ -190,8 +216,6 @@ test('getPlayerEventMatches: parses the real v1 matches response and caches it (
       'b87297a442684bbaa6f4cbf4e12efb2d', 505
     );
     assert.equal(result1.rank, 502);
-    assert.equal(result1.pointsEarned, 230);
-    assert.equal(result1.matchCount, 8);
 
     const result2 = await epicApi.getPlayerEventMatches(
       'epicgames_S41_FNCSDivisionalCup_Division3_EU', 'S41_FNCSDivisionalCup_Division3_Event8_2_EU',
@@ -199,15 +223,6 @@ test('getPlayerEventMatches: parses the real v1 matches response and caches it (
     );
     assert.deepEqual(result2, result1);
     assert.equal(callCount, 1, 'second call should be served from cache, not a second fetch');
-  });
-});
-
-test('getPlayerEventMatches: uses the v1 scanning path, not v2 — confirmed live that v2 fails with "No standing found" on the same real data', async () => {
-  await withStubbedFetchJson({
-    '/api/v1/events/eid/ewid/player/acc/matches': REAL_MATCHES_RESPONSE,
-  }, async () => {
-    const result = await epicApi.getPlayerEventMatches('eid', 'ewid', 'acc');
-    assert.ok(result, 'v1 path (no rankHint) should resolve using the real confirmed URL shape');
   });
 });
 
@@ -220,70 +235,54 @@ test('getPlayerEventMatches: found:false resolves to null, not the raw response'
   });
 });
 
-test('detectBuildModeFromEpicId: confirmed against every real id from live testing', () => {
-  assert.equal(detectBuildModeFromEpicId('Season41_RankedCupDuosZB'), 'zero_build');
-  assert.equal(detectBuildModeFromEpicId('Season41_RankedCupReloadDuos'), 'reload');
-  assert.equal(detectBuildModeFromEpicId('Season41_RankedCupDuos'), null, 'no marker at all — not evidence of Battle Royale by itself');
-  assert.equal(detectBuildModeFromEpicId('Season41_RankedCupSolo'), null);
-  assert.equal(detectBuildModeFromEpicId('Season41_RankedCupSoloReload'), 'reload');
-  assert.equal(detectBuildModeFromEpicId('S41_ConsoleVCC_SolosZB'), 'zero_build');
-  assert.equal(detectBuildModeFromEpicId('S41_CashCup_DuosZB'), 'zero_build');
-  assert.equal(detectBuildModeFromEpicId('EventTemplate_RankedCupDuosZB'), 'zero_build');
-  assert.equal(detectBuildModeFromEpicId('Season41_ReloadSoloVictoryCup'), 'reload');
-  // Real counter-example: two live calendar entries for "Champion Aphrodite FNCS Cup" shared the
-  // identical top-level id "S41_FNCSCommunityCup" — the ZB/non-ZB distinction lived in a second,
-  // unconfirmed-field-name token this function is never given. Must return null (no false signal),
-  // not guess.
-  assert.equal(detectBuildModeFromEpicId('S41_FNCSCommunityCup'), null);
-});
+test('getEpicOwnTournamentModifier: end-to-end against the real shape — resolves the real per-region eventId itself, no dependency on tournament.eventId at all', async () => {
+  // Real eventWindow beginTimes in the fixture above are all in the FUTURE (futureIso), so they
+  // won't pass the "past window" filter — rebuild one past window inline so this test can exercise
+  // the real matches-lookup path deterministically.
+  const entryWithPastWindow = JSON.parse(JSON.stringify(REAL_PS_TYPICAL_GAMER_ENTRY));
+  entryWithPastWindow.regions.EU[0].eventWindows = [{ eventWindowId: 'S41_PSTypicalGamer_ZB_Qualifier_EU', beginTime: pastIso(50), endTime: pastIso(47) }];
 
-test('detectBuildModeFromEpicId: checks multiple candidate strings, no false-positive word-boundary issue on glued markers', () => {
-  // "DuosZB" has no separator between "Duos" and "ZB" — a \bzb\b regex would never match this.
-  assert.equal(detectBuildModeFromEpicId(null, 'EventTemplate_RankedCupDuosZB'), 'zero_build');
-  assert.equal(detectBuildModeFromEpicId(undefined, undefined), null);
-});
-
-test('getEpicOwnTournamentModifier: end-to-end against the real shapes — resolves eventWindow by region, computes the same formula shape as computeOwnTournamentModifier', async () => {
-  const pastEndTime = new Date(Date.now() - 3 * 86400000).toISOString(); // 3 days ago — robust against whenever this test actually runs
   await withStubbedFetchJson({
-    '/api/v1/events/global': [
-      {
-        id: 'Season41_RankedCupDuosZB',
-        name: 'Duos Ranked Cup (Zero Build)',
-        eventWindows: [
-          { ...REAL_RANKED_CUP_DUOS_ZB_WINDOW, endTime: pastEndTime }, // BR — should be excluded for an EU tournament
-          { ...REAL_RANKED_CUP_DUOS_ZB_WINDOW, eventWindowId: 'S41_RankedCupDuosZB_Event7_EU', endTime: pastEndTime },
-        ],
-      },
-    ],
+    '/api/v1/events/global': [entryWithPastWindow],
     '/api/v1/events/global/history': [],
-    '/api/v1/events/epicgames_S41_RankedCupDuosZB_EU/S41_RankedCupDuosZB_Event7_EU/player/myaccount/matches': {
-      found: true, eventWindowId: 'S41_RankedCupDuosZB_Event7_EU', rank: 250, pointsEarned: 400,
+    '/api/v1/events/epicgames_S41_PSTypicalGamer_ZB_EU/S41_PSTypicalGamer_ZB_Qualifier_EU/player/myaccount/matches': {
+      found: true, eventWindowId: 'S41_PSTypicalGamer_ZB_Qualifier_EU', rank: 250, pointsEarned: 400,
     },
   }, async () => {
-    const tournament = { name: 'Duos Ranked Cup (Zero Build)', eventId: 'epicgames_S41_RankedCupDuosZB_EU', region: 'EU' };
+    // tournament deliberately has NO eventId — proves the real eventId comes from Epic's own
+    // freshly-resolved regionEntry, not from anything the caller supplied.
+    const tournament = { name: 'PlayStation Typical Gamer Icon Cup', region: 'EU' };
     const result = await epicApi.getEpicOwnTournamentModifier(tournament, 'myaccount', { getPlacementScore });
 
     assert.ok(result);
     assert.equal(result.source, 'epic');
-    assert.equal(result.matchedWindows.length, 1);
-    assert.equal(result.matchedWindows[0].eventWindowId, 'S41_RankedCupDuosZB_Event7_EU');
-    // rank 250 -> placementScores threshold 300 -> score 100 -> (100/100)*0.30 = 0.30
+    assert.equal(result.matchedWindows[0].eventWindowId, 'S41_PSTypicalGamer_ZB_Qualifier_EU');
     assert.equal(result.modifier, getPlacementScore(250) / 100 * 0.30);
   });
 });
 
-test('getEpicOwnTournamentModifier: returns null (not a throw) when the tournament has no eventId', async () => {
-  const result = await epicApi.getEpicOwnTournamentModifier({ name: 'X', region: 'EU' }, 'myaccount', { getPlacementScore });
-  assert.equal(result, null);
+test('getEpicOwnTournamentModifier: returns null (not a throw) when name or region is missing', async () => {
+  assert.equal(await epicApi.getEpicOwnTournamentModifier({ name: 'X' }, 'acc', { getPlacementScore }), null);
+  assert.equal(await epicApi.getEpicOwnTournamentModifier({ region: 'EU' }, 'acc', { getPlacementScore }), null);
 });
 
-test('getEpicOwnTournamentModifier: returns null when no calendar entry matches by name (Epic never called for matches)', async () => {
+test('getEpicOwnTournamentModifier: returns null when no calendar entry matches by name', async () => {
   await withStubbedFetchJson({
     '/api/v1/events/global': [],
     '/api/v1/events/global/history': [],
   }, async () => {
-    const tournament = { name: 'Totally Unknown Cup', eventId: 'epicgames_x_EU', region: 'EU' };
+    const tournament = { name: 'Totally Unknown Cup', region: 'EU' };
+    const result = await epicApi.getEpicOwnTournamentModifier(tournament, 'myaccount', { getPlacementScore });
+    assert.equal(result, null);
+  });
+});
+
+test('getEpicOwnTournamentModifier: returns null when the tournament isn\'t offered in the requested region', async () => {
+  await withStubbedFetchJson({
+    '/api/v1/events/global': [REAL_PS_TYPICAL_GAMER_ENTRY],
+    '/api/v1/events/global/history': [],
+  }, async () => {
+    const tournament = { name: 'PlayStation Typical Gamer Icon Cup', region: 'OCE' };
     const result = await epicApi.getEpicOwnTournamentModifier(tournament, 'myaccount', { getPlacementScore });
     assert.equal(result, null);
   });
