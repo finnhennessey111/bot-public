@@ -1,7 +1,7 @@
 const puppeteer = require('puppeteer');
 const config = require('./config');
 const { proxyLaunchArgs, authenticatePage, blockUnnecessaryResources, logProxyMode, withBrowserSlot, closeBrowserSafely } = require('./proxy-config');
-const { resolveRosterSize, inferRosterSize } = require('./roster-size');
+const { resolveRosterSize, inferRosterSize, detectRosterSizeFromEpicId } = require('./roster-size');
 const { detectBuildMode, detectBuildModeFromEpicId } = require('./build-mode');
 const epicApi = require('./epic-api');
 
@@ -45,6 +45,31 @@ const PERMANENT_KEYWORDS = [
 // Regions we support — Fortnite Tracker's calendar covers more (OCE, ASIA, NAW, BR/Brazil, etc.)
 // but the bot only has role/category config for these three.
 const SUPPORTED_REGIONS = ['EU', 'NAC', 'ME'];
+
+// Epic's own calendar payload has no console/platform-restriction field at all (confirmed absent
+// from every real example seen this session — no platformMappings/additionalRequirements or
+// similar). Every real console-exclusive example seen so far says "Console" directly in its own
+// name/id ("Console Duos ZB Cash Cup", "Console Solo Victory Cup (ZB)", "S41_ConsoleVCC_SolosZB")
+// — 100% correlation in the data available, so detectConsoleOnlyFromEpic below uses that as a text
+// heuristic rather than a structured flag. This override map exists specifically because a text
+// heuristic WILL eventually meet a counter-example (a console-exclusive tournament that doesn't say
+// "console", or one that mentions "console" without being exclusive) — same philosophy and shape as
+// roster-size.js's KNOWN_TOURNAMENT_ROSTER_SIZES: keep this small, only add an entry once it's
+// actually confirmed wrong, matched by substring against the combined lowercased name+id.
+const CONSOLE_ONLY_OVERRIDES = {
+  // 'some future tournament name': true, // or false, once a real counter-example is confirmed
+};
+
+// See CONSOLE_ONLY_OVERRIDES above for why this is a text heuristic, not a confirmed structured
+// signal — used only by scrapeEpicCalendar below (Fortnite Tracker's own consoleOnly detection,
+// window.platformGroups, is unaffected and untouched).
+function detectConsoleOnlyFromEpic(name, id) {
+  const combined = `${name ?? ''} ${id ?? ''}`.toLowerCase();
+  for (const [known, value] of Object.entries(CONSOLE_ONLY_OVERRIDES)) {
+    if (combined.includes(known.toLowerCase())) return value;
+  }
+  return /console/.test(combined);
+}
 
 // ---------------------------------------------------------------------------------------------
 // Shared grouping/filtering — takes a flat array of raw sessions (one per tournament/window/
@@ -359,7 +384,13 @@ async function fetchEventDescriptionRosterSize(eventId) {
 // a fake implementation without a real Puppeteer/network round trip.
 async function enrichWithDescriptionRosterSize(groups) {
   for (const group of groups) {
-    if (group.rosterSize != null || !group.eventId) continue;
+    // A synthetic "epic_..." eventId (scrapeEpicCalendar's stand-in for a real Fortnite Tracker
+    // event id — see its doc comment) would never resolve to a real fortnitetracker.com/events/
+    // page, so this would always fail. Skipping it outright avoids launching a full Puppeteer
+    // browser for a fetch that's guaranteed to 404 — both a correctness no-op and, more to the
+    // point, exactly the kind of wasted Fortnite Tracker traffic flipping to Epic-primary discovery
+    // was meant to reduce.
+    if (group.rosterSize != null || !group.eventId || group.eventId.startsWith('epic_')) continue;
 
     try {
       const rosterSize = await module.exports.fetchEventDescriptionRosterSize(group.eventId);
@@ -410,6 +441,110 @@ async function enrichWithEpicBuildMode(groups) {
   return groups;
 }
 
+// Same cross-check pattern as enrichWithEpicBuildMode above, applied to roster size instead
+// (roster-size.js's detectRosterSizeFromEpicId) — only overrides when Epic's id has an explicit
+// solo/duo/trio/squad marker, leaves the existing value (title-based, manual-override-map, or the
+// FT event-description fallback) untouched otherwise. A separate function/lookup rather than
+// folding into enrichWithEpicBuildMode above: that function is already in real use and tested, and
+// the extra findEventEntryByName call this makes is a cached local scan (no extra network cost),
+// not worth the churn of merging two already-working, independently-testable enrichments.
+async function enrichWithEpicRosterSize(groups) {
+  for (const group of groups) {
+    let entry;
+    try {
+      entry = await epicApi.findEventEntryByName(group.name);
+    } catch (err) {
+      console.error(`  ⚠️ Epic roster-size lookup failed for "${group.name}":`, err.message);
+      continue;
+    }
+    if (!entry) continue;
+
+    const epicRosterSize = detectRosterSizeFromEpicId(entry.id, entry.eventWindows?.[0]?.eventTemplateId);
+    if (epicRosterSize == null) continue;
+
+    if (epicRosterSize !== group.rosterSize) {
+      console.log(`  🔀 Roster size for "${group.name}" (${group.region}): existing detection said ${group.rosterSize ?? 'unclassified'}, Epic's id says ${epicRosterSize} — using Epic's.`);
+    }
+    group.rosterSize = epicRosterSize;
+    group.isTrios = epicRosterSize === 3;
+  }
+  return groups;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Epic (api-fortnite.com) — PRIMARY tournament-calendar source as of tonight's rework. Builds the
+// exact same rawSessions shape Fortnite Tracker's scrapeTrackerCalendar produces below, then runs
+// it through the SAME, UNCHANGED buildTournamentGroups — every filtering rule (blocked keywords,
+// FNCS finals/heats exclusion, same-day collapse, permanent-tournament detection, past-time/region
+// filtering, bare-build-mode guard) applies identically regardless of which source produced the raw
+// sessions, since buildTournamentGroups only ever looks at the rawSessions shape itself, never
+// which scraper built it. This is deliberate: it's the lowest-risk way to guarantee FNCS/permanent-
+// tournament handling really does carry over unchanged, rather than re-implementing that logic
+// against Epic's shape and hoping it stays in sync.
+//
+// What Epic's own payload genuinely does NOT provide (confirmed absent from every real example
+// seen this session, not assumed): a structured platform/console-restriction field (see
+// CONSOLE_ONLY_OVERRIDES/detectConsoleOnlyFromEpic above for the text-heuristic stand-in), and the
+// real "epicgames_..._REGION"-shaped eventId Epic's own placement-lookup API expects (only ever
+// confirmed via Fortnite Tracker's scrape — see the synthetic eventId comment below). Region,
+// build-mode, and roster-size ARE all confirmed derivable from Epic's own data.
+//
+// Returns null (not []) when Epic's fetch itself fails outright (no key set, rate limited, network
+// error, empty/unrecognized payload) — same "null means try the fallback, [] means a real but
+// empty result" distinction fetchRawCalendar/scrapeTrackerCalendar already draw for the Fortnite
+// Tracker path. See scrapeUpcomingTournaments below for the actual fail-soft wiring.
+// ---------------------------------------------------------------------------------------------
+async function scrapeEpicCalendar() {
+  const events = await epicApi.fetchGlobalEvents();
+  if (!events) return null;
+
+  const rawSessions = [];
+  for (const raw of events) {
+    const entry = epicApi.normalizeEventEntry(raw);
+    if (!entry) continue;
+
+    const title = entry.name.trim();
+    const titleLower = title.toLowerCase();
+    const consoleOnly = detectConsoleOnlyFromEpic(entry.name, entry.id);
+
+    for (const window of entry.eventWindows ?? []) {
+      const suffix = epicApi.windowRegionSuffix(window);
+      const region = SUPPORTED_REGIONS.find(r => (epicApi.REGION_SUFFIX_CANDIDATES[r] ?? [r]).includes(suffix));
+      if (!region) continue; // not one of this bot's 3 regions (or an unrecognized suffix)
+
+      rawSessions.push({
+        key: `${title}-${region}`,
+        name: title,
+        titleLower,
+        region,
+        beginTime: window.beginTime,
+        consoleOnly,
+        // Only the consoleOnly boolean above is actually read downstream (channel-manager.js/
+        // queue.js's isCompatiblePlatform) — this array itself is never inspected, so a synthetic
+        // single-entry stand-in is enough to keep the rawSession shape consistent with Fortnite
+        // Tracker's (which populates a real platformGroups-derived array here).
+        platforms: consoleOnly ? ['Console'] : [],
+        // Epic's own calendar payload never exposes the real "epicgames_..._REGION" identifier its
+        // OWN placement-lookup API (epic-api.js's getPlayerEventMatches) expects — only ever
+        // confirmed via Fortnite Tracker's scraped window.eventId. This synthetic value is stable
+        // and unique per tournament+region (entry.id is Epic's own persistent identifier, constant
+        // across a recurring tournament's rounds/weeks — confirmed via the real "Season41_..." ids
+        // seen this session), which is ALL channel-manager.js's dedup/rename actually needs (any
+        // consistent value works there — see its findExistingTournamentChannel doc comment). It is
+        // NOT a value Epic's real matches endpoint will recognize: getEpicOwnTournamentModifier
+        // already fails soft on an unrecognized eventId (falls back to Fortnite-Tracker-derived
+        // data), so this is safe — it just means that specific enrichment won't engage for a
+        // tournament discovered via this path, until a real derivation is confirmed.
+        eventId: `epic_${entry.id}_${region}`,
+      });
+    }
+  }
+
+  const groups = buildTournamentGroups(rawSessions);
+  const withRosterSize = await module.exports.enrichWithEpicRosterSize(groups);
+  return module.exports.enrichWithEpicBuildMode(withRosterSize);
+}
+
 async function scrapeTrackerCalendar() {
   const rawCalendar = await fetchRawCalendar();
 
@@ -447,8 +582,9 @@ async function scrapeTrackerCalendar() {
   }
 
   const groups = buildTournamentGroups(rawSessions);
-  const withRosterSize = await enrichWithDescriptionRosterSize(groups);
-  return module.exports.enrichWithEpicBuildMode(withRosterSize);
+  const withDescriptionRosterSize = await enrichWithDescriptionRosterSize(groups);
+  const withEpicRosterSize = await module.exports.enrichWithEpicRosterSize(withDescriptionRosterSize);
+  return module.exports.enrichWithEpicBuildMode(withEpicRosterSize);
 }
 
 // Returns global tournament-calendar data — identical regardless of which guild (if any) asks,
@@ -457,14 +593,38 @@ async function scrapeTrackerCalendar() {
 // guild means one full Puppeteer navigation per guild for data that's the same every time, which
 // at scale (40+ guilds) is exactly what got this bot's VPS IP blocked by Cloudflare in the past.
 // See channel-manager.js's runTournamentCheckTick/runEmbedRefreshTick.
+//
+// Epic (api-fortnite.com) is the PRIMARY source as of tonight's rework — scrapeEpicCalendar above
+// genuinely replaces Fortnite Tracker's own two-full-page Puppeteer calendar scrape
+// (fetchRawCalendar) on every tick Epic succeeds, which is the actual bandwidth/cost reduction this
+// was for. scrapeTrackerCalendar only runs now when Epic's own call fails outright (no
+// FORTNITE_API_KEY set, rate limited, network error, unrecognized payload) — same fail-soft
+// pattern already built and proven for the ownTournamentModifier enrichment (epic-api.js), reused
+// here rather than reinvented. Never throws either way: scrapeEpicCalendar's own internal errors
+// are caught here so a bug in the new path can't take tournament discovery down entirely with
+// Fortnite Tracker sitting right there as a working fallback.
 async function scrapeUpcomingTournaments() {
-  return scrapeTrackerCalendar();
+  let epicGroups = null;
+  try {
+    epicGroups = await module.exports.scrapeEpicCalendar();
+  } catch (err) {
+    console.error('❌ Epic calendar discovery threw — falling back to Fortnite Tracker:', err.message);
+  }
+
+  if (epicGroups) {
+    console.log(`✅ Tournament calendar served by Epic (${epicGroups.length} entries) — Fortnite Tracker calendar scrape skipped this tick`);
+    return epicGroups;
+  }
+
+  console.log('⚠️ Epic calendar unavailable this tick — falling back to Fortnite Tracker');
+  return module.exports.scrapeTrackerCalendar();
 }
 
 module.exports = {
   scrapeUpcomingTournaments, buildTournamentGroups, isBareBuildModeLabel, scrapeTrackerCalendar,
-  isRankedCupTitle, fetchEventDescriptionRosterSize, enrichWithDescriptionRosterSize,
-  enrichWithEpicBuildMode, PERMANENT_KEYWORDS,
+  scrapeEpicCalendar, isRankedCupTitle, fetchEventDescriptionRosterSize, enrichWithDescriptionRosterSize,
+  enrichWithEpicBuildMode, enrichWithEpicRosterSize, detectConsoleOnlyFromEpic, CONSOLE_ONLY_OVERRIDES,
+  PERMANENT_KEYWORDS,
 };
 
 // Test run

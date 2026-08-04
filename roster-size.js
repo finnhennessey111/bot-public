@@ -34,4 +34,24 @@ function resolveRosterSize(nameLower) {
   return inferRosterSize(nameLower);
 }
 
-module.exports = { inferRosterSize, resolveRosterSize };
+// Structural cross-check for the above, using Epic's OWN id strings (epic-api.js) — same "no \b
+// word-boundary regex" reasoning as build-mode.js's detectBuildModeFromEpicId: Epic's PascalCase
+// ids glue words together with no separator (e.g. "RankedCupDuosZB" has no boundary between "Cup"
+// and "Duos"), so inferRosterSize's \bduos?\b above would never match it. Confirmed real examples
+// this session: "RankedCupDuosZB"/"RankedCupDuos" contain "Duos", "RankedCupSolo"/
+// "RankedCupSoloReload" contain "Solo" — but "FNCSDivisionalCup" has NO team-size marker at all
+// (the same gap its plain-English title has), so this is a cross-check/enrichment signal only,
+// never a sole source of truth — returns null (no signal) rather than guessing when nothing
+// matches, exactly like detectBuildModeFromEpicId. See tournament-scraper.js's
+// enrichWithEpicRosterSize for how this only ever overrides, never asserts a default.
+function detectRosterSizeFromEpicId(...idLikeStrings) {
+  const combined = idLikeStrings.filter(Boolean).join(' ').toLowerCase();
+  if (!combined) return null;
+  if (/solo/.test(combined)) return 1;
+  if (/duo/.test(combined)) return 2;
+  if (/trio/.test(combined)) return 3;
+  if (/squad/.test(combined)) return 4;
+  return null;
+}
+
+module.exports = { inferRosterSize, resolveRosterSize, detectRosterSizeFromEpicId };
