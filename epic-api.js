@@ -249,8 +249,11 @@ function pickPastEventWindows(eventWindows, limit) {
 }
 
 // Same shape/weight as scraper.js's computeOwnTournamentModifier (up to 3 most recent matching
-// events, averaged placement score, /100 scale, 0.30 weight) — deliberately unchanged, since only
-// the DATA SOURCE is being upgraded here, not the scoring formula itself.
+// windows, 0.30 weight) — PR-native now, matching that function's own formula shape: each matched
+// window's real pointsEarned (Epic's own per-window PR points, the direct analog of Fortnite
+// Tracker's prPoints) is averaged and expressed as a fraction of currentPR, not converted through a
+// 0-100 placement-bucket score. currentPR must be > 0 to express a percentage against — mirrors
+// computeOwnTournamentModifier's own currentPR <= 0 guard, same "no signal, never a penalty" shape.
 //
 // tournament only needs { name, region } — NOT eventId. The real per-region eventId is resolved
 // fresh from Epic's own calendar right here (getRegionEntry(entry, tournament.region).eventId),
@@ -261,10 +264,11 @@ function pickPastEventWindows(eventWindows, limit) {
 // right value through.
 //
 // Returns null on absolutely any gap (no calendar match, no eligible past window for this region,
-// no player standing found) — callers fall back to the existing Fortnite Tracker-derived modifier
-// whenever this returns null, exactly the same as any other fetch failure here.
-async function getEpicOwnTournamentModifier(tournament, accountId, { getPlacementScore } = {}) {
-  if (!tournament?.name || !tournament?.region || !accountId) return null;
+// no player standing found, currentPR <= 0) — callers fall back to the existing Fortnite
+// Tracker-derived modifier whenever this returns null, exactly the same as any other fetch failure
+// here.
+async function getEpicOwnTournamentModifier(tournament, accountId, currentPR) {
+  if (!tournament?.name || !tournament?.region || !accountId || !(currentPR > 0)) return null;
 
   const entry = await module.exports.findEventEntryByName(tournament.name);
   if (!entry) {
@@ -287,10 +291,11 @@ async function getEpicOwnTournamentModifier(tournament, accountId, { getPlacemen
   const results = await Promise.all(
     windows.map(w => module.exports.getPlayerEventMatches(regionEntry.eventId, w.eventWindowId, accountId))
   );
-  const found = results.filter(r => r?.found && typeof r.rank === 'number');
+  const found = results.filter(r => r?.found && typeof r.pointsEarned === 'number');
   if (found.length === 0) return null;
 
-  const modifier = (found.reduce((sum, r) => sum + getPlacementScore(r.rank), 0) / found.length / 100) * 0.30;
+  const avgPointsEarned = found.reduce((sum, r) => sum + r.pointsEarned, 0) / found.length;
+  const modifier = (avgPointsEarned / currentPR) * 0.30;
   console.log(`[epic-api] own-tournament modifier for "${tournament.name}" served from Epic (${found.length} window(s))`);
 
   return {

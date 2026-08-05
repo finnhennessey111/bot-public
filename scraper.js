@@ -222,14 +222,26 @@ function extractPRBand(powerRank) {
   return powerRank.band ?? powerRank.bandName ?? powerRank.rankName ?? powerRank.tier ?? null;
 }
 
-function getPlacementScore(placement) {
-  if (!placement) return 0;
-  for (const band of config.placementScores) {
-    if (placement <= band.threshold) return band.score;
-  }
-  return 0;
+// Averages an event's already-decayed Power Ranking contribution (prPoints — window.
+// powerRankingData.points, confirmed live against a real account with genuinely old events: e.g.
+// a Dec 2025 "Solo Series Qualifiers" showed prPoints 8.26 against a pointsNoDecay of 11.8, an 11.34
+// point recorded loss on a Mar 2025 "Solo Cash Cup" matching prPoints 4.86 vs pointsNoDecay 16.2 —
+// exact matches, both events, confirming prPoints IS the live decayed figure already, not a static
+// pre-decay total the way profile.prSegments' season total turned out to be for thisSeasonPR).
+// Fortnite Tracker's own decay curve is used as-is here — no separate recency weighting is applied
+// on top of it, deliberately: building a second, independent decay system would either fight
+// Tracker's own curve or double-count recency, and Tracker's number already reflects genuine
+// recency-weighted form on its own.
+function averagePrPoints(events) {
+  return events.reduce((sum, e) => sum + (e.prPoints ?? 0), 0) / events.length;
 }
 
+// currentPR is the denominator every modifier is expressed against (see computeMatchScoreBreakdown
+// below) — a genuine percentage of Current PR, not a 0-100 placement-bucket score. currentPR <= 0
+// (no PR yet, e.g. a brand new unlinked-but-queued account) has nothing to express a percentage
+// against, so this returns 0 rather than dividing by zero — same "no signal, never a penalty"
+// shape as the no-history case just above it.
+//
 // Extracted from computeMatchScoreBreakdown below so elo.js's public ELO lookup can reuse the
 // EXACT same own-tournament-history formula against a broader match predicate — a permanent
 // tournament TYPE (e.g. "FNCS Division") needs to match whichever numbered division a player
@@ -237,11 +249,13 @@ function getPlacementScore(placement) {
 // every existing real-time caller (queue.js, creative-queue.js), which always matches one exact
 // tournamentName. matchesEvent is `e => boolean` — computeMatchScoreBreakdown below passes
 // `e => e.name === tournamentName`, preserving its exact prior behavior unchanged.
-function computeOwnTournamentModifier(recentEvents, matchesEvent) {
+function computeOwnTournamentModifier(recentEvents, matchesEvent, currentPR) {
   const ownTournamentEvents = recentEvents.filter(matchesEvent).slice(0, 3);
-  if (ownTournamentEvents.length === 0) return { modifier: 0, hasHistory: false, matchedEvents: [] };
+  if (ownTournamentEvents.length === 0 || !(currentPR > 0)) {
+    return { modifier: 0, hasHistory: ownTournamentEvents.length > 0, matchedEvents: ownTournamentEvents };
+  }
 
-  const modifier = (ownTournamentEvents.reduce((sum, e) => sum + getPlacementScore(e.placement), 0) / ownTournamentEvents.length / 100) * 0.30;
+  const modifier = (averagePrPoints(ownTournamentEvents) / currentPR) * 0.30;
   return { modifier, hasHistory: true, matchedEvents: ownTournamentEvents };
 }
 
@@ -252,10 +266,11 @@ function computeOwnTournamentModifier(recentEvents, matchesEvent) {
 // does NOT apply to ownTournamentModifier below, where self-referential history for the exact
 // same tournament (even if that tournament is a ranked cup) is always a fair signal.
 //
-// Placement-only (kills dropped) — same bounded 0-100 placement scale ownTournamentModifier
-// already used on its own. Kills previously contributed 30% of this signal; placement quality
-// alone is what's left now, matching ownTournamentModifier's existing shape rather than diverging
-// from it for no reason.
+// Real solo-event source confirmed unchanged: derived by filtering the player's own already-scraped
+// recentEvents (rosterSize === 1, title not ranked) rather than a dedicated Fortnite Tracker
+// playlist=solo fetch — investigated live: playlist=solo has no filtering effect on the per-player
+// profile URL (identical unfiltered results with or without it) and doesn't isolate solo-only
+// results on the tournament calendar URL either, so there's no real "corrected URL" to switch to.
 //
 // No region argument anymore: this used to also take homeRegion/queueRegion to apply a
 // cross-region penalty when they differed, but that penalty is gone now that playerData ITSELF is
@@ -269,29 +284,40 @@ function computeOwnTournamentModifier(recentEvents, matchesEvent) {
 // match time rather than re-deriving it later from a possibly-since-changed recentEvents history.
 // calculateMatchScore below is unchanged for every existing caller — just now implemented in
 // terms of this.
+//
+// PR-NATIVE FORMULA: Total = Current PR × (1 + soloModifier + ownTournamentModifier). base is
+// Current PR itself now — the old (totalPR*10 + thisSeasonPR*5) blend is gone entirely (thisSeasonPR
+// is a deliberately-removed input, not an oversight: a blunt, unfiltered seasonal aggregate that
+// doesn't fit the "targeted, relevant recent form" philosophy soloModifier/ownTournamentModifier
+// both follow), and both modifiers are now genuine percentage boosts on Current PR (each qualifying
+// event's decayed prPoints as a fraction of currentPR, weighted the same 0.30/0.35 as before) rather
+// than a 0-100 placement-bucket score applied on top of a pre-scaled base. matchScore is therefore
+// inherently PR-equivalent by construction — no ×10/÷10 conversion needed anywhere this is
+// displayed (Discord or the website).
 function computeMatchScoreBreakdown(playerData, tournamentName) {
-  const base = (playerData.totalPR * 10) + (playerData.thisSeasonPR * 5);
+  const currentPR = playerData.totalPR;
 
   const { modifier: ownTournamentModifier } = computeOwnTournamentModifier(
-    playerData.recentEvents, e => e.name === tournamentName
+    playerData.recentEvents, e => e.name === tournamentName, currentPR
   );
 
   const soloEvents = playerData.recentEvents
     .filter(e => e.rosterSize === 1 && !/ranked/i.test(e.name))
     .slice(0, 5);
 
-  let soloModifier = 0;
-  if (soloEvents.length > 0) {
-    const placementQuality = (soloEvents.reduce((sum, e) => sum + getPlacementScore(e.placement), 0) / soloEvents.length) / 100;
-    soloModifier = placementQuality * 0.35;
-  }
+  const soloModifier = (soloEvents.length > 0 && currentPR > 0)
+    ? (averagePrPoints(soloEvents) / currentPR) * 0.35
+    : 0;
 
-  const matchScore = Math.round(base * (1 + soloModifier + ownTournamentModifier));
+  const matchScore = Math.round(currentPR * (1 + soloModifier + ownTournamentModifier));
 
   // soloEvents included alongside soloModifier — the exact (up to 5) events the modifier above was
   // actually computed from, not a re-derived approximation — so a caller (elo.js's public ELO
   // lookup) can show real example events behind the number instead of just the number itself.
-  return { matchScore, base, ownTournamentModifier, soloModifier, soloEvents };
+  // base is Current PR — kept as the field name (not renamed to currentPR) since every existing
+  // caller already reads .base as "the PR-only baseline before modifiers", which is still exactly
+  // what it means; only its underlying VALUE changed (no ×10/×5 blend), not its role.
+  return { matchScore, base: currentPR, ownTournamentModifier, soloModifier, soloEvents };
 }
 
 function calculateMatchScore(playerData, tournamentName) {
@@ -319,12 +345,14 @@ async function computeMatchScoreBreakdownWithEpic(playerData, tournament, accoun
   // per-region eventId itself, from a fresh name+region calendar lookup (see epic-api.js's doc
   // comment on why: the value threaded through here meant different things depending on which
   // discovery path produced it, so trusting Epic's own freshly-resolved id is both simpler and more
-  // correct). Only name/region/accountId are actually required to attempt it.
+  // correct). Only name/region/accountId are actually required to attempt it. currentPR (breakdown.
+  // base) is threaded through so Epic's own modifier can be expressed as the same PR-native
+  // percentage the FT-derived one is, not a separate placement-bucket score.
   if (!tournament?.name || !tournament?.region || !accountId) return breakdown;
 
   let epicResult = null;
   try {
-    epicResult = await epicApi.getEpicOwnTournamentModifier(tournament, accountId, { getPlacementScore });
+    epicResult = await epicApi.getEpicOwnTournamentModifier(tournament, accountId, breakdown.base);
   } catch (err) {
     console.warn(`[scraper] Epic own-tournament lookup threw for "${tournament.name}" — falling back to Fortnite Tracker history: ${err.message}`);
   }
@@ -337,5 +365,5 @@ async function computeMatchScoreBreakdownWithEpic(playerData, tournament, accoun
 
 module.exports = {
   scrapePlayer, scrapePlayerOnce, calculateMatchScore, computeMatchScoreBreakdown,
-  computeMatchScoreBreakdownWithEpic, computeOwnTournamentModifier, getPlacementScore,
+  computeMatchScoreBreakdownWithEpic, computeOwnTournamentModifier,
 };

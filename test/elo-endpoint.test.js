@@ -15,7 +15,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { computeMatchScoreBreakdown, getPlacementScore } = require('../scraper');
+const { computeMatchScoreBreakdown } = require('../scraper');
 const { PERMANENT_KEYWORDS } = require('../tournament-scraper');
 const elo = require('../elo');
 const PlayerModel = require('../models/Player');
@@ -24,11 +24,11 @@ const playerStore = require('../players');
 // ── computeOwnTournamentModifier extraction: no behavior change ──────────────
 test('computeMatchScoreBreakdown: extracting computeOwnTournamentModifier did not change its output for an exact-tournamentName match (the only pattern every real-time caller uses)', () => {
   const playerData = {
-    totalPR: 500, thisSeasonPR: 100,
+    totalPR: 500,
     recentEvents: [
-      { name: 'Some Cup', placement: 50, rosterSize: 2, elims: 10 },
-      { name: 'Some Cup', placement: 200, rosterSize: 2, elims: 5 },
-      { name: 'A Different Cup', placement: 1, rosterSize: 2, elims: 20 },
+      { name: 'Some Cup', placement: 50, prPoints: 60, rosterSize: 2, elims: 10 },
+      { name: 'Some Cup', placement: 200, prPoints: 40, rosterSize: 2, elims: 5 },
+      { name: 'A Different Cup', placement: 1, prPoints: 200, rosterSize: 2, elims: 20 },
     ],
   };
 
@@ -43,7 +43,7 @@ test('computeMatchScoreBreakdown: extracting computeOwnTournamentModifier did no
 // ── elo.js core logic ─────────────────────────────────────────────────────────
 function makePlayerData(overrides = {}) {
   return {
-    totalPR: 800, thisSeasonPR: 200,
+    totalPR: 800,
     recentEvents: [],
     ...overrides,
   };
@@ -52,8 +52,8 @@ function makePlayerData(overrides = {}) {
 test('elo.js creative score genuinely matches what creative-queue.js\'s real 1v1/2v2 modes compute — not reimplemented logic, the same shared formula', () => {
   const playerData = makePlayerData({
     recentEvents: [
-      { name: 'Solo Cash Cup', placement: 20, rosterSize: 1, elims: 30 },
-      { name: 'Solo Cash Cup', placement: 5, rosterSize: 1, elims: 40 },
+      { name: 'Solo Cash Cup', placement: 20, prPoints: 90, rosterSize: 1, elims: 30 },
+      { name: 'Solo Cash Cup', placement: 5, prPoints: 120, rosterSize: 1, elims: 40 },
     ],
   });
 
@@ -76,12 +76,12 @@ test('elo.js creative score genuinely matches what creative-queue.js\'s real 1v1
 
 test('elo.js: a permanent tournament type with NO recorded history scores IDENTICALLY to the creative score (confirms — does not assume — the shared-base behavior)', async () => {
   const recentEvents = [
-    { name: 'Solo Cash Cup', placement: 20, rosterSize: 1, elims: 30 },
-    { name: 'Console Duos Victory Cup', placement: 15, rosterSize: 2, elims: 12 }, // history in ONE permanent type only
+    { name: 'Solo Cash Cup', placement: 20, prPoints: 90, rosterSize: 1, elims: 30 },
+    { name: 'Console Duos Victory Cup', placement: 15, prPoints: 110, rosterSize: 2, elims: 12 }, // history in ONE permanent type only
   ];
 
   const original = PlayerModel.find;
-  PlayerModel.find = () => ({ lean: async () => [{ epicUsername: 'TestPlayer', epicUsernameLower: 'testplayer', epicId: 'e1', region: 'EU', totalPR: 800, thisSeasonPR: 200, recentEvents, lastUpdated: new Date() }] });
+  PlayerModel.find = () => ({ lean: async () => [{ epicUsername: 'TestPlayer', epicUsernameLower: 'testplayer', epicId: 'e1', region: 'EU', totalPR: 800, recentEvents, lastUpdated: new Date() }] });
   try {
     const result = await elo.getPublicElo('TestPlayer');
 
@@ -107,25 +107,27 @@ test('elo.js: a permanent tournament type with NO recorded history scores IDENTI
   }
 });
 
-test('elo.js: segments always sum exactly to the total score (no rounding gap for a segmented bar to visibly break on)', async () => {
+test('elo.js: segments always sum exactly to the total score (no rounding gap for a segmented bar to visibly break on) — no seasonPR segment anymore', async () => {
   const original = PlayerModel.find;
   PlayerModel.find = () => ({
     lean: async () => [{
       epicUsername: 'SegTest', epicUsernameLower: 'segtest', epicId: 'e2', region: 'NAC',
-      totalPR: 733, thisSeasonPR: 91, lastUpdated: new Date(),
+      totalPR: 733, lastUpdated: new Date(),
       recentEvents: [
-        { name: 'FNCS Division 3', placement: 47, rosterSize: 2, elims: 9 },
-        { name: 'Solo Ranked Thing', placement: 3, rosterSize: 1, elims: 22 },
+        { name: 'FNCS Division 3', placement: 47, prPoints: 70, rosterSize: 2, elims: 9 },
+        { name: 'Solo Ranked Thing', placement: 3, prPoints: 200, rosterSize: 1, elims: 22 },
       ],
     }],
   });
   try {
     const result = await elo.getPublicElo('SegTest');
     const c = result.creative.components;
-    assert.equal(c.currentPR + c.seasonPR + c.soloPerformance, result.creative.score);
+    assert.equal('seasonPR' in c, false, 'the seasonPR segment must be gone entirely, not present as 0 — thisSeasonPR no longer contributes to the score at all');
+    assert.equal(c.currentPR + c.soloPerformance, result.creative.score);
 
     for (const t of result.tournaments) {
-      const sum = t.components.currentPR + t.components.seasonPR + t.components.soloPerformance + (t.components.ownTournamentPlacement ?? 0);
+      assert.equal('seasonPR' in t.components, false);
+      const sum = t.components.currentPR + t.components.soloPerformance + (t.components.ownTournamentPlacement ?? 0);
       assert.equal(sum, t.score, `segments for ${t.tournamentType} must sum exactly to its score`);
     }
   } finally {
@@ -137,25 +139,26 @@ test('elo.js: segments always sum exactly to the total score (no rounding gap fo
 // continuously-recomputed, decaying "Power Ranking" figure — confirmed live to be the exact number
 // the site headlines on a profile page — NOT a frozen career/lifetime total (that's a genuinely
 // different, separate field, data.powerRank.lifetimePR, never captured or used anywhere in this
-// codebase). components.currentPR (renamed from the misleading careerPR) must reflect that: the
-// old name is gone entirely, not just aliased alongside the new one.
-test('elo.js: the totalPR-derived component is named currentPR, not careerPR — "career" implies a frozen lifetime total, which is not what this figure is', async () => {
+// codebase). components.currentPR reflects that directly now: PR-native, no ×10 blend — a player's
+// currentPR component is now literally their raw totalPR, not totalPR*10.
+test('elo.js: components.currentPR is the player\'s raw totalPR directly — PR-native, no ×10 scaling', async () => {
   const original = PlayerModel.find;
   PlayerModel.find = () => ({
     lean: async () => [{
       epicUsername: 'NamingTest', epicUsernameLower: 'namingtest', epicId: 'eNaming', region: 'EU',
-      totalPR: 500, thisSeasonPR: 100, recentEvents: [], lastUpdated: new Date(),
+      totalPR: 500, recentEvents: [], lastUpdated: new Date(),
     }],
   });
   try {
     const result = await elo.getPublicElo('NamingTest');
 
-    assert.equal(result.creative.components.currentPR, 5000, 'currentPR = totalPR * 10, same formula as before, just renamed');
-    assert.equal('careerPR' in result.creative.components, false, 'the old misleading name must be completely gone, not left as a duplicate alias');
+    assert.equal(result.creative.components.currentPR, 500, 'currentPR is the raw totalPR now, genuinely PR-native — no ×10 blend');
+    assert.equal('careerPR' in result.creative.components, false);
+    assert.equal('seasonPR' in result.creative.components, false, 'thisSeasonPR no longer contributes to the score, so there\'s no seasonPR segment to show');
 
     for (const t of result.tournaments) {
       assert.equal('careerPR' in t.components, false, `${t.tournamentType} components must not have the old careerPR key either`);
-      assert.equal(t.components.currentPR, 5000);
+      assert.equal(t.components.currentPR, 500);
     }
   } finally {
     PlayerModel.find = original;
@@ -167,10 +170,10 @@ test('elo.js: a real linked player with history in SOME (not all) permanent tour
   PlayerModel.find = () => ({
     lean: async () => [{
       epicUsername: 'MixedHistory', epicUsernameLower: 'mixedhistory', epicId: 'e3', region: 'EU',
-      totalPR: 1200, thisSeasonPR: 300, lastUpdated: new Date(),
+      totalPR: 1200, lastUpdated: new Date(),
       recentEvents: [
-        { name: 'FNCS Division 1', placement: 8, rosterSize: 2, elims: 15 },
-        { name: 'FNCS Division 1', placement: 25, rosterSize: 2, elims: 10 },
+        { name: 'FNCS Division 1', placement: 8, prPoints: 150, rosterSize: 2, elims: 15 },
+        { name: 'FNCS Division 1', placement: 25, prPoints: 90, rosterSize: 2, elims: 10 },
         // no Console Duos Victory Cup history at all
       ],
     }],
@@ -309,17 +312,17 @@ test('elo.js: baseline is the PR-only score (no modifiers) — a player with NO 
   const original = PlayerModel.find;
   const player = {
     epicUsername: 'FlatPR', epicUsernameLower: 'flatpr', epicId: 'flat1', region: 'EU',
-    totalPR: 400, thisSeasonPR: 100, recentEvents: [], lastUpdated: new Date(),
+    totalPR: 400, recentEvents: [], lastUpdated: new Date(),
   };
   PlayerModel.find = stubPlayerFind([player]);
   try {
     const result = await elo.getPublicElo('FlatPR');
-    // base = totalPR*10 + thisSeasonPR*5 = 4000 + 500 = 4500, no solo/tournament history -> modifiers are 0.
-    assert.equal(result.creative.baseline, 4500);
-    assert.equal(result.creative.score, 4500, 'no recentEvents at all -> nothing to modify the baseline with');
+    // base = totalPR now (PR-native, no ×10/×5 blend), no solo/tournament history -> modifiers are 0.
+    assert.equal(result.creative.baseline, 400);
+    assert.equal(result.creative.score, 400, 'no recentEvents at all -> nothing to modify the baseline with');
     assert.equal(result.creative.vsBaselinePercent, 0);
     for (const t of result.tournaments) {
-      assert.equal(t.baseline, 4500);
+      assert.equal(t.baseline, 400);
       assert.equal(t.vsBaselinePercent, 0);
     }
   } finally {
@@ -331,25 +334,25 @@ test('elo.js: real recent history that raises soloModifier/ownTournamentModifier
   const original = PlayerModel.find;
   const player = {
     epicUsername: 'StrongRecent', epicUsernameLower: 'strongrecent', epicId: 'strong1', region: 'EU',
-    totalPR: 400, thisSeasonPR: 100, lastUpdated: new Date(),
+    totalPR: 400, lastUpdated: new Date(),
     recentEvents: [
-      // Strong solo results (top placement band + high elims) -> soloModifier > 0.
-      { name: 'Solo Cash Cup', placement: 1, rosterSize: 1, elims: 45 },
-      { name: 'Solo Cash Cup', placement: 2, rosterSize: 1, elims: 40 },
+      // Strong solo results (real decayed prPoints comfortably above 0) -> soloModifier > 0.
+      { name: 'Solo Cash Cup', placement: 1, prPoints: 180, rosterSize: 1, elims: 45 },
+      { name: 'Solo Cash Cup', placement: 2, prPoints: 150, rosterSize: 1, elims: 40 },
       // Strong own-tournament (FNCS Division) placement history -> ownTournamentModifier > 0.
-      { name: 'FNCS Division 2', placement: 1, rosterSize: 3, elims: 20 },
+      { name: 'FNCS Division 2', placement: 1, prPoints: 200, rosterSize: 3, elims: 20 },
     ],
   };
   PlayerModel.find = stubPlayerFind([player]);
   try {
     const result = await elo.getPublicElo('StrongRecent');
     const baseline = result.creative.baseline;
-    assert.equal(baseline, 4500);
+    assert.equal(baseline, 400);
 
     // Real formula (scraper.js computeMatchScoreBreakdown/computeOwnTournamentModifier) never
-    // produces a NEGATIVE soloModifier/ownTournamentModifier — getPlacementScore floors at 0 — so
-    // the only real directions are "at baseline" (0%) or "above baseline" (>0%), never below.
-    // Confirmed here rather than assumed: exercising this with strong (not just any) recent history.
+    // produces a NEGATIVE soloModifier/ownTournamentModifier — prPoints is never negative — so the
+    // only real directions are "at baseline" (0%) or "above baseline" (>0%), never below. Confirmed
+    // here rather than assumed: exercising this with strong (not just any) recent history.
     assert.ok(result.creative.score >= baseline, 'creative score must never fall below its own PR baseline given the real formula');
     assert.ok(result.creative.vsBaselinePercent > 0, 'strong solo history must show as performing ABOVE baseline');
     assert.equal(
@@ -370,10 +373,12 @@ test('elo.js: real recent history that raises soloModifier/ownTournamentModifier
 test('elo.js: percentile is computed against a real query over stored players — correctly ordered, top scorer near 99th, median near 50th, bottom near 0th (not inverted, not off-by-one)', async () => {
   const original = PlayerModel.find;
   // 101 real/seeded comparison players with totalPR 0..100 (unique, no history) — pure, predictable
-  // creative scores of totalPR*10 (0, 10, 20, ..., 1000).
+  // creative scores equal to totalPR itself now (PR-native, 0, 1, 2, ..., 100). Percentile ranking
+  // is scale-invariant either way (relative order is all that matters), so this test's real claim
+  // holds regardless of the formula's absolute scale.
   const pool = Array.from({ length: 101 }, (_, i) => ({
     epicUsername: `Filler${i}`, epicUsernameLower: `filler${i}`, epicId: `filler-${i}`, region: 'EU',
-    totalPR: i, thisSeasonPR: 0, recentEvents: [], lastUpdated: new Date(),
+    totalPR: i, recentEvents: [], lastUpdated: new Date(),
   }));
   PlayerModel.find = stubPlayerFind(pool);
   try {
@@ -431,8 +436,8 @@ test('elo.js: a player registered under multiple guilds only counts ONCE in the 
 // two-sided signal: this player's OWN vsBaselinePercent minus the SAME comparison pool's average.
 // Computed independently here (via the real computeMatchScoreBreakdown, not elo.js internals) so
 // this is a genuine cross-check, not just asserting elo.js agrees with itself.
-function expectedVsBaselinePercent(totalPR, thisSeasonPR, recentEvents) {
-  const { base, soloModifier } = computeMatchScoreBreakdown({ totalPR, thisSeasonPR, recentEvents }, '__never_matches__');
+function expectedVsBaselinePercent(totalPR, recentEvents) {
+  const { base, soloModifier } = computeMatchScoreBreakdown({ totalPR, recentEvents }, '__never_matches__');
   const baseline = Math.round(base);
   const total = Math.round(base * (1 + soloModifier));
   return Math.round(((total / baseline) - 1) * 1000) / 10;
@@ -440,20 +445,20 @@ function expectedVsBaselinePercent(totalPR, thisSeasonPR, recentEvents) {
 
 test('elo.js: relativeToAveragePercent is POSITIVE for a player whose bonus beats the pool average, even though vsBaselinePercent alone is never negative', async () => {
   const original = PlayerModel.find;
-  const flatA = { epicUsername: 'FlatA', epicUsernameLower: 'flata', epicId: 'flatA', totalPR: 300, thisSeasonPR: 0, recentEvents: [], lastUpdated: new Date() };
-  const flatB = { epicUsername: 'FlatB', epicUsernameLower: 'flatb', epicId: 'flatB', totalPR: 300, thisSeasonPR: 0, recentEvents: [], lastUpdated: new Date() };
+  const flatA = { epicUsername: 'FlatA', epicUsernameLower: 'flata', epicId: 'flatA', totalPR: 300, recentEvents: [], lastUpdated: new Date() };
+  const flatB = { epicUsername: 'FlatB', epicUsernameLower: 'flatb', epicId: 'flatB', totalPR: 300, recentEvents: [], lastUpdated: new Date() };
   const strong = {
-    epicUsername: 'StrongBonus', epicUsernameLower: 'strongbonus', epicId: 'strongBonus', totalPR: 100, thisSeasonPR: 0, lastUpdated: new Date(),
+    epicUsername: 'StrongBonus', epicUsernameLower: 'strongbonus', epicId: 'strongBonus', totalPR: 100, lastUpdated: new Date(),
     recentEvents: [
-      { name: 'Solo Cash Cup', placement: 1, rosterSize: 1, elims: 45 },
-      { name: 'Solo Cash Cup', placement: 1, rosterSize: 1, elims: 45 },
+      { name: 'Solo Cash Cup', placement: 1, prPoints: 90, rosterSize: 1, elims: 45 },
+      { name: 'Solo Cash Cup', placement: 1, prPoints: 90, rosterSize: 1, elims: 45 },
     ],
   };
   PlayerModel.find = stubPlayerFind([flatA, flatB, strong]);
   try {
     const result = await elo.getPublicElo('StrongBonus');
-    const strongPct = expectedVsBaselinePercent(strong.totalPR, strong.thisSeasonPR, strong.recentEvents);
-    const flatPct = expectedVsBaselinePercent(300, 0, []);
+    const strongPct = expectedVsBaselinePercent(strong.totalPR, strong.recentEvents);
+    const flatPct = expectedVsBaselinePercent(300, []);
     assert.equal(result.creative.vsBaselinePercent, strongPct);
     assert.ok(strongPct > 0, 'sanity check: this player DOES have a positive bonus over their own floor');
 
@@ -469,19 +474,20 @@ test('elo.js: relativeToAveragePercent is POSITIVE for a player whose bonus beat
 test('elo.js: relativeToAveragePercent is NEGATIVE for a player whose bonus is smaller than the pool average — the genuine below-average case vsBaselinePercent alone cannot express', async () => {
   const original = PlayerModel.find;
   const strongEvents = [
-    { name: 'Solo Cash Cup', placement: 1, rosterSize: 1, elims: 45 },
-    { name: 'Solo Cash Cup', placement: 1, rosterSize: 1, elims: 45 },
+    { name: 'Solo Cash Cup', placement: 1, prPoints: 90, rosterSize: 1, elims: 45 },
+    { name: 'Solo Cash Cup', placement: 1, prPoints: 90, rosterSize: 1, elims: 45 },
   ];
-  const strongA = { epicUsername: 'PeerA', epicUsernameLower: 'peera', epicId: 'peerA', totalPR: 100, thisSeasonPR: 0, recentEvents: strongEvents, lastUpdated: new Date() };
-  const strongB = { epicUsername: 'PeerB', epicUsernameLower: 'peerb', epicId: 'peerB', totalPR: 100, thisSeasonPR: 0, recentEvents: strongEvents, lastUpdated: new Date() };
-  // A real, but comparatively weak, bonus — still >= 0 on its own (mid-tier placement, no elims).
-  const weakEvents = [{ name: 'Solo Cash Cup', placement: 1000, rosterSize: 1, elims: 0 }];
-  const weak = { epicUsername: 'WeakBonus', epicUsernameLower: 'weakbonus', epicId: 'weakBonus', totalPR: 100, thisSeasonPR: 0, recentEvents: weakEvents, lastUpdated: new Date() };
+  const strongA = { epicUsername: 'PeerA', epicUsernameLower: 'peera', epicId: 'peerA', totalPR: 100, recentEvents: strongEvents, lastUpdated: new Date() };
+  const strongB = { epicUsername: 'PeerB', epicUsernameLower: 'peerb', epicId: 'peerB', totalPR: 100, recentEvents: strongEvents, lastUpdated: new Date() };
+  // A real, but comparatively weak, bonus — still >= 0 on its own (a small nonzero decayed prPoints
+  // value, not the strong peers' 90).
+  const weakEvents = [{ name: 'Solo Cash Cup', placement: 1000, prPoints: 5, rosterSize: 1, elims: 0 }];
+  const weak = { epicUsername: 'WeakBonus', epicUsernameLower: 'weakbonus', epicId: 'weakBonus', totalPR: 100, recentEvents: weakEvents, lastUpdated: new Date() };
   PlayerModel.find = stubPlayerFind([strongA, strongB, weak]);
   try {
     const result = await elo.getPublicElo('WeakBonus');
-    const weakPct = expectedVsBaselinePercent(100, 0, weakEvents);
-    const strongPct = expectedVsBaselinePercent(100, 0, strongEvents);
+    const weakPct = expectedVsBaselinePercent(100, weakEvents);
+    const strongPct = expectedVsBaselinePercent(100, strongEvents);
     assert.ok(weakPct >= 0, 'sanity check: this player is still AT OR ABOVE their own floor, never below it');
     assert.ok(weakPct < strongPct, 'sanity check: genuinely the weakest bonus of the three');
 
@@ -499,10 +505,10 @@ test('elo.js: relativeToAveragePercent is computed per tournament type from that
   // Two peers with real FNCS Division placement history (raises their FNCS bonus specifically,
   // not their creative bonus) — the target has none, so their FNCS relativeToAveragePercent must
   // come out negative even if their creative one (compared only against flat creative peers) does not.
-  const fncsHistory = [{ name: 'FNCS Division 2', placement: 1, rosterSize: 3, elims: 0 }];
-  const peerA = { epicUsername: 'FncsPeerA', epicUsernameLower: 'fncspeera', epicId: 'fncsPeerA', totalPR: 100, thisSeasonPR: 0, recentEvents: fncsHistory, lastUpdated: new Date() };
-  const peerB = { epicUsername: 'FncsPeerB', epicUsernameLower: 'fncspeerb', epicId: 'fncsPeerB', totalPR: 100, thisSeasonPR: 0, recentEvents: fncsHistory, lastUpdated: new Date() };
-  const noHistory = { epicUsername: 'NoFncsHistory', epicUsernameLower: 'nofncshistory', epicId: 'noFncsHistory', totalPR: 100, thisSeasonPR: 0, recentEvents: [], lastUpdated: new Date() };
+  const fncsHistory = [{ name: 'FNCS Division 2', placement: 1, prPoints: 90, rosterSize: 3, elims: 0 }];
+  const peerA = { epicUsername: 'FncsPeerA', epicUsernameLower: 'fncspeera', epicId: 'fncsPeerA', totalPR: 100, recentEvents: fncsHistory, lastUpdated: new Date() };
+  const peerB = { epicUsername: 'FncsPeerB', epicUsernameLower: 'fncspeerb', epicId: 'fncsPeerB', totalPR: 100, recentEvents: fncsHistory, lastUpdated: new Date() };
+  const noHistory = { epicUsername: 'NoFncsHistory', epicUsernameLower: 'nofncshistory', epicId: 'noFncsHistory', totalPR: 100, recentEvents: [], lastUpdated: new Date() };
   PlayerModel.find = stubPlayerFind([peerA, peerB, noHistory]);
   try {
     const result = await elo.getPublicElo('NoFncsHistory');

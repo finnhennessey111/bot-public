@@ -4,11 +4,22 @@ module.exports = {
   token: process.env.DISCORD_TOKEN,
 
   // Soft PR-distance penalty — inflates the ranking diff (not eligibility) for candidates
-  // further apart in Total PR, so closer matches are still preferred once both are eligible.
+  // further apart in raw Total PR, so closer matches are still preferred once both are eligible.
+  // Distinct from tournamentWideningSchedule/creativeWideningSchedule below (which gate
+  // ELIGIBILITY via logPR distance) — this only runs in queue.js's rankingDiff, which is exclusively
+  // used to pick the best match AMONG candidates that already passed that eligibility gate. It
+  // exists specifically to stop a modifier-inflated matchScore (soloModifier/ownTournamentModifier
+  // can make two very-different-raw-PR players look deceptively close on matchScore alone) from
+  // winning a tie-break it shouldn't — confirmed via investigation this is a genuinely distinct
+  // purpose from the logPR eligibility gate, not a redundant leftover, so it was rescaled rather
+  // than removed when the score formula went PR-native (queue.js's rankingDiff.js was previously
+  // tuned against the old ~10-15x-scaled matchScore magnitude). 100/350 are real target values, not
+  // a back-calculated rescale; 225/0.20 preserves the original table's shape (an interpolated
+  // midpoint at half the max penalty) rather than jumping straight from 0 to 0.40.
   prDistancePenalties: [
-    { maxDiff: 150, scorePenalty: 0 },
-    { maxDiff: 300, scorePenalty: 0.20 },
-    { maxDiff: Infinity, scorePenalty: 0.40 },
+    { maxDiff: 100, scorePenalty: 0 },
+    { maxDiff: 225, scorePenalty: 0.20 },
+    { maxDiff: 350, scorePenalty: 0.40 },
   ],
 
   matchSweepIntervalSeconds: 15,
@@ -47,18 +58,6 @@ module.exports = {
     teamMethodVoteSeconds: 60,
     teamChoiceSeconds: 60,
   },
-
-  // Placement score conversion — bounded 0-100 scale. Worst possible placement in any
-  // tournament is #10,000 (confirmed), so this is fully bounded rather than open-ended; bands
-  // are calibrated against the actual player base, where top-10/top-50 finishes essentially
-  // never happen.
-  placementScores: [
-    { threshold: 300,   score: 100 },
-    { threshold: 1000,  score: 70  },
-    { threshold: 2000,  score: 40  },
-    { threshold: 5000,  score: 15  },
-    { threshold: 10000, score: 5   },
-  ],
 
   // Channel lifecycle
   channelCreateHoursBefore: 24,  // midday day before = ~24hrs

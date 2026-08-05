@@ -11,7 +11,6 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const epicApi = require('../epic-api');
-const { getPlacementScore } = require('../scraper');
 
 function withStubbedFetchJson(responses, fn) {
   const original = epicApi.fetchJson;
@@ -252,18 +251,20 @@ test('getEpicOwnTournamentModifier: end-to-end against the real shape — resolv
     // tournament deliberately has NO eventId — proves the real eventId comes from Epic's own
     // freshly-resolved regionEntry, not from anything the caller supplied.
     const tournament = { name: 'PlayStation Typical Gamer Icon Cup', region: 'EU' };
-    const result = await epicApi.getEpicOwnTournamentModifier(tournament, 'myaccount', { getPlacementScore });
+    const result = await epicApi.getEpicOwnTournamentModifier(tournament, 'myaccount', 500);
 
     assert.ok(result);
     assert.equal(result.source, 'epic');
     assert.equal(result.matchedWindows[0].eventWindowId, 'S41_PSTypicalGamer_ZB_Qualifier_EU');
-    assert.equal(result.modifier, getPlacementScore(250) / 100 * 0.30);
+    // PR-native: pointsEarned (400) as a fraction of currentPR (500), not a placement-bucket score.
+    assert.equal(result.modifier, (400 / 500) * 0.30);
   });
 });
 
-test('getEpicOwnTournamentModifier: returns null (not a throw) when name or region is missing', async () => {
-  assert.equal(await epicApi.getEpicOwnTournamentModifier({ name: 'X' }, 'acc', { getPlacementScore }), null);
-  assert.equal(await epicApi.getEpicOwnTournamentModifier({ region: 'EU' }, 'acc', { getPlacementScore }), null);
+test('getEpicOwnTournamentModifier: returns null (not a throw) when name, region, or currentPR is missing/zero', async () => {
+  assert.equal(await epicApi.getEpicOwnTournamentModifier({ name: 'X' }, 'acc', 500), null);
+  assert.equal(await epicApi.getEpicOwnTournamentModifier({ region: 'EU' }, 'acc', 500), null);
+  assert.equal(await epicApi.getEpicOwnTournamentModifier({ name: 'X', region: 'EU' }, 'acc', 0), null);
 });
 
 test('getEpicOwnTournamentModifier: returns null when no calendar entry matches by name', async () => {
@@ -272,7 +273,7 @@ test('getEpicOwnTournamentModifier: returns null when no calendar entry matches 
     '/api/v1/events/global/history': [],
   }, async () => {
     const tournament = { name: 'Totally Unknown Cup', region: 'EU' };
-    const result = await epicApi.getEpicOwnTournamentModifier(tournament, 'myaccount', { getPlacementScore });
+    const result = await epicApi.getEpicOwnTournamentModifier(tournament, 'myaccount', 500);
     assert.equal(result, null);
   });
 });
@@ -283,7 +284,7 @@ test('getEpicOwnTournamentModifier: returns null when the tournament isn\'t offe
     '/api/v1/events/global/history': [],
   }, async () => {
     const tournament = { name: 'PlayStation Typical Gamer Icon Cup', region: 'OCE' };
-    const result = await epicApi.getEpicOwnTournamentModifier(tournament, 'myaccount', { getPlacementScore });
+    const result = await epicApi.getEpicOwnTournamentModifier(tournament, 'myaccount', 500);
     assert.equal(result, null);
   });
 });
