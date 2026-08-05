@@ -65,11 +65,18 @@ const verifiedChannels = [
 // members (not even after they progress through the ladder above).
 const MOD_ONLY_CHANNEL_KEYS = ['setup'];
 
+// err.code/err.status are DiscordAPIError's own fields (@discordjs/rest) — Discord's actual REST
+// response for a permission failure (code 50013) never says WHICH permission is missing (confirmed
+// by reading DiscordAPIError.getMessage() in @discordjs/rest: it only ever flattens error.errors,
+// a field-validation structure Discord doesn't populate for a blanket permission check), so
+// err.message alone is always just "Missing Permissions" — logging code/status at least confirms
+// it's genuinely a 403/50013 (not some other failure mode surfacing similar-looking text) without
+// pretending to know more than Discord's response actually contains.
 async function editOverwrite(channel, targetId, permissions, label) {
   try {
     await channel.permissionOverwrites.edit(targetId, permissions);
   } catch (err) {
-    console.error(`  ⚠️ Failed to set overwrite on #${channel.name} for ${label}:`, err.message);
+    console.error(`  ⚠️ Failed to set overwrite on #${channel.name} for ${label}: [${err.code ?? '?'}/${err.status ?? '?'}] ${err.message}`);
   }
 }
 
@@ -78,20 +85,44 @@ async function editOverwrite(channel, targetId, permissions, label) {
 // guild-wide allow) to still see in — never guaranteed on a freshly-invited "new server", where
 // the invite may not have granted Administrator. Without this, the bot can end up unable to see
 // its own creative-queue/setup channels the moment enforcePermissions denies @everyone there.
+//
+// EmbedLinks/CreatePublicThreads/SendMessagesInThreads added after a real production incident:
+// every one of the 9 tournament forums has @everyone's EmbedLinks explicitly DENIED
+// (enforceTournamentForumChannels below), and this overwrite used to be completely silent on that
+// bit for the bot itself — a member-specific overwrite only overrides the exact permissions it
+// sets; anything it doesn't mention falls through to the role-level result (here, @everyone's
+// explicit deny), so the bot's own tournament-post messages (which always include an embed —
+// channel-manager.js's createTournamentChannel) were being sent into a channel where the bot
+// itself had EmbedLinks denied. This is a genuine, code-confirmed gap, not the same thing as
+// (though possibly compounding) the separate open question of whether forum-post creation also
+// needs CreatePublicThreads/SendMessagesInThreads as a Discord-side requirement distinct from
+// SendMessages — both are granted here now since there's no downside to the bot holding permissions
+// it turns out not to strictly need, only to it lacking one it does.
 async function grantBotAccess(guild, channel) {
   const botMember = guild.members.me;
   if (!botMember) return;
-  await editOverwrite(channel, botMember, { ViewChannel: true, SendMessages: true }, 'bot');
+  await editOverwrite(channel, botMember, {
+    ViewChannel: true, SendMessages: true, EmbedLinks: true,
+    CreatePublicThreads: true, SendMessagesInThreads: true,
+  }, 'bot');
 }
 
 // Permission-overwrite object for guild.channels.create's permissionOverwrites array — grants the
-// bot explicit ViewChannel/SendMessages at creation time itself, rather than relying on a later
-// enforcePermissions() pass (or grantBotAccess above) to add it. Needed for channels like the
-// creative queue ones that matchmaker-setup.js creates with a restrictive default (e.g. no parent
-// category to inherit from, or a guild where @everyone's base permissions deny ViewChannel) — the
-// bot could otherwise be unable to see/post in a channel it just created.
+// bot explicit ViewChannel/SendMessages/EmbedLinks/thread-creation at creation time itself, rather
+// than relying on a later enforcePermissions() pass (or grantBotAccess above) to add it. Needed for
+// channels like the creative queue ones that matchmaker-setup.js creates with a restrictive default
+// (e.g. no parent category to inherit from, or a guild where @everyone's base permissions deny
+// ViewChannel) — the bot could otherwise be unable to see/post in a channel it just created. Same
+// permission set as grantBotAccess above, kept in sync deliberately — see that function's doc
+// comment for why EmbedLinks/thread permissions are included.
 function botAccessOverwrite(guild) {
-  return { id: guild.members.me.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages] };
+  return {
+    id: guild.members.me.id,
+    allow: [
+      PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.EmbedLinks,
+      PermissionFlagsBits.CreatePublicThreads, PermissionFlagsBits.SendMessagesInThreads,
+    ],
+  };
 }
 
 async function lockGuildBasePermissions(guild) {

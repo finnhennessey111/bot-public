@@ -1,6 +1,6 @@
 // channel-manager.js - Automated tournament channel creation and deletion
 
-const { ThreadAutoArchiveDuration } = require('discord.js');
+const { ThreadAutoArchiveDuration, PermissionFlagsBits } = require('discord.js');
 const { scrapeUpcomingTournaments, isBareBuildModeLabel, isRankedCupTitle } = require('./tournament-scraper');
 const { savePinnedMessages } = require('./store');
 const { buildTournamentEmbed, buildRankedCupTournamentEmbed, buildRankedCupQueueButtons, rankedCupPoolName, RANK_TIERS } = require('./embeds');
@@ -391,7 +391,24 @@ async function createTournamentChannel(guild, tournament, pinnedMessages) {
     }
 
   } catch (err) {
-    console.error(`  ❌ Failed to create forum post ${channelName}:`, err.message);
+    // err.code/err.status are DiscordAPIError's own fields — logged in addition to err.message
+    // since Discord's actual 403/50013 response body never says WHICH permission is missing
+    // (confirmed via @discordjs/rest's DiscordAPIError source: it only ever flattens
+    // error.errors, a field-validation structure Discord doesn't populate for a blanket
+    // permission check). To get real specificity instead of guessing, diff the bot's resolved
+    // permissions on this forum against what forum-post creation needs and log exactly what's
+    // absent — permissions.js's grantBotAccess/enforceTournamentForumChannels should already grant
+    // all of these, so seeing this fire in production means that self-heal pass hasn't run yet or
+    // failed, not that the required permission set itself is wrong.
+    console.error(`  ❌ Failed to create forum post ${channelName}: [${err.code ?? '?'}/${err.status ?? '?'}] ${err.message}`);
+    const botMember = guild.members.me;
+    if (botMember && forum) {
+      const missing = forum.permissionsFor(botMember)?.missing([
+        PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.EmbedLinks,
+        PermissionFlagsBits.CreatePublicThreads, PermissionFlagsBits.SendMessagesInThreads,
+      ]) ?? [];
+      if (missing.length) console.error(`     Missing on #${forum.name}: ${missing.join(', ')}`);
+    }
   }
 }
 
