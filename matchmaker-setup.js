@@ -65,8 +65,18 @@ const CATEGORY_SPECS = [
   // channel's own per-creation overwrite instead), so any channel placed under it inherits bot
   // access automatically instead of needing enforcePermissions to patch it in after the fact.
   { key: 'creative', name: 'Creative' },
-  // Parent for the 9 tournament forums (TOURNAMENT_FORUM_SPECS/ensureTournamentForums below).
-  { key: 'tournaments', name: 'Tournaments' },
+  // Parents for the 9 tournament forums (TOURNAMENT_FORUM_SPECS/ensureTournamentForums below) —
+  // one category per region (3 build-mode forums each), replacing the earlier single shared
+  // "Tournaments" category that held all 9 flat. Matches how the pre-forums channel system used to
+  // visually organize by region. A guild that already has the old single category (from before this
+  // shipped) gets migrated automatically — see guild-config.js's channelIds.tournamentForum_*
+  // migration, which now also ensures these 3 categories exist and reparents any already-existing
+  // forums into the correct one. The old category itself is never deleted (same "never delete what
+  // a mod might have touched" precedent as everywhere else in this file) — it's simply left behind,
+  // empty, once its 9 children have moved out.
+  { key: 'tournaments_EU', name: 'EU Tournaments' },
+  { key: 'tournaments_NAC', name: 'NAC Tournaments' },
+  { key: 'tournaments_ME', name: 'ME Tournaments' },
 ];
 
 const CHANNEL_SPECS = [
@@ -187,10 +197,18 @@ async function ensureChannel(guild, existingChannelIds, spec, { parentId, parent
   return created.id;
 }
 
-// Fetch-or-create all 9 region×build-mode forums, parented under the Tournaments category. Each
-// forum is independently idempotent (same fetch-existing-by-id-else-create pattern as
-// ensureChannel/ensureCategory above) — a partial prior run that only got through some of the 9
-// resumes correctly, same "nothing duplicated on retry" guarantee the rest of setup already has.
+// Fetch-or-create all 9 region×build-mode forums, each parented under ITS OWN region's category
+// (categoryIdsByRegion — {EU: id, NAC: id, ME: id}, see CATEGORY_SPECS above). Each forum is
+// independently idempotent (same fetch-existing-by-id-else-create pattern as ensureChannel/
+// ensureCategory above) — a partial prior run that only got through some of the 9 resumes
+// correctly, same "nothing duplicated on retry" guarantee the rest of setup already has. For an
+// EXISTING forum (found by its stored id) whose current parent isn't yet its region's category —
+// e.g. one still sitting under the old single shared "Tournaments" category from before this
+// restructure — ensureChannelParent reparents it in place. This is the ONLY mechanism that moves an
+// existing forum: nothing here ever deletes or recreates a forum channel, so every post/thread
+// already inside it is completely unaffected (a thread's parent is the forum channel itself, not
+// the category, so moving the forum to a new category carries its threads along automatically,
+// Discord-side, with zero API calls needed for the threads themselves).
 //
 // No tags here at all (unlike the earlier single-shared-forum design this replaces) — region AND
 // build-mode are now both expressed by WHICH of the 9 forums a post lives in, the same way region
@@ -205,18 +223,20 @@ async function ensureChannel(guild, existingChannelIds, spec, { parentId, parent
 // GuildForumThreadManager#create's options don't accept permissionOverwrites either). The forum
 // CHANNEL's own overwrites are what every post inherits — permissions.js's enforcePermissions
 // (called right after this, at the end of runMatchmakerSetup, and again on every bot startup) sets
-// them on all 9, same as every other managed channel.
-async function ensureTournamentForums(guild, existingChannelIds, categoryId) {
+// them on all 9, same as every other managed channel. Reparenting a channel never touches its own
+// overwrites either way (setParent's lockPermissions:false below is exactly what prevents that).
+async function ensureTournamentForums(guild, existingChannelIds, categoryIdsByRegion) {
   const channelIds = {};
 
   for (const spec of TOURNAMENT_FORUM_SPECS) {
+    const categoryId = categoryIdsByRegion?.[spec.region] ?? null;
     const existingId = existingChannelIds[spec.key];
     let channel = existingId ? await guild.channels.fetch(existingId).catch(() => null) : null;
 
     if (!channel) {
-      channel = await guild.channels.create({ name: spec.name, type: ChannelType.GuildForum, parent: categoryId ?? null });
+      channel = await guild.channels.create({ name: spec.name, type: ChannelType.GuildForum, parent: categoryId });
     } else {
-      await ensureChannelParent(channel, categoryId, 'Tournaments');
+      await ensureChannelParent(channel, categoryId, `${spec.region} Tournaments`);
     }
 
     channelIds[spec.key] = channel.id;
@@ -352,7 +372,9 @@ async function runMatchmakerSetup(guild) {
         channelIds[spec.key] = await ensureChannel(guild, config.channelIds, spec, { parentId, parentLabel: 'MatchMaker' });
       }
 
-      const tournamentForumIds = await ensureTournamentForums(guild, config.channelIds, categoryIds.tournaments);
+      const tournamentForumIds = await ensureTournamentForums(guild, config.channelIds, {
+        EU: categoryIds.tournaments_EU, NAC: categoryIds.tournaments_NAC, ME: categoryIds.tournaments_ME,
+      });
       Object.assign(channelIds, tournamentForumIds);
       await setGuildConfig(guild.id, { channelIds });
 
@@ -481,11 +503,12 @@ async function refreshAllSetupEmbeds(client) {
 module.exports = {
   runMatchmakerSetup,
   refreshAllSetupEmbeds,
-  // ensureTournamentForums: called directly by guild-config.js's self-heal migration (a guild
-  // missing any of the 9 tournament forums shouldn't need a full /matchmaker-setup re-run just to
-  // get them) — see that migration's own doc comment for why it's a deferred require rather than a
-  // top-level one.
+  // ensureTournamentForums/ensureCategory: called directly by guild-config.js's self-heal migration
+  // (a guild missing any of the 9 tournament forums, or the 3 region categories, shouldn't need a
+  // full /matchmaker-setup re-run just to get them) — see that migration's own doc comment for why
+  // it's a deferred require rather than a top-level one.
   ensureTournamentForums,
+  ensureCategory,
   // Specs exported for testing (e.g. a regression guard confirming no "general" text/voice
   // channel is ever added back) — runMatchmakerSetup itself needs a live Discord guild object to
   // exercise, so asserting against these directly is how that's verified without one.

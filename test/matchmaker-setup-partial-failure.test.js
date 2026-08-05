@@ -160,8 +160,11 @@ test('matchmaker-setup: roles/categories/channels created before a partial failu
 
     const saved = getCurrent();
     assert.equal(Object.keys(saved.roleIds).length, 11, 'all 11 roles should be saved even though the run failed later');
-    assert.ok(saved.categoryIds.matchmaker && saved.categoryIds.creative && saved.categoryIds.tournaments,
-      'all 3 categories should be saved even though the run failed later');
+    assert.ok(
+      saved.categoryIds.matchmaker && saved.categoryIds.creative
+      && saved.categoryIds.tournaments_EU && saved.categoryIds.tournaments_NAC && saved.categoryIds.tournaments_ME,
+      'all 5 categories (matchmaker, creative, 3 region tournament categories) should be saved even though the run failed later'
+    );
     assert.ok(saved.channelIds.register && saved.channelIds.getRoles && saved.channelIds.howto,
       'channels created before the failing #setup embed post should be saved');
     assert.ok(

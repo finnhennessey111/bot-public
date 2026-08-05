@@ -696,6 +696,29 @@ async function runTournamentCheckTick(client, pinnedMessages) {
   await tournamentApproval.expirePendingApprovals(client).catch(err => console.error('[tournament-approval] Failed to sweep expired approvals:', err.message));
 }
 
+// Single-guild version of runTournamentCheckTick's core (scrape -> gate -> checkAndCreateChannels)
+// above — same composition, same approval gate (no bypass), just scoped to ONE guild and run
+// immediately instead of waiting for the next scheduled tick (up to TOURNAMENT_CHECK_INTERVAL_MS,
+// 4h, away). Without this, a guild had no posts for any currently-approved tournament until the
+// next tick happened to run — confirmed via a real live test (a brand-new server showed nothing at
+// all, even with tournaments already approved and live elsewhere) — even though
+// tournamentApproval.gateTournaments already re-includes every still-'approved' record on EVERY
+// tick regardless of per-guild state (the persistent record genuinely does drive this correctly;
+// the gap was purely "wait for the next tick", not a logic bug in the gate itself).
+//
+// Called from index.js: once when the bot joins a new guild (client.on('guildCreate', ...)) and
+// once right after /matchmaker-setup finishes for a guild (the realistic common case — a brand new
+// guild has nowhere to post into until setup creates the 9 forums, so catching up on join alone
+// would usually find no forum configured yet and no-op; catching up again right after setup is what
+// actually populates them immediately). Safe to call before setup has run at all —
+// createTournamentChannel already logs-and-skips per tournament when a guild has no forum
+// configured for a given region/build-mode combo yet, it doesn't throw.
+async function catchUpTournamentsForGuild(client, guild, pinnedMessages) {
+  const tournaments = await scrapeUpcomingTournaments();
+  const approvedTournaments = await tournamentApproval.gateTournaments(client, tournaments, pinnedMessages);
+  await checkAndCreateChannels(guild, approvedTournaments, pinnedMessages);
+}
+
 // Scrapes at most once per tick, and only if at least one guild actually has a pinned entry
 // needing beginTime backfill (checked across the whole global pinnedMessages, not per guild) —
 // so N guilds all needing backfill in the same tick still costs one scrape, not N. A
@@ -760,7 +783,7 @@ function startScheduler(client, pinnedMessages) {
 module.exports = {
   startScheduler, checkAndCreateChannels, managedChannels, buildChannelName, abbreviateBuildMode,
   createTournamentChannel, createTournamentChannelsAcrossGuilds, CHANNEL_DELETE_BUFFER_MS,
-  updateActiveTournamentEmbeds, TOURNAMENT_CHECK_INTERVAL_MS,
+  updateActiveTournamentEmbeds, TOURNAMENT_CHECK_INTERVAL_MS, catchUpTournamentsForGuild,
   // Exported for testability (same precedent as buildChannelName/abbreviateBuildMode above) — the
   // forum-post migration's #5 item specifically asked to verify this deletion path works with
   // ThreadChannel.delete() the same way it always did with a normal channel's.

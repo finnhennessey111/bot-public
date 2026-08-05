@@ -95,32 +95,48 @@ const GUILD_CONFIG_MIGRATIONS = [
     },
   },
   {
-    // 9-forum tournament channel migration — a guild that ran /matchmaker-setup before this
-    // shipped is missing one or more of the 9 region×build-mode tournament forums (or, for a guild
-    // that only ever saw the earlier single-shared-forum design, all 9 of them). Self-heals it
-    // here (same precedent as roleIds.verified above) so channel-manager.js's
-    // createTournamentChannel always has somewhere to post without every existing server needing
-    // an admin to manually re-run setup. The earlier single shared "tournaments" forum (and its
-    // channelIds.tournamentForum / tagIds config, if this guild has them) is left completely
-    // untouched — not deleted, not migrated — any post already inside it keeps working exactly as
-    // before via the same generic thread-handling code (creation only routes into a DIFFERENT
-    // forum going forward for genuinely new tournaments, it doesn't move existing ones).
-    name: 'channelIds.tournamentForum_* (9 region×build-mode forums)',
-    isMissing: (config) => require('./matchmaker-setup').TOURNAMENT_FORUM_SPECS.some(spec => !config.channelIds?.[spec.key]),
+    // 9-forum tournament channel + 3-region-category migration — a guild that ran
+    // /matchmaker-setup before this shipped is missing one or more of the 9 region×build-mode
+    // tournament forums (or, for a guild that only ever saw the earlier single-shared-forum
+    // design, all 9 of them), and/or is missing one or more of the 3 region categories (EU/NAC/ME
+    // Tournaments) those forums should each be parented under — including a guild that already has
+    // all 9 forums, just still sitting under the OLD single shared "Tournaments" category from
+    // before this restructure. Self-heals both here (same precedent as roleIds.verified above) so
+    // every existing server gets migrated automatically at the bot's next startup, not only if an
+    // admin happens to re-run /matchmaker-setup. The old single "Tournaments" category itself (and
+    // the earlier-still single shared forum/tagIds config, if this guild has them from even before
+    // that) is left completely untouched — not deleted — it's simply left behind, empty, once its
+    // children have moved out; ensureTournamentForums' own doc comment covers why reparenting an
+    // existing forum never touches any post/thread already inside it.
+    name: 'channelIds.tournamentForum_* (9 forums) + categoryIds.tournaments_{EU,NAC,ME} (3 region categories)',
+    isMissing: (config) => {
+      const { TOURNAMENT_FORUM_SPECS } = require('./matchmaker-setup');
+      const missingForum = TOURNAMENT_FORUM_SPECS.some(spec => !config.channelIds?.[spec.key]);
+      const missingCategory = ['EU', 'NAC', 'ME'].some(region => !config.categoryIds?.[`tournaments_${region}`]);
+      return missingForum || missingCategory;
+    },
     apply: async (guild) => {
       // Deferred require: matchmaker-setup.js requires guild-config.js at the top level, so
       // requiring it back at module load here would be a real circular require — only
-      // ensureTournamentForums/TOURNAMENT_FORUM_SPECS are needed, and only once this migration
-      // actually runs (isMissing above also uses the deferred form for the same reason).
-      const { ensureTournamentForums } = require('./matchmaker-setup');
+      // ensureCategory/ensureTournamentForums/TOURNAMENT_FORUM_SPECS are needed, and only once this
+      // migration actually runs (isMissing above also uses the deferred form for the same reason).
+      const { ensureCategory, ensureTournamentForums } = require('./matchmaker-setup');
       const config = getGuildConfig(guild.id);
-      // Reuses whichever category the guild already has (e.g. from a prior /matchmaker-setup run)
-      // — falls back to no parent (root) if this guild has never run setup with the Tournaments
-      // category at all; the next real /matchmaker-setup run reparents them once it creates it.
-      const categoryId = config.categoryIds?.tournaments ?? null;
-      const forumChannelIds = await ensureTournamentForums(guild, config.channelIds, categoryId);
+
+      const categoryIds = { ...config.categoryIds };
+      for (const region of ['EU', 'NAC', 'ME']) {
+        const key = `tournaments_${region}`;
+        if (!categoryIds[key]) {
+          categoryIds[key] = await ensureCategory(guild, config.categoryIds, { key, name: `${region} Tournaments` });
+        }
+      }
+      await setGuildConfig(guild.id, { categoryIds });
+
+      const forumChannelIds = await ensureTournamentForums(guild, config.channelIds, {
+        EU: categoryIds.tournaments_EU, NAC: categoryIds.tournaments_NAC, ME: categoryIds.tournaments_ME,
+      });
       await setGuildConfig(guild.id, { channelIds: forumChannelIds });
-      return `created ${Object.keys(forumChannelIds).length} tournament forum(s)`;
+      return `ensured 3 region categories, created/reparented ${Object.keys(forumChannelIds).length} tournament forum(s)`;
     },
   },
 ];
@@ -250,4 +266,9 @@ module.exports = {
   getTagId,
   getCreativeChannelInfo,
   setGuildConfig,
+  // Exported for testing (same precedent as matchmaker-setup.js's TOURNAMENT_FORUM_SPECS/
+  // channel-manager.js's deleteManagedChannel) — runs every self-heal migration against every
+  // guild the given client is currently in, without needing to go through the full init()
+  // startup path (seedLegacyGuildFromEnv, etc.) that isn't what these tests are about.
+  runGuildConfigMigrations,
 };

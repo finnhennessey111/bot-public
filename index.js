@@ -21,8 +21,8 @@ const { createMatchChannelsForMatch } = require('./match-channels');
 // name for arrays of built player objects, which would otherwise shadow this module import.
 const playerStore = require('./players');
 const epicOAuth = require('./epic-oauth');
-const { startScheduler, checkAndCreateChannels, createTournamentChannelsAcrossGuilds } = require('./channel-manager');
-const { scrapeUpcomingTournaments, isRankedCupTitle } = require('./tournament-scraper');
+const { startScheduler, createTournamentChannelsAcrossGuilds, catchUpTournamentsForGuild } = require('./channel-manager');
+const { isRankedCupTitle } = require('./tournament-scraper');
 const tournamentApproval = require('./tournament-approval');
 const channelDeletionUndo = require('./channel-deletion-undo');
 const { markSelfDeletion } = require('./self-deletion-tracker');
@@ -586,6 +586,16 @@ client.once('clientReady', async () => {
 // backfilling config for guilds already joined at startup, without sending a DM for those.
 client.on('guildCreate', guild => guildConfig.handleNewGuild(guild).catch(console.error));
 
+// Immediate catch-up on every currently-approved, still-relevant tournament — without this, a
+// brand-new guild had nothing until the next scheduled tick (up to 4h away), even with tournaments
+// already approved and live in other servers (confirmed via a real test). Safe to call before this
+// guild has run /matchmaker-setup at all — catchUpTournamentsForGuild's own createTournamentChannel
+// calls just log-and-skip per tournament when no forum is configured yet for a region/build-mode
+// combo, rather than throwing. The more realistic case for a genuinely brand-new guild — nowhere to
+// post into until setup actually creates the 9 forums — is covered separately, right after
+// /matchmaker-setup finishes below.
+client.on('guildCreate', guild => catchUpTournamentsForGuild(client, guild, pinnedMessages).catch(console.error));
+
 // ── MOD ROLE GRANT GUARD ────────────────────────────────────────────────────────
 // The only sanctioned ways to hold the MatchMaker Mod role are /grant-mod (owner-only — see the
 // interaction handler above) or a server Administrator assigning it by hand in Discord. Anyone
@@ -868,14 +878,14 @@ async function handleInteraction(interaction) {
         return interaction.reply({ content: '❌ This command is restricted to the MatchMaker Mod role.', flags: 64 });
       }
       await interaction.reply({ content: '🔍 Checking tournaments in background... check #master-tournaments shortly.', flags: 64 });
-      scrapeUpcomingTournaments()
-        // Same approval gate the scheduled tick uses (channel-manager.js's runTournamentCheckTick)
-        // — a brand-new tournament still gets DMed for approval here, not created immediately,
-        // even though this command is guild-scoped (the gate itself is global, see
-        // tournament-approval.js's doc comment on why it can't run per-guild).
-        .then(tournaments => tournamentApproval.gateTournaments(client, tournaments, pinnedMessages))
-        .then(approvedTournaments => checkAndCreateChannels(interaction.guild, approvedTournaments, pinnedMessages))
-        .catch(console.error);
+      // Same approval gate the scheduled tick uses (channel-manager.js's runTournamentCheckTick) —
+      // a brand-new tournament still gets DMed for approval here, not created immediately, even
+      // though this command is guild-scoped (the gate itself is global, see tournament-approval.js's
+      // doc comment on why it can't run per-guild). catchUpTournamentsForGuild is the same
+      // scrape->gate->checkAndCreateChannels composition this handler used to inline directly —
+      // extracted so this, the guildCreate handler, and the post-/matchmaker-setup catch-up below
+      // all share one implementation.
+      catchUpTournamentsForGuild(client, interaction.guild, pinnedMessages).catch(console.error);
     }
 
     // /matchmaker-setup — gated at runtime (register-commands.js deliberately sets no
@@ -896,6 +906,13 @@ async function handleInteraction(interaction) {
       try {
         const result = await runMatchmakerSetup(interaction.guild);
         await interaction.editReply({ content: result.summary });
+        // Immediate catch-up now that this guild's 9 tournament forums genuinely exist — the
+        // realistic moment a brand-new guild actually has somewhere to post into (see the
+        // guildCreate handler's own catch-up call, which usually no-ops before this point for
+        // exactly that reason). Backgrounded — the setup reply above shouldn't wait on a full
+        // tournament scrape, and this is the same fire-and-forget shape /check-tournaments' handler
+        // already uses for the identical call.
+        catchUpTournamentsForGuild(client, interaction.guild, pinnedMessages).catch(console.error);
       } catch (err) {
         console.error('matchmaker-setup failed:', err.message);
         await interaction.editReply({ content: `❌ Setup failed: ${err.message}` });
