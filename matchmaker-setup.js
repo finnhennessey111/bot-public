@@ -90,7 +90,10 @@ const CHANNEL_SPECS = [
   // Centralized suggest-a-feature (suggestions.js) — one button+modal, forwarded straight to the
   // developer and stored centrally, rather than free-form messages scattered across dozens of
   // separate servers' channels. Verified-member-visible (permissions.js's verifiedChannels).
-  { key: 'suggestions', name: 'suggestions', category: 'matchmaker' },
+  // Name is "suggestions-report-a-bug", not the literal "Suggestions / Report a Bug" requested —
+  // Discord text channel names can't contain spaces or "/" (lowercased, hyphens only), so this is
+  // the closest valid equivalent.
+  { key: 'suggestions', name: 'suggestions-report-a-bug', category: 'matchmaker' },
   // Skipped entirely while access gating is disabled (see access.js's ACCESS_GATING_ENABLED) —
   // there's nothing for it to gate right now. Flip that flag back on to have new setups create it
   // again; existing servers that already have #access from before keep it untouched either way.

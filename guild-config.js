@@ -139,6 +139,33 @@ const GUILD_CONFIG_MIGRATIONS = [
       return `ensured 3 region categories, created/reparented ${Object.keys(forumChannelIds).length} tournament forum(s)`;
     },
   },
+  {
+    // Renames an already-created #suggestions channel to match matchmaker-setup.js's current
+    // CHANNEL_SPECS name ("suggestions-report-a-bug") — ensureChannel (matchmaker-setup.js) only
+    // ever creates-if-missing/reparents an existing channel, it never corrects an existing one's
+    // name, so a guild that ran /matchmaker-setup before this renaming shipped would otherwise keep
+    // the old name forever, with no path back to the new one short of a manual Discord rename (the
+    // exact "one-off manual rename that gets reverted" problem this exists to avoid — except here
+    // it's the reverse: without this, nothing would ever apply the new name at all).
+    //
+    // isMissing can't check the live Discord channel name directly (isMissing only ever sees the
+    // cached config, synchronously, no guild/network access) — it stays "missing" for as long as a
+    // suggestions channel is configured at all, so apply() below re-checks and is a cheap no-op
+    // once the name already matches, rather than only ever running once.
+    name: 'channelIds.suggestions renamed to "suggestions-report-a-bug"',
+    isMissing: (config) => !!config.channelIds?.suggestions,
+    apply: async (guild) => {
+      const config = getGuildConfig(guild.id);
+      const channel = await guild.channels.fetch(config.channelIds.suggestions).catch(() => null);
+      if (!channel) return 'suggestions channel no longer exists — nothing to rename';
+
+      const previousName = channel.name;
+      if (previousName === 'suggestions-report-a-bug') return 'already correctly named — no-op';
+
+      await channel.setName('suggestions-report-a-bug');
+      return `renamed #${channel.id} from "${previousName}" to "suggestions-report-a-bug"`;
+    },
+  },
 ];
 
 // Startup self-heal: for every guild the bot is currently in, check each known migration against

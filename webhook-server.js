@@ -468,6 +468,33 @@ function startWebhookServer(client) {
   const eloRateLimit = createRateLimiter({ windowMs: 60_000, max: 20 });
   const MAX_EPIC_USERNAME_LENGTH = 64; // generous — real Epic display names are far shorter
 
+  // Autocomplete for the website's ELO checker — up to 5 registered Epic usernames matching a
+  // partial (prefix) input, so a visitor can find their own name without typing it exactly. Own
+  // rate limiter (not the eloRateLimit instance below) — same 20/min/IP config as the single-lookup
+  // endpoint ("the same way" it's rate-limited), but a SEPARATE bucket, since autocomplete is
+  // realistically fired once per keystroke rather than once per manual lookup; sharing one counter
+  // between the two would let rapid typing exhaust the budget meant for the actual lookup too.
+  //
+  // Registered BEFORE /api/elo/:epicUsername below — Express matches routes in registration order,
+  // and :epicUsername is a wildcard that would otherwise swallow a request to /api/elo/search
+  // (treating "search" as the username param) before ever reaching this route.
+  const eloSearchRateLimit = createRateLimiter({ windowMs: 60_000, max: 20 });
+
+  app.get('/api/elo/search', eloSearchRateLimit, async (req, res) => {
+    const q = req.query.q;
+    if (!q || typeof q !== 'string' || q.length > MAX_EPIC_USERNAME_LENGTH) {
+      return res.status(400).json({ error: 'Invalid query.' });
+    }
+
+    try {
+      const usernames = await playerStore.searchEpicUsernames(q);
+      res.json({ usernames });
+    } catch (err) {
+      console.error(`[elo] Username search failed for "${q}":`, err.message);
+      res.status(500).json({ error: 'Something went wrong searching — try again shortly.' });
+    }
+  });
+
   app.get('/api/elo/:epicUsername', eloRateLimit, async (req, res) => {
     const { epicUsername } = req.params;
     if (!epicUsername || epicUsername.length > MAX_EPIC_USERNAME_LENGTH) {
@@ -495,6 +522,7 @@ function startWebhookServer(client) {
       discordOAuthEnabled && 'GET /premium/:plan, GET /discord-checkout-callback',
       deployEnabled && 'POST /deploy',
       'GET /api/elo/:epicUsername',
+      'GET /api/elo/search',
     ].filter(Boolean);
     console.log(`[webhook] Server listening on port ${port} (${routes.join(', ')})`);
   });

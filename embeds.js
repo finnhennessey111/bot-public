@@ -107,9 +107,7 @@ function tournamentDescription(region, eventId) {
   return (
     `**Region:** ${region}\n\nQueue up to find a teammate for this tournament.` +
     (trackerUrl ? `\n\n🔗 [Check if you're eligible](${trackerUrl})` : '') +
-    '\n\n⚠️ **Make sure you\'re actually registered for this event** through Epic\'s own ' +
-    'competitive system before queueing here — queueing on MatchMaker only finds you a teammate, ' +
-    'it does not register you for the tournament itself.'
+    '\n\n📊 Think you\'re better than your Power Ranking? Check your actual performance at www.matchmakerbot.xyz'
   );
 }
 
@@ -134,7 +132,7 @@ function buildTournamentEmbed(tournamentName, region, queueCount, isTrios = fals
       { name: '📍 Region', value: region, inline: true },
       { name: '🎮 Format', value: isTrios ? 'Trios' : 'Duos', inline: true },
     )
-    .setFooter({ text: 'MatchMaker • Think you\'re outperforming your PR? Check www.matchmakerbot.xyz' })
+    .setFooter({ text: 'MatchMaker' })
     .setTimestamp();
 
   return embed;
@@ -189,7 +187,7 @@ function buildRankedCupTournamentEmbed(tournamentName, region, rankCounts, isTri
       { name: '📍 Region', value: region, inline: true },
       { name: '🎮 Format', value: isTrios ? 'Trios' : 'Duos', inline: true },
     )
-    .setFooter({ text: 'MatchMaker • Think you\'re outperforming your PR? Check www.matchmakerbot.xyz' })
+    .setFooter({ text: 'MatchMaker' })
     .setTimestamp();
 
   return embed;

@@ -112,6 +112,51 @@ async function isRegisteredPlayer(guildId, discordId) {
   return !!(await getPlayer(guildId, discordId));
 }
 
+// Public autocomplete (elo.js's GET /api/elo/search) — up to `limit` registered Epic usernames
+// whose lowercased name STARTS WITH the (also lowercased) query. Prefix-anchored on purpose, not a
+// bare substring: a bare substring regex can't use a standard ascending index at all, while an
+// anchored prefix regex against the already-lowercased epicUsernameLower field can — same index
+// findCanonicalByEpicUsername's own doc comment already relies on, reused here rather than an
+// unindexed scan. "Registered" here means exactly what findCanonicalByEpicUsername already treats
+// it as: has epicUsernameLower set at all (set once a player links an Epic username — see
+// models/Player.js's doc comment on that field) — an account that never registered through the bot
+// has no Player doc, so it's structurally impossible for one to appear here. Deliberately NOT
+// additionally gated on epicOAuthLinked, for the same reason: the corresponding single-username
+// lookup (findCanonicalByEpicUsername) doesn't gate on it either, and an autocomplete that suggests
+// a name the exact-match endpoint then can't find would be a confusing mismatch.
+//
+// Deduped by epicId, same freshest-by-lastUpdated tie-break as findCanonicalByEpicUsername — the
+// same real account registered under N guilds must only ever fill ONE of the `limit` slots, never N
+// copies of itself crowding out other distinct players. Over-fetches (limit * 20, still a bounded
+// cap, not a full scan) before deduping, since naively taking the first `limit` raw docs could
+// under-fill the final list even when enough distinct accounts genuinely match. Sorted
+// alphabetically by the same indexed field the query itself filters on — the cheapest order to
+// fetch in, and a reasonable, deterministic "closest match" ordering for a prefix search; not a
+// relevance/popularity ranking.
+async function searchEpicUsernames(query, limit = 5) {
+  const trimmed = String(query ?? '').trim();
+  if (!trimmed) return [];
+
+  const lower = trimmed.toLowerCase();
+  const escaped = lower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+  const candidates = await PlayerModel.find({ epicUsernameLower: new RegExp(`^${escaped}`) })
+    .sort({ epicUsernameLower: 1 })
+    .limit(limit * 20)
+    .lean();
+
+  const byAccount = new Map(); // epicId (or _id fallback for a legacy record with none) -> freshest doc
+  for (const doc of candidates) {
+    const key = doc.epicId ?? `_id:${doc._id}`;
+    const age = doc.lastUpdated ? new Date(doc.lastUpdated).getTime() : 0;
+    const existing = byAccount.get(key);
+    const existingAge = existing?.lastUpdated ? new Date(existing.lastUpdated).getTime() : -1;
+    if (!existing || age > existingAge) byAccount.set(key, doc);
+  }
+
+  return [...byAccount.values()].slice(0, limit).map(doc => doc.epicUsername);
+}
+
 // A player can hold the "Registered" role (region set) without ever having linked Epic — legacy
 // players from before Epic OAuth gating existed, or a manually-granted role — so linking is its
 // own, independently-checked condition rather than inferred from Registered. Pure predicate over
@@ -387,6 +432,7 @@ module.exports = {
   forceRefreshStats,
   rescrapeRegisteredPlayers,
   findCanonicalByEpicUsername,
+  searchEpicUsernames,
   getAllScoredPlayers,
   cacheTtlMsFor,
   RECENT_ACTIVITY_CACHE_TTL_MS,
