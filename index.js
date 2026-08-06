@@ -30,6 +30,7 @@ const { enforcePermissions, isModMember } = require('./permissions');
 const guildConfig = require('./guild-config');
 const { getRoleId, getChannelId } = guildConfig;
 const { runMatchmakerSetup, refreshAllSetupEmbeds, runMatchmakerSetupForAllGuilds, buildRefreshAllSummaryMessage } = require('./matchmaker-setup');
+const { startTierComparisonScheduler } = require('./tier-comparison');
 const { registerCommands } = require('./register-commands');
 const changelog = require('./changelog');
 const suggestions = require('./suggestions');
@@ -523,6 +524,10 @@ client.once('clientReady', async () => {
   repairComingSoonCreativeChannels(client).catch(err => console.error('Failed to repair coming-soon creative channels on startup:', err.message));
 
   startScheduler(client, pinnedMessages);
+  // Pure DB read/write (real player docs -> models/TierBandStats.js) — no Discord API calls at
+  // all, so unlike startScheduler this needs no client/pinnedMessages. See tier-comparison.js's top
+  // doc comment for the full system this feeds.
+  startTierComparisonScheduler();
   startMatchSweep();
   // The queue pool is global (cross-server matchmaking) — a match's involved guild(s) come from
   // the matched players themselves, not one event-level guildId, so these listeners hand off to
