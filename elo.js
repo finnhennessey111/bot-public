@@ -35,6 +35,7 @@
 const { computeMatchScoreBreakdown, computeOwnTournamentModifier } = require('./scraper');
 const { PERMANENT_KEYWORDS } = require('./tournament-scraper');
 const { findCanonicalByEpicUsername, getAllScoredPlayers } = require('./players');
+const config = require('./config');
 
 // Never a real tournament title (recentEvents' names all come from real scraped Fortnite Tracker
 // event titles) — passed as computeMatchScoreBreakdown's tournamentName so ownTournamentModifier
@@ -56,6 +57,64 @@ const PERMANENT_TYPE_LABELS = {
 
 function labelForKeyword(keyword) {
   return PERMANENT_TYPE_LABELS[keyword] ?? keyword.replace(/\b\w/g, c => c.toUpperCase());
+}
+
+// Which of PERMANENT_KEYWORDS are console-exclusive tournament TYPES — collapsed to the keyword
+// level since this endpoint has no single real scraped tournament instance to read a per-event
+// consoleOnly flag from (tournament-scraper.js's real consoleOnly detection), only the generic type
+// the website groups by. 'console duos victory cup' is unambiguous by name and console-exclusive in
+// every real scraped instance; 'fncs division' is not platform-restricted. Drives which Fortnite
+// Tracker input segment (players.js's getStatsForContext, same logic queue.js's buildPlayer already
+// uses for a real queue join) a Console player's PR/solo-event signal is drawn from for each type —
+// without this, a Console player was always shown their combined "all"-input PR/history here,
+// never the gamepad-specific numbers a real queue attempt for the same tournament type would use
+// (confirmed real symptom: Console Duos Victory Cup showing kbm/PC-segment PR for a console player).
+const PERMANENT_KEYWORD_CONSOLE_ONLY = {
+  'console duos victory cup': true,
+};
+
+// Resolves the SAME Fortnite Tracker platform segment a real queue join for this tournament type
+// would use (players.js's getStatsForContext computes this exact same segment — the resolution
+// RULE is reused, not reimplemented): tournamentConsoleOnly decides whether a Console player's
+// segment is gamepad or kbm (a PC player always stays on the combined "all" segment either way, so
+// this is a no-op for them, same as in a real queue join).
+//
+// Deliberately read-only, unlike getStatsForContext itself: this file's top doc comment guarantees
+// "never a live Puppeteer/Fortnite Tracker scrape at request time" for this public, unauthenticated
+// endpoint — calling getStatsForContext directly would silently break that guarantee, since its
+// cache-miss path calls scrapePlayer (a real headless-Chromium launch) whenever a (region,
+// platform-segment) context has never been fetched before. So this only ever reads whatever's
+// ALREADY cached on the player doc (home fields for the "all" segment, statsByContext for
+// kbm/gamepad — both populated lazily by a real queue join, players.js's getContextualPlayerStats),
+// regardless of TTL staleness (staleness matters for a queue-join's accuracy, not for a display-only
+// lookup). If a Console player has never actually queued THIS specific platform-segment context
+// before (no cached entry exists yet), this falls back to their home snapshot rather than either
+// showing a fake 0 or paying for a live scrape — a real but narrow edge case, distinct from the
+// reported bug (a console player who HAS queued before, so the correct context is already cached,
+// just never being read).
+function resolvePlayerDataForContext(player, tournamentConsoleOnly) {
+  const platform = player.platform ?? 'PC';
+  const platformSegment = platform === 'Console'
+    ? (tournamentConsoleOnly ? config.ftPlatformSegments.Console : config.ftPlatformSegments.PC)
+    : 'all';
+
+  if (platformSegment !== 'all') {
+    const key = `${player.region}|${platformSegment}`;
+    const cached = player.statsByContext?.[key];
+    if (cached && cached.totalPR != null) {
+      return {
+        totalPR: cached.totalPR ?? 0,
+        thisSeasonPR: cached.thisSeasonPR ?? 0,
+        recentEvents: cached.recentEvents ?? [],
+      };
+    }
+  }
+
+  return {
+    totalPR: player.totalPR ?? 0,
+    thisSeasonPR: player.thisSeasonPR ?? 0,
+    recentEvents: player.recentEvents ?? [],
+  };
 }
 
 // Splits a matchScore into UI-ready segments that sum EXACTLY to the total, for a segmented bar on
@@ -190,7 +249,12 @@ function toExampleEvents(events) {
   }));
 }
 
-function buildCreativeElo(playerData, pools) {
+// player is the raw Player doc (needs region/platform/statsByContext for
+// resolvePlayerDataForContext), not a pre-shaped playerData object — creative queueing never has a
+// console-exclusive-mode concept (same as creative-queue.js's buildCreativePlayer), so this always
+// resolves the non-console-exclusive context (kbm for a Console player, "all" for a PC player).
+function buildCreativeElo(player, pools) {
+  const playerData = resolvePlayerDataForContext(player, false);
   const { base, soloModifier, soloEvents } = computeMatchScoreBreakdown(playerData, NEVER_MATCHES_A_REAL_TOURNAMENT);
   const { total, currentPR, soloPerformance } = toSegments({ base, soloModifier, ownTournamentModifier: 0 });
   const baseline = Math.round(base);
@@ -207,11 +271,19 @@ function buildCreativeElo(playerData, pools) {
   };
 }
 
-function buildTournamentElo(playerData, pools) {
-  const { base, soloModifier, soloEvents } = computeMatchScoreBreakdown(playerData, NEVER_MATCHES_A_REAL_TOURNAMENT);
-  const baseline = Math.round(base);
-
+// player is the raw Player doc (see buildCreativeElo above) — each tournament type resolves its
+// OWN platform-scoped context independently (PERMANENT_KEYWORD_CONSOLE_ONLY), since a Console
+// player's correct segment genuinely differs per type (gamepad for Console Duos Victory Cup, kbm
+// for FNCS Division) — there is deliberately no single shared playerData/base/soloModifier computed
+// once and reused across every type the way there used to be, since that shared value could only
+// ever be correct for one of the two contexts at a time for a Console player.
+function buildTournamentElo(player, pools) {
   return PERMANENT_KEYWORDS.map(keyword => {
+    const tournamentConsoleOnly = !!PERMANENT_KEYWORD_CONSOLE_ONLY[keyword];
+    const playerData = resolvePlayerDataForContext(player, tournamentConsoleOnly);
+    const { base, soloModifier, soloEvents } = computeMatchScoreBreakdown(playerData, NEVER_MATCHES_A_REAL_TOURNAMENT);
+    const baseline = Math.round(base);
+
     const { modifier: ownTournamentModifier, hasHistory, matchedEvents: ownTournamentMatchedEvents } = computeOwnTournamentModifier(
       playerData.recentEvents, e => e.name.toLowerCase().includes(keyword), base
     );
@@ -253,18 +325,20 @@ async function getPublicElo(epicUsername) {
   const player = await findCanonicalByEpicUsername(epicUsername);
   if (!player) return null;
 
-  if (player.totalPR == null) {
+  // "Ever scraped in ANY context" — not just player.totalPR (the home, non-console-exclusive
+  // context). A Console player's home fields can legitimately stay null forever under normal use:
+  // getStatsForContext only ever writes them when the resolved segment is "all" (players.js's
+  // isHomePlatform), and a Console player's segment is always kbm or gamepad, never "all" — so a
+  // Console player who has only ever queued (never run /refresh-stats, which always scrapes the
+  // "all" segment unconditionally) would otherwise incorrectly report hasStats:false here despite
+  // having real, genuine statsByContext history.
+  const hasAnyStats = player.totalPR != null || Object.keys(player.statsByContext ?? {}).length > 0;
+  if (!hasAnyStats) {
     // Registered/linked but never actually scraped yet (no queue attempt has ever happened for
     // this account) — nothing real to show. Distinct from "not found" so the website can render a
     // different, honest "no stats yet" message instead of implying the account doesn't exist.
     return { found: true, hasStats: false, epicUsername: player.epicUsername };
   }
-
-  const playerData = {
-    totalPR: player.totalPR ?? 0,
-    thisSeasonPR: player.thisSeasonPR ?? 0,
-    recentEvents: player.recentEvents ?? [],
-  };
 
   // Fetched only once we know there's a real score to rank — the "registered but never scraped"
   // branch above already returned, so this never pays for a full scan on a lookup that couldn't
@@ -276,8 +350,8 @@ async function getPublicElo(epicUsername) {
     found: true,
     hasStats: true,
     epicUsername: player.epicUsername,
-    creative: buildCreativeElo(playerData, pools),
-    tournaments: buildTournamentElo(playerData, pools),
+    creative: buildCreativeElo(player, pools),
+    tournaments: buildTournamentElo(player, pools),
   };
 }
 
