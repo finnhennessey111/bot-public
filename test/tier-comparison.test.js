@@ -1,15 +1,21 @@
-// Verifies the new tier-comparison system (tier-comparison.js): a standalone, unwired-into-any-
-// live-score layer that measures whether a player's real recent behavior (trend, consistency,
-// window-average decayed PR) more closely resembles the PR band above them than their own band —
-// gated so it can only ever produce a real result once BOTH the player's own band and the next band
-// up have enough real, signal-contributing players (MIN_BAND_PLAYERS). Real registered player count
-// is confirmed under 20 total right now, so in production this is expected to return hasSignal:false
-// for everyone for a long time — that's the safe, correct default this suite specifically checks for,
-// not something being worked around.
+// Verifies the tier-comparison system (tier-comparison.js): now wired into every live scoring path
+// (scraper.js's computeMatchScoreBreakdownWithEpic/WithTierComparison) — measures whether a
+// player's real recent behavior (trend, consistency, window-average decayed PR) more closely
+// resembles the PR band above them than their own band, gated so it can only ever produce a real
+// result once BOTH the player's own band and the next band up have enough real, signal-contributing
+// players (MIN_BAND_PLAYERS). Real registered player count is confirmed under 20 total right now, so
+// in production this is expected to return hasSignal:false for everyone for a long time — that's
+// the safe, correct default this suite specifically checks for, not something being worked around.
 //
 // PlayerModel/TierBandStatsModel are stubbed directly (same "stub the Model, not the module"
 // precedent as test/elo-endpoint.test.js's stubPlayerFind / test/tournament-channel-visibility.test.js's
-// DeletedTournamentChannelModel stub) — no real MongoDB connection needed.
+// DeletedTournamentChannelModel stub) — no real MongoDB connection needed. db.isConnected() is also
+// stubbed true for the getTierComparisonModifier tests below: that check exists so a real,
+// unconfigured/down connection fails fast instead of hanging on a real Mongoose query (this now runs
+// on every live queue join / elo lookup, not just the once-daily batch job) — in this disconnected
+// test environment it would otherwise short-circuit every stubbed-band test straight to
+// hasSignal:false before ever reaching the stub, which is a real, separately-verified behavior of
+// its own (see the dedicated "database not connected" test), not what most of these tests are about.
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
@@ -22,6 +28,7 @@ const {
 
 const PlayerModel = require('../models/Player');
 const TierBandStatsModel = require('../models/TierBandStats');
+const db = require('../db');
 
 // Independent cross-checks (not just asserting the module agrees with itself) for the two real
 // statistics computeWindowStats derives — mirrors this codebase's established precedent
@@ -205,9 +212,15 @@ test('runDailyTierBandComputation: zero real bands with enough signal skips inse
 
 // ── getTierComparisonModifier: the real per-player gated comparison ──────────
 function stubBandLookup(bandsByMin) {
-  const original = TierBandStatsModel.findOne;
+  const originalFindOne = TierBandStatsModel.findOne;
+  const originalIsConnected = db.isConnected;
   TierBandStatsModel.findOne = ({ bandMin }) => ({ lean: async () => bandsByMin[bandMin] ?? null });
-  return () => { TierBandStatsModel.findOne = original; };
+  // Every real caller of getTierComparisonModifier now goes through db.isConnected() first (fails
+  // fast rather than hanging on a real Mongoose query against this disconnected test environment) —
+  // stubbed true here so these tests actually exercise the stubbed TierBandStatsModel.findOne above,
+  // not just the fail-fast path (that's covered separately, see the "database not connected" test).
+  db.isConnected = () => true;
+  return () => { TierBandStatsModel.findOne = originalFindOne; db.isConnected = originalIsConnected; };
 }
 
 test('getTierComparisonModifier: a player with too little real history gets hasSignal:false and modifier 0, never a DB lookup', async () => {
@@ -345,5 +358,26 @@ test('getTierComparisonModifier: a player far PAST the next band\'s average is c
     assert.equal(result.modifier, MAX_TIER_MODIFIER);
   } finally {
     restore();
+  }
+});
+
+test('getTierComparisonModifier: db.isConnected() false fails fast to hasSignal:false — never touches TierBandStatsModel at all', async () => {
+  const player = playerWithFlatHistory(50, 60); // enough real history to pass the window-stats check
+  const originalIsConnected = db.isConnected;
+  const originalFindOne = TierBandStatsModel.findOne;
+  db.isConnected = () => false;
+  // If getTierComparisonModifier called this despite isConnected() being false, the test must fail
+  // loudly (a real, unstubbed disconnected Mongoose query would otherwise just hang/timeout here
+  // instead) — same "assert the call never happens" precedent as
+  // test/matchmaker-setup-partial-failure.test.js's assertNoDelete.
+  TierBandStatsModel.findOne = () => { throw new Error('must not query TierBandStatsModel when the DB is not connected'); };
+  try {
+    const result = await getTierComparisonModifier(player);
+    assert.equal(result.hasSignal, false);
+    assert.equal(result.modifier, 0);
+    assert.match(result.reason, /not connected/i);
+  } finally {
+    db.isConnected = originalIsConnected;
+    TierBandStatsModel.findOne = originalFindOne;
   }
 });

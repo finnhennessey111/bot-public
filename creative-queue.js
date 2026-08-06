@@ -25,7 +25,7 @@ const { EventEmitter } = require('events');
 const { creativeQueues, saveQueues } = require('./store');
 const config = require('./config');
 const playerStore = require('./players');
-const { computeMatchScoreBreakdown } = require('./scraper');
+const { computeMatchScoreBreakdownWithTierComparison } = require('./scraper');
 
 const MODES = {
   '1v1': ['1v1 Realistics', '1v1 Zone Wars'],
@@ -246,7 +246,10 @@ async function buildCreativePlayer({ guildId, guildName, discordId, discordUsern
   // tournament — no scraped event will ever have this name, so ownTournamentModifier correctly
   // comes out to 0 with no special-casing needed. The solo-cup performance modifier and season-PR
   // weighting still apply normally, since neither depends on the name passed here.
-  const { matchScore, soloModifier } = computeMatchScoreBreakdown(playerData, mode);
+  // computeMatchScoreBreakdownWithTierComparison (not the plain sync computeMatchScoreBreakdown) —
+  // layers tier-comparison.js's real-band modifier on top; safely inert (adds exactly 0) whenever
+  // there isn't yet enough real player data for a valid comparison, per that module's own gating.
+  const { matchScore, soloModifier } = await computeMatchScoreBreakdownWithTierComparison(playerData, mode);
 
   return {
     guildId,

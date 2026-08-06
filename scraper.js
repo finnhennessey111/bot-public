@@ -335,9 +335,11 @@ function calculateMatchScore(playerData, tournamentName) {
 // scraped identifier (confirmed live to be the same real Epic eventId the matches endpoint wants).
 // Falls back to the plain FT-derived breakdown on absolutely any gap (no eventId, no Epic calendar
 // match, no player standing found, a network/API failure) — this never throws, and never leaves a
-// queue-join without a score. Only queue.js's buildPlayer (real tournaments) calls this;
-// creative-queue.js and elo.js keep calling the plain synchronous computeMatchScoreBreakdown
-// unchanged, since neither has a real Epic-trackable tournament to look up.
+// queue-join without a score. Only queue.js's buildPlayer (real tournaments) calls this — creative-
+// queue.js and elo.js call computeMatchScoreBreakdownWithTierComparison instead (below), since
+// neither has a real Epic-trackable tournament to look up, but both still want the (also async)
+// tier-comparison modifier this function itself applies at the very end, via the shared
+// applyTierComparisonModifier helper.
 async function computeMatchScoreBreakdownWithEpic(playerData, tournament, accountId) {
   const breakdown = computeMatchScoreBreakdown(playerData, tournament?.name);
 
@@ -348,7 +350,13 @@ async function computeMatchScoreBreakdownWithEpic(playerData, tournament, accoun
   // correct). Only name/region/accountId are actually required to attempt it. currentPR (breakdown.
   // base) is threaded through so Epic's own modifier can be expressed as the same PR-native
   // percentage the FT-derived one is, not a separate placement-bucket score.
-  if (!tournament?.name || !tournament?.region || !accountId) return breakdown;
+  //
+  // Still runs applyTierComparisonModifier even when Epic can't be attempted at all — tier-
+  // comparison doesn't need tournament/accountId info, only playerData, so a missing eventId/region/
+  // accountId should never silently skip it too.
+  if (!tournament?.name || !tournament?.region || !accountId) {
+    return applyTierComparisonModifier(breakdown, playerData);
+  }
 
   let epicResult = null;
   try {
@@ -357,13 +365,73 @@ async function computeMatchScoreBreakdownWithEpic(playerData, tournament, accoun
     console.warn(`[scraper] Epic own-tournament lookup threw for "${tournament.name}" — falling back to Fortnite Tracker history: ${err.message}`);
   }
 
-  if (!epicResult) return breakdown;
+  if (!epicResult) {
+    return applyTierComparisonModifier(breakdown, playerData);
+  }
 
   const matchScore = Math.round(breakdown.base * (1 + breakdown.soloModifier + epicResult.modifier));
-  return { ...breakdown, matchScore, ownTournamentModifier: epicResult.modifier, ownTournamentSource: 'epic' };
+  return applyTierComparisonModifier(
+    { ...breakdown, matchScore, ownTournamentModifier: epicResult.modifier, ownTournamentSource: 'epic' },
+    playerData
+  );
+}
+
+// Layers tier-comparison.js's real-band-based modifier onto an already-computed breakdown (FT-only
+// or Epic-upgraded — either shape works, this only reads breakdown.base/soloModifier/
+// ownTournamentModifier and playerData.recentEvents/totalPR). Deferred require: tier-comparison.js
+// requires players.js, which itself requires this file (scrapePlayer) — requiring tier-comparison.js
+// back at this file's own top level would be a real circular require depending on which module
+// happens to load first (same category of issue guild-config.js's matchmaker-setup migration
+// already deferred a require to avoid — see that file's own doc comment on the same pattern).
+// Deferring until this function actually runs sidesteps it entirely, since by call time every
+// module involved has already finished loading.
+//
+// Fails soft on absolutely anything (a DB hiccup, tier-comparison.js throwing) — same "never leaves
+// a queue-join without a score" guarantee computeMatchScoreBreakdownWithEpic's own Epic lookup
+// already has. hasSignal:false (the real, expected, common case — see tier-comparison.js's top doc
+// comment on real current player count) is a normal, non-error result, not something this needs to
+// catch.
+async function applyTierComparisonModifier(breakdown, playerData) {
+  const { getTierComparisonModifier } = require('./tier-comparison');
+
+  let tierResult;
+  try {
+    tierResult = await getTierComparisonModifier(playerData);
+  } catch (err) {
+    console.warn(`[scraper] Tier-comparison lookup threw — falling back to no tier modifier: ${err.message}`);
+    return { ...breakdown, tierModifier: 0, tierComparisonHasSignal: false };
+  }
+
+  if (!tierResult.hasSignal) {
+    return { ...breakdown, tierModifier: 0, tierComparisonHasSignal: false };
+  }
+
+  const matchScore = Math.round(
+    breakdown.base * (1 + breakdown.soloModifier + breakdown.ownTournamentModifier + tierResult.modifier)
+  );
+  return {
+    ...breakdown,
+    matchScore,
+    tierModifier: tierResult.modifier,
+    tierComparisonHasSignal: true,
+    tierComparisonInfo: { resemblance: tierResult.resemblance, ownBand: tierResult.ownBand, nextBand: tierResult.nextBand },
+  };
+}
+
+// The non-Epic counterpart to computeMatchScoreBreakdownWithEpic — for callers with no real,
+// Epic-trackable tournament context (creative-queue.js's creative matches; elo.js's public lookup,
+// which deliberately never calls Epic live — see that file's own top doc comment on staying a fast,
+// DB-only endpoint). Still layers the real tier-comparison modifier on top of the plain FT-derived
+// breakdown, since tier-comparison isn't tournament-specific the way Epic's own placement lookup is
+// — it's a general "does this player's own recent behavior resemble the tier above them" signal,
+// equally applicable to a creative match or a generic tournament-type check as to a real tournament
+// queue join.
+async function computeMatchScoreBreakdownWithTierComparison(playerData, tournamentName) {
+  const breakdown = computeMatchScoreBreakdown(playerData, tournamentName);
+  return applyTierComparisonModifier(breakdown, playerData);
 }
 
 module.exports = {
   scrapePlayer, scrapePlayerOnce, calculateMatchScore, computeMatchScoreBreakdown,
-  computeMatchScoreBreakdownWithEpic, computeOwnTournamentModifier,
+  computeMatchScoreBreakdownWithEpic, computeMatchScoreBreakdownWithTierComparison, computeOwnTournamentModifier,
 };

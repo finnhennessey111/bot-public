@@ -31,8 +31,18 @@
 // EXACT events those modifiers were computed from (scraper.js's computeMatchScoreBreakdown now
 // also returns soloEvents; computeOwnTournamentModifier already returned matchedEvents), not a
 // separately re-derived "recent events" list. No new selection logic lives here.
+//
+// Both builders below are async now: they go through scraper.js's
+// computeMatchScoreBreakdownWithTierComparison, which layers tier-comparison.js's real, band-based
+// modifier on top of the same base/soloModifier — the same real formula every other live path
+// (queue.js/creative-queue.js) uses, not a website-only variant. `components.tierBonus` and the
+// top-level `tierComparison` transparency object are both OMITTED (not a 0/false stub) whenever
+// there's no valid real comparison yet — see tier-comparison.js's own doc comment on why that's the
+// expected state for essentially every real lookup right now (confirmed real player count under 20
+// total). The comparison POOL (buildScorePools) deliberately does NOT get this layered in — see its
+// own doc comment for the cost tradeoff that decision avoids.
 
-const { computeMatchScoreBreakdown, computeOwnTournamentModifier } = require('./scraper');
+const { computeMatchScoreBreakdown, computeMatchScoreBreakdownWithTierComparison, computeOwnTournamentModifier } = require('./scraper');
 const { PERMANENT_KEYWORDS } = require('./tournament-scraper');
 const { findCanonicalByEpicUsername, getAllScoredPlayers } = require('./players');
 const config = require('./config');
@@ -124,11 +134,18 @@ function resolvePlayerDataForContext(player, tournamentConsoleOnly) {
 // rounding on its own and the total silently drifting off by a point or two.
 //
 // PR-NATIVE FORMULA (scraper.js's computeMatchScoreBreakdown doc comment): Total = Current PR ×
-// (1 + soloModifier + ownTournamentModifier). No seasonPR segment anymore — thisSeasonPR is a
-// deliberately-removed formula input now (a blunt, unfiltered seasonal aggregate that didn't fit
-// the "targeted, relevant recent form" philosophy soloModifier/ownTournamentModifier both follow),
-// not just hidden from display; it no longer contributes to the score at all, so there's nothing
-// left here for a "seasonPR" segment to represent.
+// (1 + soloModifier + ownTournamentModifier + tierModifier). No seasonPR segment anymore —
+// thisSeasonPR is a deliberately-removed formula input now (a blunt, unfiltered seasonal aggregate
+// that didn't fit the "targeted, relevant recent form" philosophy soloModifier/ownTournamentModifier
+// both follow), not just hidden from display; it no longer contributes to the score at all, so
+// there's nothing left here for a "seasonPR" segment to represent.
+//
+// tierModifier (tier-comparison.js's getTierComparisonModifier, via scraper.js's
+// computeMatchScoreBreakdownWithTierComparison) defaults to 0 — real player count is confirmed
+// under 20 total right now, so it's expected to BE 0 for essentially every real lookup for a long
+// time (that module's own gating), not something being special-cased away here. tierBonus is
+// omitted from the returned components (not shown as a literal 0) exactly when it has no real
+// signal — same "omit rather than a 0 field" rule ownTournamentPlacement already follows.
 //
 // Named currentPR (not careerPR) deliberately: totalPR (scraper.js's extractPowerRank, reading
 // data.powerRank.points) is Fortnite Tracker's continuously-recomputed, decaying "Power Ranking"
@@ -137,12 +154,13 @@ function resolvePlayerDataForContext(player, tournamentConsoleOnly) {
 // data.powerRank.lifetimePR — which this codebase never captures or uses at all). "Career" implies
 // a permanent, monotonically-growing sum; this value can and does go back down over time as older
 // results decay out, so "current" is the accurate word.
-function toSegments({ base, soloModifier, ownTournamentModifier }) {
-  const total = Math.round(base * (1 + soloModifier + ownTournamentModifier));
+function toSegments({ base, soloModifier, ownTournamentModifier, tierModifier = 0 }) {
+  const total = Math.round(base * (1 + soloModifier + ownTournamentModifier + tierModifier));
   const currentPR = Math.round(base);
   const ownTournamentPlacement = ownTournamentModifier > 0 ? Math.round(base * ownTournamentModifier) : 0;
-  const soloPerformance = total - currentPR - ownTournamentPlacement;
-  return { total, currentPR, ownTournamentPlacement, soloPerformance };
+  const tierBonus = tierModifier > 0 ? Math.round(base * tierModifier) : 0;
+  const soloPerformance = total - currentPR - ownTournamentPlacement - tierBonus;
+  return { total, currentPR, ownTournamentPlacement, tierBonus, soloPerformance };
 }
 
 // "base" from computeMatchScoreBreakdown IS Current PR itself now (the PR-only baseline, before
@@ -196,6 +214,15 @@ function average(nums) {
 // vsBaselinePercent's doc comment) — averaging across real players doesn't change that; it turns
 // "am I above MY OWN floor" (always yes/flat) into "am I getting a BIGGER bonus over my floor than
 // the average real player gets over theirs" (a genuine above/below-average comparison).
+//
+// Deliberately uses the plain SYNCHRONOUS computeMatchScoreBreakdown here, not
+// computeMatchScoreBreakdownWithTierComparison — tier-comparison.js's getTierComparisonModifier does
+// up to 2 real DB reads per call, and this pool can be every scored player in the database
+// (getAllScoredPlayers' own doc comment already flags that query itself as "not free"); doing that
+// per POOL player on every request would multiply this endpoint's DB load by the pool size, on a
+// public, potentially-hammered route. The looked-up player (buildCreativeElo/buildTournamentElo
+// below) still gets the real tier modifier — only the comparison POOL's own scores skip it, a
+// disclosed, deliberate cost/consistency tradeoff, not an oversight.
 function buildScorePools(allPlayers) {
   const creative = [];
   const creativeBonuses = [];
@@ -253,10 +280,11 @@ function toExampleEvents(events) {
 // resolvePlayerDataForContext), not a pre-shaped playerData object — creative queueing never has a
 // console-exclusive-mode concept (same as creative-queue.js's buildCreativePlayer), so this always
 // resolves the non-console-exclusive context (kbm for a Console player, "all" for a PC player).
-function buildCreativeElo(player, pools) {
+async function buildCreativeElo(player, pools) {
   const playerData = resolvePlayerDataForContext(player, false);
-  const { base, soloModifier, soloEvents } = computeMatchScoreBreakdown(playerData, NEVER_MATCHES_A_REAL_TOURNAMENT);
-  const { total, currentPR, soloPerformance } = toSegments({ base, soloModifier, ownTournamentModifier: 0 });
+  const { base, soloModifier, soloEvents, tierModifier, tierComparisonHasSignal, tierComparisonInfo } =
+    await computeMatchScoreBreakdownWithTierComparison(playerData, NEVER_MATCHES_A_REAL_TOURNAMENT);
+  const { total, currentPR, tierBonus, soloPerformance } = toSegments({ base, soloModifier, ownTournamentModifier: 0, tierModifier });
   const baseline = Math.round(base);
   const ownVsBaselinePercent = vsBaselinePercent(total, baseline);
 
@@ -266,8 +294,14 @@ function buildCreativeElo(player, pools) {
     vsBaselinePercent: ownVsBaselinePercent,
     relativeToAveragePercent: relativeToAveragePercent(ownVsBaselinePercent, pools.creativeAvgBonus),
     percentile: percentileRank(total, pools.creative),
-    components: { currentPR, soloPerformance },
+    components: { currentPR, soloPerformance, ...(tierComparisonHasSignal ? { tierBonus } : {}) },
     examples: { soloPerformance: toExampleEvents(soloEvents) },
+    // Transparency, not a scoring input in its own right (tierBonus above already carries the real
+    // numeric contribution) — same spirit as prContext elsewhere: lets the website explain WHY a
+    // tier bonus is present when it is. Omitted entirely (not a hasSignal:false stub) when there's
+    // no real comparison to show — real player count under 20 total means this will be absent for
+    // essentially everyone for a long time, which is the correct, expected state.
+    ...(tierComparisonHasSignal ? { tierComparison: tierComparisonInfo } : {}),
   };
 }
 
@@ -277,18 +311,25 @@ function buildCreativeElo(player, pools) {
 // for FNCS Division) — there is deliberately no single shared playerData/base/soloModifier computed
 // once and reused across every type the way there used to be, since that shared value could only
 // ever be correct for one of the two contexts at a time for a Console player.
-function buildTournamentElo(player, pools) {
-  return PERMANENT_KEYWORDS.map(keyword => {
+async function buildTournamentElo(player, pools) {
+  return Promise.all(PERMANENT_KEYWORDS.map(async keyword => {
     const tournamentConsoleOnly = !!PERMANENT_KEYWORD_CONSOLE_ONLY[keyword];
     const playerData = resolvePlayerDataForContext(player, tournamentConsoleOnly);
-    const { base, soloModifier, soloEvents } = computeMatchScoreBreakdown(playerData, NEVER_MATCHES_A_REAL_TOURNAMENT);
+
+    // ownTournamentModifier still comes from the plain FT-derived computeOwnTournamentModifier
+    // (elo.js has no real Epic-trackable single tournament to look up — same reasoning
+    // computeMatchScoreBreakdownWithEpic's own doc comment gives), computed separately from
+    // base/soloModifier/tierModifier below exactly as before this change — only what feeds base/
+    // soloModifier now also picks up the tier-comparison layer via the WithTierComparison wrapper.
+    const { base, soloModifier, soloEvents, tierModifier, tierComparisonHasSignal, tierComparisonInfo } =
+      await computeMatchScoreBreakdownWithTierComparison(playerData, NEVER_MATCHES_A_REAL_TOURNAMENT);
     const baseline = Math.round(base);
 
     const { modifier: ownTournamentModifier, hasHistory, matchedEvents: ownTournamentMatchedEvents } = computeOwnTournamentModifier(
       playerData.recentEvents, e => e.name.toLowerCase().includes(keyword), base
     );
 
-    const { total, currentPR, ownTournamentPlacement, soloPerformance } = toSegments({ base, soloModifier, ownTournamentModifier });
+    const { total, currentPR, ownTournamentPlacement, tierBonus, soloPerformance } = toSegments({ base, soloModifier, ownTournamentModifier, tierModifier });
     const ownVsBaselinePercent = vsBaselinePercent(total, baseline);
 
     return {
@@ -307,6 +348,7 @@ function buildTournamentElo(player, pools) {
         // exactly); omitted rather than a 0 field so the website can tell "no history" apart from
         // "history that happened to score zero placement value" at a glance.
         ...(hasHistory ? { ownTournamentPlacement } : {}),
+        ...(tierComparisonHasSignal ? { tierBonus } : {}),
       },
       examples: {
         soloPerformance: toExampleEvents(soloEvents),
@@ -314,8 +356,9 @@ function buildTournamentElo(player, pools) {
         // events to show, not an empty-but-present array implying "checked, found none relevant".
         ...(hasHistory ? { ownTournamentPlacement: toExampleEvents(ownTournamentMatchedEvents) } : {}),
       },
+      ...(tierComparisonHasSignal ? { tierComparison: tierComparisonInfo } : {}),
     };
-  });
+  }));
 }
 
 // Returns null for "not found in our database at all" — webhook-server.js turns that into a clean
@@ -346,12 +389,20 @@ async function getPublicElo(epicUsername) {
   const allPlayers = await getAllScoredPlayers();
   const pools = buildScorePools(allPlayers);
 
+  // Both now async (tier-comparison.js's real DB-backed comparison, layered in via
+  // computeMatchScoreBreakdownWithTierComparison) — run concurrently rather than sequentially,
+  // since neither depends on the other's result.
+  const [creative, tournaments] = await Promise.all([
+    buildCreativeElo(player, pools),
+    buildTournamentElo(player, pools),
+  ]);
+
   return {
     found: true,
     hasStats: true,
     epicUsername: player.epicUsername,
-    creative: buildCreativeElo(player, pools),
-    tournaments: buildTournamentElo(player, pools),
+    creative,
+    tournaments,
   };
 }
 

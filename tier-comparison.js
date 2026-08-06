@@ -1,10 +1,15 @@
 // tier-comparison.js - A standalone, self-contained "does this player's recent behavior resemble
 // the tier above them" comparison system. Deliberately NOT folded into scraper.js's
-// computeMatchScoreBreakdown/PR-native formula — this is a distinct, separable layer with its own
-// data model (models/TierBandStats.js), its own daily batch job, and its own gating, so it can be
-// adjusted or disabled entirely without touching the core matching formula. Nothing in this file is
-// wired into a live score anywhere yet — getTierComparisonModifier below is a ready-to-integrate
-// export, left unintegrated deliberately (see this file's bottom doc comment for why).
+// computeMatchScoreBreakdown/PR-native formula's own logic — this is a distinct, separable layer
+// with its own data model (models/TierBandStats.js), its own daily batch job, and its own gating,
+// so it can be adjusted or disabled entirely without touching the core matching formula. Wired in
+// via scraper.js's computeMatchScoreBreakdownWithTierComparison/computeMatchScoreBreakdownWithEpic
+// (both call getTierComparisonModifier below at the very end) — every live scoring path
+// (queue.js/creative-queue.js/elo.js) picks this up automatically. Safe to wire in immediately
+// despite real player count being confirmed under 20 total: getTierComparisonModifier's gating
+// means it returns a real, honest hasSignal:false for essentially every real lookup right now, the
+// same safe default state as before it was wired in — see this file's bottom doc comment for how
+// that non-effect was verified, not just assumed.
 //
 // REAL DATA CONSTRAINT this was designed around: registered/scraped player count right now is
 // confirmed well under 20 total, across every guild. Every constant and every gate below is chosen
@@ -40,6 +45,7 @@
 
 const TierBandStatsModel = require('./models/TierBandStats');
 const playerStore = require('./players');
+const db = require('./db');
 
 // Target window size ("last 5-10 qualifying events" per the real spec this was built against) —
 // MIN_EVENTS_FOR_TIER_SIGNAL is the floor below which there simply isn't enough real history to
@@ -227,6 +233,17 @@ async function getTierComparisonModifier(playerData) {
     return { modifier: 0, hasSignal: false, reason: 'not enough real qualifying event history for this player' };
   }
 
+  // Fails fast rather than letting a real Mongoose query hang against a down/unconfigured
+  // connection — this is now called on every real queue join / creative queue join / public ELO
+  // lookup (scraper.js's computeMatchScoreBreakdownWithEpic/WithTierComparison), not just the
+  // once-daily batch job, so a slow DB hiccup here would otherwise stall every one of those live
+  // paths for however long Mongoose's own connection-buffering timeout takes, on top of the
+  // eventual (correct) fallback to hasSignal:false anyway. db.isConnected() is a cheap, already-
+  // tracked in-memory flag (db.js), not a real round trip.
+  if (!db.isConnected()) {
+    return { modifier: 0, hasSignal: false, reason: 'database not connected' };
+  }
+
   const { bandMin, bandMax } = bandRangeForPR(playerData.totalPR);
   const [ownBand, nextBand] = await Promise.all([
     TierBandStatsModel.findOne({ bandMin }).lean(),
@@ -277,11 +294,14 @@ module.exports = {
   getTierComparisonModifier,
 };
 
-// NOT WIRED INTO A LIVE SCORE: getTierComparisonModifier above is a complete, ready-to-integrate
-// export, but nothing in scraper.js/elo.js/queue.js calls it yet. Deliberate — with real player
-// count confirmed under 20 total, wiring this into the live matching formula today would have zero
-// visible effect (every real lookup would come back hasSignal:false) while adding surface area to
-// the core scoring path for no current benefit. The batch job and data model are real
-// infrastructure meant to run and accumulate real band statistics starting now, so real comparisons
-// are available the moment the player base actually grows into them — integrating the modifier into
-// a live score is a separate, later decision once there's something real for it to say.
+// WIRED INTO EVERY LIVE SCORE: getTierComparisonModifier is called from scraper.js's
+// computeMatchScoreBreakdownWithEpic (queue.js's real tournament path) and
+// computeMatchScoreBreakdownWithTierComparison (creative-queue.js, elo.js) — every real matching/
+// display path picks this up automatically, no second activation step needed. Safe at real current
+// scale (confirmed under 20 total players): every real lookup returns hasSignal:false today (the
+// MIN_BAND_PLAYERS gate), so this has zero effect on any live score right now — exactly the same
+// safe default as before it was wired in, just without needing a future code change to activate it.
+// db.isConnected() is checked before ever touching TierBandStatsModel specifically because this now
+// runs on every real queue join / creative queue join / public ELO lookup, not just the once-daily
+// batch job — a slow or down DB must never stall one of those live paths waiting on a query this
+// function is going to fall back away from anyway.

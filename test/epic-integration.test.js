@@ -25,6 +25,17 @@ function withStubbedFindEventEntryByName(stub, fn) {
   return fn().finally(() => { epicApi.findEventEntryByName = original; });
 }
 
+// computeMatchScoreBreakdownWithEpic now ALSO always runs applyTierComparisonModifier (tier-
+// comparison.js) at the end, on every path — this test file never stubs db.isConnected (real DB
+// connectivity check tier-comparison.js's getTierComparisonModifier fails fast on), so it's always
+// false in this test environment, meaning every real result here carries these two extra fields
+// with these exact values. Wrapping the plain FT-only breakdown with them is what makes these
+// fallback tests a genuine "identical to the plain result" comparison again, rather than each
+// needing its own ad-hoc partial-match assertion.
+function expectedWithNoTierSignal(plainBreakdown) {
+  return { ...plainBreakdown, tierModifier: 0, tierComparisonHasSignal: false };
+}
+
 const PLAYER_DATA = {
   totalPR: 500, thisSeasonPR: 100,
   recentEvents: [{ name: 'Duos Ranked Cup (Zero Build)', placement: 800, rosterSize: 2 }],
@@ -37,7 +48,7 @@ test('computeMatchScoreBreakdownWithEpic: no tournament.region — Epic is never
   const tournament = { name: 'Duos Ranked Cup (Zero Build)' }; // no region
   const result = await scraperModule.computeMatchScoreBreakdownWithEpic(PLAYER_DATA, tournament, 'myaccount');
   const plain = computeMatchScoreBreakdown(PLAYER_DATA, tournament.name);
-  assert.deepEqual(result, plain);
+  assert.deepEqual(result, expectedWithNoTierSignal(plain));
 });
 
 test('computeMatchScoreBreakdownWithEpic: eventId absent is NOT a reason to skip Epic anymore — it\'s still attempted (and succeeds) using just name+region', async () => {
@@ -57,7 +68,7 @@ test('computeMatchScoreBreakdownWithEpic: no accountId — Epic is never even at
   const tournament = { name: 'Duos Ranked Cup (Zero Build)', eventId: 'epicgames_x_EU', region: 'EU' };
   const result = await scraperModule.computeMatchScoreBreakdownWithEpic(PLAYER_DATA, tournament, null);
   const plain = computeMatchScoreBreakdown(PLAYER_DATA, tournament.name);
-  assert.deepEqual(result, plain);
+  assert.deepEqual(result, expectedWithNoTierSignal(plain));
 });
 
 test('computeMatchScoreBreakdownWithEpic: Epic lookup throws — falls back to the FT-derived breakdown, never rejects', async () => {
@@ -68,7 +79,7 @@ test('computeMatchScoreBreakdownWithEpic: Epic lookup throws — falls back to t
   }, async () => {
     const result = await scraperModule.computeMatchScoreBreakdownWithEpic(PLAYER_DATA, tournament, 'myaccount');
     const plain = computeMatchScoreBreakdown(PLAYER_DATA, tournament.name);
-    assert.deepEqual(result, plain, 'a thrown Epic error must resolve to the exact same result a plain FT-only call would produce');
+    assert.deepEqual(result, expectedWithNoTierSignal(plain), 'a thrown Epic error must resolve to the exact same result a plain FT-only call would produce');
   });
 });
 
@@ -78,7 +89,7 @@ test('computeMatchScoreBreakdownWithEpic: Epic lookup resolves null (no match/no
   await withStubbedEpicOwnTournamentModifier(async () => null, async () => {
     const result = await scraperModule.computeMatchScoreBreakdownWithEpic(PLAYER_DATA, tournament, 'myaccount');
     const plain = computeMatchScoreBreakdown(PLAYER_DATA, tournament.name);
-    assert.deepEqual(result, plain);
+    assert.deepEqual(result, expectedWithNoTierSignal(plain));
   });
 });
 
@@ -100,13 +111,16 @@ test('computeMatchScoreBreakdownWithEpic: Epic lookup succeeds — its modifier 
   });
 });
 
-test('computeMatchScoreBreakdown (plain, sync): completely unaffected by any of the above — creative-queue.js and elo.js keep working exactly as before', () => {
-  // Regression guard: computeMatchScoreBreakdownWithEpic must be purely additive. Any accidental
-  // change to computeMatchScoreBreakdown's own signature/behavior would silently break
-  // creative-queue.js's buildCreativePlayer and elo.js, neither of which this task touches.
+test('computeMatchScoreBreakdown (plain, sync): its own signature/behavior is unaffected by computeMatchScoreBreakdownWithEpic\'s changes', () => {
+  // Regression guard: computeMatchScoreBreakdownWithEpic must be purely additive (built ON TOP of
+  // this function, never mutating it). Note: creative-queue.js and elo.js no longer call this plain
+  // sync function directly — both now go through the async computeMatchScoreBreakdownWithTierComparison
+  // wrapper (scraper.js) so they also pick up tier-comparison.js's real modifier — but that wrapper
+  // itself calls this exact function first, so this function's own behavior still has to stay solid.
   const result = computeMatchScoreBreakdown(PLAYER_DATA, 'Duos Ranked Cup (Zero Build)');
   assert.equal(typeof result.matchScore, 'number');
   assert.equal(result.ownTournamentSource, undefined, 'the plain sync path never stamps an Epic source');
+  assert.equal('tierModifier' in result, false, 'the plain sync function itself must never gain the async wrapper\'s fields');
 });
 
 // ── enrichWithEpicBuildMode (tournament-scraper.js) ─────────────────────────────────────────────
