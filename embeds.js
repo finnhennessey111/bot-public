@@ -107,7 +107,9 @@ function tournamentDescription(region, eventId) {
   return (
     `**Region:** ${region}\n\nQueue up to find a teammate for this tournament.` +
     (trackerUrl ? `\n\n🔗 [Check if you're eligible](${trackerUrl})` : '') +
-    '\n\n📊 Think you\'re better than your Power Ranking? Check your actual performance at www.matchmakerbot.xyz'
+    '\n\n⚠️ **Make sure you\'re actually registered for this event** through Epic\'s own ' +
+    'competitive system before queueing here — queueing on MatchMaker only finds you a teammate, ' +
+    'it does not register you for the tournament itself.'
   );
 }
 
@@ -561,7 +563,7 @@ function buildMatchButtons(matchId) {
 function buildMatchConfirmedEmbed(players) {
   return new EmbedBuilder()
     .setTitle('🎮 Match Found!')
-    .setDescription('You have been matched! Add each other in-game and good luck! 🏆\n\n📊 Think you\'re outperforming your PR? Check www.matchmakerbot.xyz')
+    .setDescription('You have been matched! Add each other in-game and good luck! 🏆')
     .setColor(0x2E7D32)
     .addFields(
       players.map((player, i) => {
@@ -721,7 +723,7 @@ function buildCreativeComingSoonEmbed(category) {
       'This channel will switch over to the real queue automatically once it launches.'
     )
     .setColor(CREATIVE_COLOR)
-    .setFooter({ text: 'MatchMaker Creative • Check your ELO at www.matchmakerbot.xyz' });
+    .setFooter({ text: 'MatchMaker Creative • www.matchmakerbot.xyz' });
 }
 
 // counts: { [mode]: { EU: n, NAC: n } } — computed by the caller (creative-channel.js) so this
@@ -743,7 +745,7 @@ function buildCreativeQueueEmbed(category, counts = {}, modes = MODES[category])
       modeLines.join('\n\n')
     )
     .setColor(CREATIVE_COLOR)
-    .setFooter({ text: 'MatchMaker Creative • Think you\'re outperforming your PR? Check www.matchmakerbot.xyz' })
+    .setFooter({ text: 'MatchMaker Creative • www.matchmakerbot.xyz' })
     .setTimestamp();
 }
 
@@ -808,7 +810,7 @@ function buildCreativeMatchCard(player) {
 function buildCreativeMatchConfirmedEmbed(players, mode) {
   return new EmbedBuilder()
     .setTitle('🎮 Creative Match Found!')
-    .setDescription(`**${mode}**\n\nShare your in-game details below and good luck! 🏆\n\n📊 Think you're outperforming your PR? Check www.matchmakerbot.xyz`)
+    .setDescription(`**${mode}**\n\nShare your in-game details below and good luck! 🏆`)
     .setColor(CREATIVE_COLOR)
     .addFields(
       players.map((player, i) => {
@@ -1056,7 +1058,7 @@ function buildPostMatchOutcomeEmbed(mode) {
     .setTitle('🏆 How did your match go?')
     .setDescription(`A quick 2-question check-in for your recent **${mode}** match — purely for us to review later, this never affects your score.`)
     .setColor(COLOR_DEFAULT)
-    .setFooter({ text: 'MatchMaker • Think you\'re outperforming your PR? Check www.matchmakerbot.xyz' });
+    .setFooter({ text: 'MatchMaker' });
 }
 
 function buildPostMatchOutcomeButtons(matchId) {
