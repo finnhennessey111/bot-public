@@ -29,7 +29,7 @@ const { markSelfDeletion } = require('./self-deletion-tracker');
 const { enforcePermissions, isModMember } = require('./permissions');
 const guildConfig = require('./guild-config');
 const { getRoleId, getChannelId } = guildConfig;
-const { runMatchmakerSetup, refreshAllSetupEmbeds } = require('./matchmaker-setup');
+const { runMatchmakerSetup, refreshAllSetupEmbeds, runMatchmakerSetupForAllGuilds, buildRefreshAllSummaryMessage } = require('./matchmaker-setup');
 const { registerCommands } = require('./register-commands');
 const changelog = require('./changelog');
 const suggestions = require('./suggestions');
@@ -1085,6 +1085,33 @@ async function handleInteraction(interaction) {
         console.error('post-update error:', err);
         await interaction.editReply({ content: `❌ Failed to post update: ${err.message}` });
       }
+    }
+
+    // /refresh-all-servers — bot-developer-only (same BOT_OWNER_DISCORD_ID in-handler check as
+    // /post-update above, no Discord-level command-visibility restriction). Distinct from
+    // /post-update: this re-runs the FULL idempotent /matchmaker-setup logic (roles, categories,
+    // channels, embeds — matchmaker-setup.js's runMatchmakerSetup, reused as-is, not duplicated) in
+    // every guild, not just a live #setup embed edit. Genuinely slow across many guilds (each one's
+    // own setup is already a sequential run of Discord API calls, paced again on top of that between
+    // guilds — see runMatchmakerSetupForAllGuilds' doc comment), so this acknowledges immediately
+    // and does the real work in the background rather than holding the interaction open — the
+    // result is reported via DM once every guild has been processed, not via editReply.
+    if (interaction.commandName === 'refresh-all-servers') {
+      await interaction.deferReply({ flags: 64 });
+
+      if (!BOT_OWNER_DISCORD_ID) {
+        return interaction.editReply({ content: '❌ BOT_OWNER_DISCORD_ID is not configured — this command is disabled.' });
+      }
+      if (interaction.user.id !== BOT_OWNER_DISCORD_ID) {
+        return interaction.editReply({ content: '❌ Only the MatchMaker developer can run this command.' });
+      }
+
+      const guildCount = client.guilds.cache.size;
+      await interaction.editReply({ content: `🔄 Refreshing setup across ${guildCount} server(s) in the background — you'll get a DM summary when it's done.` });
+
+      runMatchmakerSetupForAllGuilds(client)
+        .then(result => dmUser(client, BOT_OWNER_DISCORD_ID, { content: buildRefreshAllSummaryMessage(result) }))
+        .catch(err => console.error('[refresh-all-servers] Unexpected failure:', err.message));
     }
 
     // /test-webhook — manually runs the same DB-write + cache-invalidation path a real Stripe

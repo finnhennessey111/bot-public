@@ -109,6 +109,10 @@ const commands = [
     .addStringOption(o => o.setName('entry').setDescription('The changelog entry text').setRequired(true)),
 
   new SlashCommandBuilder()
+    .setName('refresh-all-servers')
+    .setDescription('[Owner only] Re-run MatchMaker setup across every server the bot is in'),
+
+  new SlashCommandBuilder()
     .setName('test-webhook')
     .setDescription('Simulate a successful Stripe payment to test subscription activation (mod only)')
     .addUserOption(o => o.setName('user').setDescription('User to simulate the subscription for (defaults to you)').setRequired(false))

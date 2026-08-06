@@ -144,6 +144,16 @@ const TOURNAMENT_FORUM_SPECS = REGION_SPECS.flatMap(region =>
 
 const runningGuilds = new Set();
 
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Pause between guilds for /refresh-all-servers below — each guild's own setup already runs its
+// Discord API calls sequentially (this file's top doc comment), which is the real rate-limit
+// safeguard; this is an extra buffer on top of that so a bot in many servers doesn't chain dozens
+// of guilds' worth of role/channel/embed calls back-to-back with zero breathing room between them.
+const REFRESH_ALL_GUILDS_PACING_MS = 2000;
+
 async function ensureRole(guild, existingRoleIds, spec) {
   const existingId = existingRoleIds[spec.key];
   if (existingId) {
@@ -503,9 +513,77 @@ async function refreshAllSetupEmbeds(client) {
   return refreshed;
 }
 
+// /refresh-all-servers (index.js) — re-runs the SAME idempotent runMatchmakerSetup used by a real
+// /matchmaker-setup, across every guild the bot is currently in. Sequential (not Promise.all), with
+// a pause between guilds (REFRESH_ALL_GUILDS_PACING_MS) — same rate-limit reasoning as the rest of
+// this file, just one level up (per-guild instead of per-API-call). A failure in one guild (most
+// realistically a missing bot permission there, or that guild's own runMatchmakerSetup already
+// running concurrently via a real /matchmaker-setup — runningGuilds' own guard) is caught and
+// recorded, never stops the run — every remaining guild still gets processed. Returns the raw
+// result rather than throwing or messaging anyone itself; index.js's handler owns turning this into
+// a DM (via buildRefreshAllSummaryMessage below), since Discord-interaction/DM concerns don't belong
+// in this file's existing pure-orchestration functions.
+// pacingMs defaults to the real production pause but is an explicit parameter (not a closed-over
+// constant) purely so tests can pass 0 and exercise a many-guild run without actually waiting
+// REFRESH_ALL_GUILDS_PACING_MS * (guildCount - 1) real seconds — index.js's real caller never passes
+// this, so production behavior is unaffected.
+async function runMatchmakerSetupForAllGuilds(client, pacingMs = REFRESH_ALL_GUILDS_PACING_MS) {
+  const succeeded = [];
+  const failed = [];
+
+  const guilds = [...client.guilds.cache.values()];
+  for (let i = 0; i < guilds.length; i++) {
+    const guild = guilds[i];
+    try {
+      await runMatchmakerSetup(guild);
+      succeeded.push({ guildId: guild.id, guildName: guild.name });
+    } catch (err) {
+      console.error(`[refresh-all-servers] Setup failed for guild ${guild.id} (${guild.name}): ${err.message}`);
+      failed.push({ guildId: guild.id, guildName: guild.name, reason: err.message });
+    }
+    if (i < guilds.length - 1) await sleep(pacingMs);
+  }
+
+  return { succeeded, failed };
+}
+
+// Discord's real message-length cap is 2000 chars — 1900 leaves headroom for this being sent as a
+// DM (no embed truncation safety net the way a field-capped embed would have). A guild with a huge
+// number of failures gets its failure list truncated with a "...and N more" note (full detail is
+// still in the server's own logs — the console.error above, per guild, as it happens) rather than
+// this either silently dropping guilds from the list or the DM send itself failing outright.
+const DM_SUMMARY_MAX_LENGTH = 1900;
+
+function buildRefreshAllSummaryMessage({ succeeded, failed }) {
+  const total = succeeded.length + failed.length;
+  const lines = [
+    '✅ /refresh-all-servers complete.',
+    `Succeeded: ${succeeded.length}/${total}`,
+    `Failed: ${failed.length}/${total}`,
+  ];
+
+  if (failed.length > 0) {
+    lines.push('', 'Failures:');
+    let shown = 0;
+    for (const f of failed) {
+      const line = `• ${f.guildName} (${f.guildId}): ${f.reason}`;
+      if (lines.join('\n').length + line.length + 1 > DM_SUMMARY_MAX_LENGTH) break;
+      lines.push(line);
+      shown++;
+    }
+    if (shown < failed.length) {
+      lines.push(`• ...and ${failed.length - shown} more (see server logs for the full list)`);
+    }
+  }
+
+  return lines.join('\n');
+}
+
 module.exports = {
   runMatchmakerSetup,
   refreshAllSetupEmbeds,
+  runMatchmakerSetupForAllGuilds,
+  buildRefreshAllSummaryMessage,
   // ensureTournamentForums/ensureCategory: called directly by guild-config.js's self-heal migration
   // (a guild missing any of the 9 tournament forums, or the 3 region categories, shouldn't need a
   // full /matchmaker-setup re-run just to get them) — see that migration's own doc comment for why
