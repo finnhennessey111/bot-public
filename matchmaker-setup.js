@@ -17,6 +17,7 @@ const { BUILD_MODES } = require('./build-mode');
 const changelog = require('./changelog');
 const {
   buildRolesEmbed, buildRolesComponents, buildPlatformSelectRow, buildRegisterEmbed, buildEpicLinkButtonRow,
+  buildFortniteApiLinkButtonRow,
   buildSetupInstructionsEmbed,
   buildAccessChannelEmbed, buildAccessChannelButtons,
   buildSuggestionsChannelEmbed, buildSuggestionButtonRow,
@@ -430,7 +431,7 @@ async function runMatchmakerSetup(guild) {
       );
       setupMessageIds.register = await ensurePosted(
         guild.client, config.setupMessageIds, channelIds, 'register',
-        () => ({ embeds: [buildRegisterEmbed(channelIds.getRoles)], components: [buildEpicLinkButtonRow()] })
+        () => ({ embeds: [buildRegisterEmbed(channelIds.getRoles)], components: [buildEpicLinkButtonRow(), buildFortniteApiLinkButtonRow()] })
       );
       setupMessageIds.suggestions = await ensurePosted(
         guild.client, config.setupMessageIds, channelIds, 'suggestions',

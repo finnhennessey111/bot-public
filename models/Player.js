@@ -95,6 +95,38 @@ const playerSchema = new mongoose.Schema({
     }, { _id: false }),
     default: {},
   },
+  // Second, SEPARATE Epic-adjacent authorization — api-fortnite.com's own device-authorization-
+  // grant OAuth (fortnite-api-oauth.js), structurally independent of epicId/epicUsername/
+  // epicOAuthLinked above (that's the DIRECT Epic OAuth used for account linking/verified-role
+  // gating — completely unrelated flow, unchanged by this). Opt-in, never required — players.js
+  // uses this (when present and its accessToken is valid/refreshable) to source recentEvents from
+  // api-fortnite.com's open-ended tournament-history endpoint instead of the Fortnite Tracker
+  // scrape, for this player only; every other stat (totalPR/thisSeasonPR/prBand/sessions) and
+  // every player who hasn't done this keep working exactly as before. accountId here is this
+  // token's OWN Epic account id as returned by api-fortnite.com's OAuth completion response — not
+  // assumed to equal epicId above (same real person's Epic account in practice, but never cross-
+  // checked, since nothing downstream needs that guarantee).
+  fortniteApiOAuth: {
+    type: new mongoose.Schema({
+      accountId: String,
+      accessToken: String,
+      refreshToken: String,
+      // Confirmed live: this access token genuinely expires (api-fortnite.com's OAuth completion
+      // response carries a real expiresIn, observed as 7200s/2h) — players.js refreshes on demand
+      // via refresh-token first, falling back to refresh-device (deviceId/secret below) if the
+      // refresh token itself has also expired/been invalidated. See fortnite-api-oauth.js's header
+      // comment for the full confirmed-live flow.
+      expiresAt: Date,
+      // Epic's own long-lived device-auth credential (confirmed live in the OAuth completion
+      // response) — what lets re-authorization essentially never be needed again, short of the
+      // player revoking device access from their own Epic account settings. deviceId/secret only
+      // (accountId above already covers the third field this triple normally carries).
+      deviceId: String,
+      deviceSecret: String,
+      linkedAt: { type: Date, default: null },
+    }, { _id: false }),
+    default: {},
+  },
   registeredAt: { type: Date, default: Date.now },
 });
 

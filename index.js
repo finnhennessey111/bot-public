@@ -21,6 +21,7 @@ const { createMatchChannelsForMatch } = require('./match-channels');
 // name for arrays of built player objects, which would otherwise shadow this module import.
 const playerStore = require('./players');
 const epicOAuth = require('./epic-oauth');
+const fortniteApiOAuth = require('./fortnite-api-oauth');
 const { startScheduler, createTournamentChannelsAcrossGuilds, catchUpTournamentsForGuild } = require('./channel-manager');
 const { isRankedCupTitle } = require('./tournament-scraper');
 const tournamentApproval = require('./tournament-approval');
@@ -51,6 +52,7 @@ const {
   buildUseCreditsButton, buildCreditWindowStartedDmEmbed,
   buildBotStatusEmbed, buildQueueStatusEmbed, buildPlayerLookupEmbed,
   buildEpicAuthorizeLinkRow, buildEpicLinkRequiredReply,
+  buildFortniteApiAuthorizeLinkRow,
 } = require('./embeds');
 const store = require('./store');
 const { pinnedMessages, savePinnedMessages, saveQueues } = store;
@@ -87,6 +89,53 @@ let storeInitError = null;
 
 async function replyModOnly(interaction) {
   await interaction.editReply({ content: '❌ This command is restricted to the MatchMaker Mod role.' });
+}
+
+// Background poll loop for the fortnite_api_link_open button below — fortnite-api-oauth.js's
+// device-auth flow has no redirect/callback to wait for (unlike epic-oauth.js's), so the bot polls
+// POST /oauth/complete itself and edits the SAME ephemeral reply in place once the player finishes
+// approving on Epic's own site, rather than requiring a second click from them. Runs for up to
+// expiresInSeconds (confirmed live: 600s/10min, the device-auth flow's own window) — comfortably
+// inside a Discord interaction webhook token's 15-minute editReply validity, so this never risks
+// outliving the ability to actually deliver the result. Errors editing the reply (e.g. the player
+// dismissed the ephemeral message) are swallowed — nothing else depends on this succeeding, and
+// linkFortniteApiOAuth below has already persisted the real credentials by that point regardless.
+async function pollFortniteApiAuthorization(interaction, guildId, discordId, flowId, expiresInSeconds) {
+  const deadline = Date.now() + expiresInSeconds * 1000;
+
+  while (Date.now() < deadline) {
+    const result = await fortniteApiOAuth.pollComplete(flowId);
+
+    if (result.status === 'authorized') {
+      await playerStore.linkFortniteApiOAuth(guildId, discordId, result);
+      await interaction.editReply({
+        content: '✅ Tournament history access authorized! This will improve your recent-form accuracy over time.',
+        components: [],
+      }).catch(() => {});
+      return;
+    }
+    if (result.status === 'expired') {
+      await interaction.editReply({
+        content: '⌛ That authorization link expired before it was approved. Click **Link Tournament History** in #register again to retry.',
+        components: [],
+      }).catch(() => {});
+      return;
+    }
+    if (result.status === 'error') {
+      await interaction.editReply({
+        content: '❌ Something went wrong authorizing — click **Link Tournament History** in #register again to retry.',
+        components: [],
+      }).catch(() => {});
+      return;
+    }
+
+    await new Promise(resolve => setTimeout(resolve, (result.retryAfter ?? 10) * 1000));
+  }
+
+  await interaction.editReply({
+    content: '⌛ That authorization link expired before it was approved. Click **Link Tournament History** in #register again to retry.',
+    components: [],
+  }).catch(() => {});
 }
 
 // Queue join/leave ephemeral replies auto-dismiss after 10s so repeat queue/leave clicks don't
@@ -1607,6 +1656,52 @@ async function handleInteraction(interaction) {
         components: [buildEpicAuthorizeLinkRow(url)],
         flags: 64,
       });
+    }
+
+    // ── FORTNITE-API.COM TOURNAMENT HISTORY LINK (posted in #register) ───────────────────────
+    // Second, SEPARATE authorization from Epic account linking above — api-fortnite.com's own
+    // device-auth OAuth (fortnite-api-oauth.js), never required, purely an enhancement (see
+    // players.js's applyFortniteApiOAuthOverride). No redirect/callback exists for this flow —
+    // pollFortniteApiAuthorization above polls in the background and edits this same reply once
+    // the player finishes approving, so there's nothing further for this handler itself to do
+    // once the flow has started.
+    if (customId === 'fortnite_api_link_open') {
+      if (channelId !== getChannelId(guild.id, 'register')) {
+        return interaction.reply({
+          content: `❌ Use this in <#${getChannelId(guild.id, 'register')}>.`,
+          flags: 64,
+        });
+      }
+      if (!fortniteApiOAuth.isConfigured()) {
+        return interaction.reply({
+          content: '❌ Tournament history access isn\'t set up for this bot yet — contact a mod.',
+          flags: 64,
+        });
+      }
+
+      const existing = await playerStore.getPlayer(guild.id, user.id);
+      if (playerStore.isFortniteApiOAuthLinked(existing)) {
+        return interaction.reply({
+          content: '✅ You\'ve already authorized tournament history access — nothing more to do.',
+          flags: 64,
+        });
+      }
+
+      await interaction.deferReply({ flags: 64 });
+
+      const flow = await fortniteApiOAuth.startDeviceAuthFlow();
+      if (!flow) {
+        return interaction.editReply({ content: '❌ Couldn\'t start authorization right now — try again shortly.' });
+      }
+
+      await interaction.editReply({
+        content: `🔗 Click below, then log in and approve with your Epic account. This link expires in `
+          + `${Math.round(flow.expiresIn / 60)} minutes — this message updates automatically once you're done.`,
+        components: [buildFortniteApiAuthorizeLinkRow(flow.verificationUri)],
+      });
+
+      pollFortniteApiAuthorization(interaction, guild.id, user.id, flow.flowId, flow.expiresIn)
+        .catch(err => console.error(`[fortnite-api-oauth] Polling failed for ${user.id}:`, err.message));
     }
 
     // ── REFRESH STATS BUTTON (posted in #access) ──────────────────────────────────────────────

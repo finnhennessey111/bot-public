@@ -1286,7 +1286,8 @@ function buildRegisterEmbed(getRolesChannelId) {
     .setDescription(
       '• 🔗 Click **Link Epic Account** below to link your Epic account\n' +
       `• ✅ Once linked, go to ${getRolesChannelId ? `<#${getRolesChannelId}>` : '#get-roles'} to complete your profile\n` +
-      '• 🎮 Then you can queue in tournament and creative channels'
+      '• 🎮 Then you can queue in tournament and creative channels\n' +
+      '• 📊 *(Optional)* Click **Link Tournament History** — this lets us see your tournament history'
     )
     .setColor(0x4A90D9)
     .setFooter({ text: 'MatchMaker' });
@@ -1311,6 +1312,38 @@ function buildEpicAuthorizeLinkRow(url) {
   return new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setLabel('Continue to Epic Games')
+      .setStyle(ButtonStyle.Link)
+      .setURL(url)
+  );
+}
+
+// Second, SEPARATE #register button — appears right after buildEpicLinkButtonRow's row (sequential,
+// not combined into one click), for api-fortnite.com's own OAuth (fortnite-api-oauth.js), a
+// genuinely distinct authorization from Epic account linking above. Opt-in (Secondary style, not
+// Primary) — index.js's fortnite_api_link_open handler starts the device-auth flow and replies
+// with buildFortniteApiAuthorizeLinkRow below. Posted as a standing button on every #register
+// message (ensurePosted edits existing servers' messages in place on the next /matchmaker-setup or
+// /refresh-all-servers), so an already-registered player has the same path to opt into this as a
+// brand-new one — no separate DM campaign needed.
+function buildFortniteApiLinkButtonRow() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId('fortnite_api_link_open')
+      .setLabel('Link Tournament History')
+      .setEmoji('📊')
+      .setStyle(ButtonStyle.Secondary)
+  );
+}
+
+// Link-style button opening api-fortnite.com's device-auth verificationUri directly — same
+// "no interaction reaches the bot for this click" shape as buildEpicAuthorizeLinkRow above. Unlike
+// that flow, there's no redirect/callback to wait for here: the player approves on Epic's own
+// site, and index.js's pollFortniteApiAuthorization polls in the background and edits the original
+// ephemeral reply once done — no second click needed.
+function buildFortniteApiAuthorizeLinkRow(url) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setLabel('Authorize on Epic Games')
       .setStyle(ButtonStyle.Link)
       .setURL(url)
   );
@@ -1771,6 +1804,8 @@ module.exports = {
   buildEpicLinkButtonRow,
   buildEpicAuthorizeLinkRow,
   buildEpicLinkRequiredReply,
+  buildFortniteApiLinkButtonRow,
+  buildFortniteApiAuthorizeLinkRow,
   buildWelcomeDmEmbed,
   buildAccessChannelEmbed,
   buildAccessChannelButtons,

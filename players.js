@@ -7,6 +7,11 @@
 const PlayerModel = require('./models/Player');
 const config = require('./config');
 const { scrapePlayer } = require('./scraper');
+// Namespace import (not destructured) — deliberately, so a test can monkey-patch individual
+// functions on this object directly (e.g. fortniteApiOAuth.refreshWithToken = async () => ...),
+// same "destructured at require time can't be stubbed the way a namespace import can" precedent
+// documented for discord-dm.js's dmUser and tournament-scraper.js's scrapeUpcomingTournaments.
+const fortniteApiOAuth = require('./fortnite-api-oauth');
 
 // How often a player may force a fresh FT scrape early via /refresh-stats (refreshPlayerStats),
 // independent of everything below — a player-initiated action, not automatic cache reuse.
@@ -174,6 +179,16 @@ function isEpicLinked(playerRecord) {
   return !!(playerRecord?.epicOAuthLinked && playerRecord.epicId && playerRecord.epicUsername);
 }
 
+// Second, SEPARATE authorization check — api-fortnite.com's own OAuth (fortnite-api-oauth.js), not
+// the Epic-direct one isEpicLinked checks above. deviceId/deviceSecret required alongside
+// accountId (not just accountId alone) since those are what getValidFortniteApiAccessToken below
+// falls back to once the short-lived accessToken/refreshToken have both expired — a record with
+// only an accountId and no device credentials would silently be unable to ever refresh.
+function isFortniteApiOAuthLinked(playerRecord) {
+  const link = playerRecord?.fortniteApiOAuth;
+  return !!(link?.accountId && link.deviceId && link.deviceSecret);
+}
+
 // Clears whatever cached Fortnite Tracker stats are on a record — used whenever the linked Epic
 // account changes (a fresh link, a re-link to a *different* account, or an explicit unlink), since
 // getPlayerStats' cache (below) keys purely off lastUpdated/discordId+guildId with no check that
@@ -207,6 +222,19 @@ async function linkEpicAccount(guildId, discordId, { epicId, epicUsername }) {
   });
 }
 
+// Called once index.js's pollFortniteApiAuthorization observes a completed device-auth flow
+// (fortnite-api-oauth.js's pollComplete returning status:'authorized'). Mirrors linkEpicAccount's
+// exact persistence shape above, but on the structurally separate fortniteApiOAuth field — never
+// touches epicId/epicUsername/epicOAuthLinked. A re-run (re-authorizing after this player's device
+// auth was revoked, or simply re-clicking the button) just overwrites the whole sub-document with
+// fresh credentials, same "replace outright" behavior linkEpicAccount already has for its own
+// field.
+async function linkFortniteApiOAuth(guildId, discordId, { accountId, accessToken, refreshToken, expiresAt, deviceId, deviceSecret }) {
+  return module.exports.upsertPlayer(guildId, discordId, {
+    fortniteApiOAuth: { accountId, accessToken, refreshToken, expiresAt, deviceId, deviceSecret, linkedAt: new Date() },
+  });
+}
+
 // Reverts a player to the unlinked state (resolveEpicIdentity's Discord-nickname fallback) — the
 // only way to fully unlink today, since re-triggering Link Epic Account only ever replaces the
 // link with a new one, never removes it outright (see index.js's /unlink-epic command). Cached
@@ -223,6 +251,73 @@ function formatAge(ms) {
   const mins = Math.round(ms / 60000);
   if (mins < 60) return `${mins}m`;
   return `${(mins / 60).toFixed(1)}h`;
+}
+
+// Returns a valid api-fortnite.com access token for this player, refreshing (and persisting the
+// refreshed credentials) if the stored one has expired or is about to within the next minute —
+// refresh-token first (cheap, no browser needed), falling back to refresh-device (the real long-
+// term mechanism, see fortnite-api-oauth.js's header comment) only if refresh-token itself comes
+// back invalid. Returns null if BOTH fail (e.g. the player revoked device access from their own
+// Epic account settings) — the caller (applyFortniteApiOAuthOverride below) treats that exactly
+// like "never authorized" and falls back to Fortnite Tracker, never throwing this player's queue-
+// join/scrape into an error state over an auth problem on a purely optional enhancement.
+async function getValidFortniteApiAccessToken(guildId, discordId, link) {
+  const stillValid = link.expiresAt && new Date(link.expiresAt).getTime() > Date.now() + 60_000;
+  if (stillValid) return link.accessToken;
+
+  let result = await fortniteApiOAuth.refreshWithToken(link.refreshToken);
+  if (result.status !== 'ok') {
+    result = await fortniteApiOAuth.refreshWithDevice({ accountId: link.accountId, deviceId: link.deviceId, secret: link.deviceSecret });
+  }
+  if (result.status !== 'ok') {
+    console.warn(`[players] fortnite-api OAuth refresh failed for ${discordId} (guild ${guildId}) via both refresh-token and refresh-device — falling back to Fortnite Tracker until re-authorized`);
+    return null;
+  }
+
+  await module.exports.upsertPlayer(guildId, discordId, {
+    fortniteApiOAuth: {
+      accountId: result.accountId ?? link.accountId,
+      accessToken: result.accessToken,
+      refreshToken: result.refreshToken ?? link.refreshToken,
+      expiresAt: result.expiresAt,
+      deviceId: link.deviceId,
+      deviceSecret: link.deviceSecret,
+      linkedAt: link.linkedAt ?? null,
+    },
+  });
+  return result.accessToken;
+}
+
+// Called right after every scrapePlayer() call, before persistence — see this file's top-level
+// getPlayerStats/getContextualPlayerStats/refreshPlayerStats/forceRefreshStats, each of which
+// already has its own `existing` record fetched (via a direct, un-.lean()'d PlayerModel.findOne,
+// same shape those functions already use for their own cache checks) — passed in here rather than
+// re-fetched, both to avoid a redundant query and because getPlayer()'s own .lean()-chained query
+// shape genuinely differs from what these callers already use. Purely additive: the Fortnite
+// Tracker scrape above ALWAYS still runs unchanged (totalPR/thisSeasonPR/prBand/sessions have no
+// other source), this only ever overrides `fresh.recentEvents` on top of it, and only when every
+// step actually produces usable data — any gap anywhere in this chain (not configured, never
+// authorized, refresh failed, fetch failed, unparseable/empty response) silently returns `fresh`
+// untouched. That's what makes this a true zero-risk enhancement: a player who hasn't done this
+// second authorization is never even queried (isFortniteApiOAuthLinked short-circuits before any
+// network call), and a player who HAS but hits any real-world failure gets exactly the same
+// recentEvents they'd have gotten without this feature existing at all.
+async function applyFortniteApiOAuthOverride(guildId, discordId, existingRecord, fresh) {
+  if (!fortniteApiOAuth.isConfigured()) return fresh;
+  if (!module.exports.isFortniteApiOAuthLinked(existingRecord)) return fresh;
+
+  const link = existingRecord.fortniteApiOAuth;
+  const accessToken = await getValidFortniteApiAccessToken(guildId, discordId, link);
+  if (!accessToken) return fresh;
+
+  const history = await fortniteApiOAuth.fetchTournamentHistory(link.accountId, accessToken);
+  if (history == null) return fresh; // today's confirmed 404/403 gap, or a real transient failure
+
+  const mappedEvents = fortniteApiOAuth.mapHistoryToRecentEvents(history);
+  if (mappedEvents.length === 0) return fresh; // nothing usable — keep Fortnite Tracker's own recentEvents
+
+  console.log(`[players] recentEvents for ${discordId} (guild ${guildId}) sourced from api-fortnite.com OAuth history (${mappedEvents.length} events) instead of Fortnite Tracker`);
+  return { ...fresh, recentEvents: mappedEvents };
 }
 
 function toStatsFields(scraped) {
@@ -267,7 +362,8 @@ async function getPlayerStats(guildId, discordId, epicUsername, epicId, region) 
     `[stats] cache MISS for ${epicUsername} (${discordId}) — `
     + `${existing?.lastUpdated ? `stale (${formatAge(age)} old)` : 'no cached record'}, scraping fresh`
   );
-  const fresh = await scrapePlayer(epicUsername, region, epicId);
+  let fresh = await scrapePlayer(epicUsername, region, epicId);
+  fresh = await applyFortniteApiOAuthOverride(guildId, discordId, existing, fresh);
   await upsertPlayer(guildId, discordId, { epicUsername, epicId, ...toStatsFields(fresh) });
   return fresh;
 }
@@ -286,7 +382,8 @@ async function refreshPlayerStats(guildId, discordId, epicUsername, epicId, regi
   }
 
   console.log(`[stats] manual refresh for ${epicUsername} (${discordId}) — scraping fresh`);
-  const fresh = await scrapePlayer(epicUsername, region, epicId);
+  let fresh = await scrapePlayer(epicUsername, region, epicId);
+  fresh = await applyFortniteApiOAuthOverride(guildId, discordId, existing, fresh);
   await upsertPlayer(guildId, discordId, { epicUsername, epicId, ...toStatsFields(fresh) });
   return { limited: false, stats: fresh };
 }
@@ -296,7 +393,12 @@ async function refreshPlayerStats(guildId, discordId, epicUsername, epicId, regi
 // does exactly what was asked.
 async function forceRefreshStats(guildId, discordId, epicUsername, epicId, region) {
   console.log(`[stats] force refresh for ${epicUsername} (${discordId}) — scraping fresh, ignoring cache`);
-  const fresh = await scrapePlayer(epicUsername, region, epicId);
+  // Fetched purely for applyFortniteApiOAuthOverride below (this function otherwise ignores any
+  // cached state, by design) — same direct, un-.lean()'d PlayerModel.findOne shape
+  // getPlayerStats/refreshPlayerStats/getContextualPlayerStats already use for the same purpose.
+  const existing = await PlayerModel.findOne({ guildId, discordId });
+  let fresh = await scrapePlayer(epicUsername, region, epicId);
+  fresh = await applyFortniteApiOAuthOverride(guildId, discordId, existing, fresh);
   await upsertPlayer(guildId, discordId, { epicUsername, epicId, ...toStatsFields(fresh) });
   return fresh;
 }
@@ -334,7 +436,11 @@ async function getContextualPlayerStats(guildId, discordId, epicUsername, epicId
     `[stats] contextual cache MISS for ${epicUsername} (${discordId}) context=${key} — `
     + `${cached?.lastUpdated ? `stale (${formatAge(age)} old)` : 'never fetched for this context'}, scraping fresh`
   );
-  const fresh = await scrapePlayer(epicUsername, region, epicId, platformSegment);
+  let fresh = await scrapePlayer(epicUsername, region, epicId, platformSegment);
+  // The api-fortnite.com history override is deliberately applied here too, not just in the
+  // home-context path — a player's real tournament-history data doesn't vary by which FT-scraped
+  // (region, platform) context triggered this fetch, it's the same underlying source either way.
+  fresh = await applyFortniteApiOAuthOverride(guildId, discordId, existing, fresh);
   await PlayerModel.updateOne(
     { guildId, discordId },
     { $set: { [`statsByContext.${key}`]: toStatsFields(fresh) } }
@@ -554,6 +660,8 @@ module.exports = {
   isEpicLinked,
   linkEpicAccount,
   unlinkEpicAccount,
+  isFortniteApiOAuthLinked,
+  linkFortniteApiOAuth,
   getPlayerStats,
   getContextualPlayerStats,
   getStatsForContext,
