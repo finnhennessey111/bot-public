@@ -64,8 +64,6 @@ function makePlayer(discordId, tournamentName, region, queueType) {
     consoleOnly: false,
     ingameRoles: [],
     languages: [],
-    ageBracket: null,
-    bio: null,
     totalPR: 500,
     thisSeasonPR: 0,
     matchScore: 500,

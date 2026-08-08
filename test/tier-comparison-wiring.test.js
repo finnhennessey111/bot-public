@@ -137,7 +137,10 @@ test('creative-queue.js: buildCreativePlayer uses computeMatchScoreBreakdownWith
   const source = fs.readFileSync(path.join(__dirname, '..', 'creative-queue.js'), 'utf8');
   assert.match(source, /require\('\.\/scraper'\)/);
   assert.match(source, /computeMatchScoreBreakdownWithTierComparison/);
-  assert.match(source, /await computeMatchScoreBreakdownWithTierComparison\(playerData, mode\)/);
+  // Third argument (formRosterSizeForMode(mode)) is what splits 1v1/2v2 scoring — see
+  // test/creative-1v1-2v2-score-split.test.js for the behavioral verification of that split;
+  // this just confirms the tier-comparison-aware wrapper is still the one actually called.
+  assert.match(source, /await computeMatchScoreBreakdownWithTierComparison\(playerData, mode, formRosterSizeForMode\(mode\)\)/);
 });
 
 test('elo.js: buildCreativeElo/buildTournamentElo use computeMatchScoreBreakdownWithTierComparison, not the plain sync computeMatchScoreBreakdown', () => {

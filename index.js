@@ -72,6 +72,7 @@ const { startWebhookServer, simulateCheckoutCompleted } = require('./webhook-ser
 const { startAccessScheduler } = require('./notifications');
 const { QUEUE_CHANNEL_CONFIGS, categoryForAnyMode } = require('./creative-channel-configs');
 const db = require('./db');
+const { alertError } = require('./error-alert');
 const feedback = require('./feedback');
 const postMatchFeedback = require('./post-match-feedback');
 const {
@@ -80,6 +81,9 @@ const {
 } = require('./embeds');
 
 const botStartTime = Date.now();
+// Set if store.init() throws — that happens before client.login(), so there's no logged-in client
+// yet to DM about it. Checked (and alerted on) once the client actually comes online below.
+let storeInitError = null;
 
 async function replyModOnly(interaction) {
   await interaction.editReply({ content: '❌ This command is restricted to the MatchMaker Mod role.' });
@@ -188,8 +192,9 @@ async function finalizeTeamQueueJoin(interaction, category, selection, membersRa
     }
 
     const players = await Promise.all(members.map(async member => {
-      const platform = getPlatformFromMember(guild.id, member);
       const { epicUsername, epicId } = await resolveEpicIdentity(guild, member);
+      // platform is no longer passed in — buildCreativePlayer resolves it itself from the
+      // player's own stored Player.platforms (it already fetches that doc for homeRegion).
       return buildCreativePlayer({
         guildId: guild.id,
         guildName: guild.name,
@@ -200,7 +205,6 @@ async function finalizeTeamQueueJoin(interaction, category, selection, membersRa
         epicId,
         mode: selection.mode,
         region: selection.region,
-        platform,
       });
     }));
 
@@ -253,10 +257,12 @@ async function refreshTeamFormingMessage(team) {
 async function sendTeamInvites(channel, guild, team, invites) {
   const teammatePlayers = await Promise.all(team.members.map(async m => {
     const member = await guild.members.fetch(m.discordId);
-    const platform = getPlatformFromMember(guild.id, member) ?? 'PC';
     const { epicUsername } = await resolveEpicIdentity(guild, member);
     const playerData = await playerStore.getPlayerStats(guild.id, m.discordId, epicUsername, null, team.region);
     const userData = await playerStore.getPlayer(guild.id, m.discordId);
+    // Display-only (no console-only-tournament concept for a creative team invite card), so
+    // tournamentConsoleOnly is always false — same reasoning as creative-queue.js's own resolution.
+    const platform = playerStore.resolveQueuePlatform(userData?.platforms, false);
     return { epicUsername, platform, totalPR: playerData.totalPR, region: userData?.region ?? null };
   }));
 
@@ -499,7 +505,51 @@ const client = new Client({
   ],
 });
 
+// Process-wide safety net — nothing previously caught either of these at all (confirmed: no
+// process.on('uncaughtException'/'unhandledRejection') existed anywhere in this codebase), so a
+// bug that threw outside any try/catch would either crash the process (pm2 restarts it) or vanish
+// silently, with no one finding out until something visibly broke. Unlike the curated per-
+// subsystem alertError calls elsewhere, there's no "routine" version of either of these — they
+// always alert.
+process.on('uncaughtException', (err) => {
+  console.error('[fatal] Uncaught exception:', err.message);
+  alertError(client, { area: 'Uncaught Exception', summary: err.message });
+});
+
+process.on('unhandledRejection', (reason) => {
+  const message = reason instanceof Error ? reason.message : String(reason);
+  console.error('[fatal] Unhandled promise rejection:', message);
+  alertError(client, { area: 'Unhandled Rejection', summary: message });
+});
+
+client.on('error', (err) => {
+  console.error('[fatal] Discord client error:', err.message);
+  alertError(client, { area: 'Discord Client Error', summary: err.message });
+});
+
+client.on('shardError', (err) => {
+  console.error('[fatal] Discord shard error:', err.message);
+  alertError(client, { area: 'Discord Shard Error', summary: err.message });
+});
+
+// Runtime connection loss, not "MONGODB_URI not set" (db.js already handles that with a
+// console.warn, no alert — it's an expected local/offline-fallback state, not a bug).
+db.mongoose.connection.on('error', (err) => {
+  alertError(client, { area: 'MongoDB', summary: `Connection error: ${err.message}` });
+});
+
+db.mongoose.connection.on('disconnected', () => {
+  alertError(client, {
+    area: 'MongoDB',
+    summary: 'Disconnected from MongoDB — persistence and per-guild config reads/writes are affected until it reconnects.',
+  });
+});
+
 client.once('clientReady', async () => {
+  if (storeInitError) {
+    alertError(client, { area: 'Store Init', summary: `store.init() failed unexpectedly at startup: ${storeInitError.message}` });
+  }
+
   console.log(`✅ MatchMaker bot is online as ${client.user.tag}`);
 
   // Registration used to be a manual `node register-commands.js` step someone had to remember to
@@ -522,6 +572,12 @@ client.once('clientReady', async () => {
   // embed+buttons forever, since nothing else proactively re-visits it (an admin would have to
   // remember to manually re-run /matchmaker-setup). See creative-channel.js's doc comment.
   repairComingSoonCreativeChannels(client).catch(err => console.error('Failed to repair coming-soon creative channels on startup:', err.message));
+
+  // Self-heal for the get-roles bio/age-bracket removal — clears the stale field(s) off any
+  // Player document that still has them from before the feature was removed. Pure DB, no client/
+  // guild loop needed (same shape as tier-comparison's own startup call below) since neither field
+  // was ever backed by a Discord role. See players.js's removeBioAndAgeBracketFields doc comment.
+  playerStore.removeBioAndAgeBracketFields().catch(err => console.error('Failed to clean up bio/ageBracket fields on startup:', err.message));
 
   startScheduler(client, pinnedMessages);
   // Pure DB read/write (real player docs -> models/TierBandStats.js) — no Discord API calls at
@@ -669,15 +725,6 @@ async function guardModRoleGrant(oldMember, newMember) {
   console.log(`🚫 Reverted unauthorized MatchMaker Mod grant: ${executor.tag ?? executor.id} tried to assign it to ${newMember.user.tag}.`);
 }
 
-// ── PLATFORM HELPERS ──────────────────────────────────────────────────────────
-
-function getPlatformFromMember(guildId, member) {
-  if (member.roles.cache.has(getRoleId(guildId, 'PC'))) return 'PC';
-  if (member.roles.cache.has(getRoleId(guildId, 'Console'))) return 'Console';
-  if (member.roles.cache.has(getRoleId(guildId, 'Mobile'))) return 'Mobile';
-  return null;
-}
-
 // ── INTERACTION HANDLER ────────────────────────────────────────────────────────
 client.on('interactionCreate', async (interaction) => {
   try {
@@ -781,9 +828,10 @@ async function handleInteraction(interaction) {
       await interaction.editReply({ content: `✅ Creative ${category} queue embed posted and pinned.` });
     }
 
-    // /setup-howto — posts wherever the command is run (previously a fixed env-var channel;
-    // /matchmaker-setup posts the same embed automatically into #how-to-use on first setup —
-    // this command is for manually re-posting/refreshing it elsewhere).
+    // /setup-howto — posts wherever the command is run. Used to also be auto-posted by
+    // /matchmaker-setup into a dedicated #how-to-use channel; that channel was removed (redundant
+    // with this command, which a mod can already run in whichever channel they'd rather have it
+    // live in), so this is now the only way the how-to embed gets posted, always manual.
     if (interaction.commandName === 'setup-howto') {
       await interaction.deferReply({ flags: 64 });
       if (!isModMember(interaction.guild.id, interaction)) return replyModOnly(interaction);
@@ -1144,12 +1192,6 @@ async function handleInteraction(interaction) {
 
   // ── MODAL SUBMISSIONS ────────────────────────────────────────────────────────
   if (interaction.isModalSubmit()) {
-    if (interaction.customId === 'bio_modal') {
-      const bio = interaction.fields.getTextInputValue('bio_input');
-      await playerStore.upsertPlayer(interaction.guild.id, interaction.user.id, { bio });
-      await interaction.reply({ content: `✅ Bio saved: "${bio}"`, flags: 64 });
-    }
-
     // ── SUGGESTION MODAL SUBMIT ────────────────────────────────────────────────
     // Stores centrally (models/Suggestion.js) AND forwards to the developer via a DM regardless of
     // which server it came from — see suggestions.js's doc comment. Storage happens first and
@@ -1241,9 +1283,32 @@ async function handleInteraction(interaction) {
       await interaction.editReply({ content: `✅ Language(s) set to **${values.join(', ')}**.` });
     }
 
-    if (customId === 'select_age_bracket') {
-      await playerStore.upsertPlayer(guildId, user.id, { ageBracket: values[0] });
-      await interaction.editReply({ content: `✅ Age bracket set to **${values[0]}**.` });
+    // Additive, not a replace-one-with-the-other pick — see embeds.js's buildPlatformSelectRow doc
+    // comment. Unlike every other select above (which only ever ADDS roles, never removes one for
+    // a value the player deselects — e.g. select_extra_regions), this one also REMOVES a role for
+    // any platform that was previously selected but isn't in `values` anymore: a stale Console role
+    // left behind after deselecting it would wrongly keep granting console-only-tournament
+    // eligibility (queue.js's isCompatiblePlatform) for someone who said they no longer have it.
+    // The previous value has to be read BEFORE the upsert below overwrites it — upsertPlayer
+    // returns the doc AFTER the update, not before, so there's no way to diff against its result.
+    if (customId === 'select_platform') {
+      const previous = await playerStore.getPlayer(guildId, user.id);
+      const previousPlatforms = previous?.platforms ?? [];
+
+      await playerStore.upsertPlayer(guildId, user.id, { platforms: values });
+
+      for (const platform of values) {
+        await assignRole(interaction.guild, user.id, platformRoleId(guildId, platform));
+      }
+      for (const platform of previousPlatforms) {
+        if (!values.includes(platform)) {
+          await removeRole(interaction.guild, user.id, platformRoleId(guildId, platform));
+        }
+      }
+
+      await interaction.editReply({
+        content: values.length > 0 ? `✅ Platform(s) set to: **${values.join(', ')}**.` : '✅ Platform(s) cleared.',
+      });
     }
 
     if (customId.startsWith('creative_mode_')) {
@@ -1494,24 +1559,6 @@ async function handleInteraction(interaction) {
       return;
     }
 
-    // ── BIO BUTTON ───────────────────────────────────────────────────────────
-    if (customId === 'set_bio') {
-      const modal = new ModalBuilder()
-        .setCustomId('bio_modal')
-        .setTitle('Set Your Bio');
-
-      const bioInput = new TextInputBuilder()
-        .setCustomId('bio_input')
-        .setLabel('Tell teammates about yourself')
-        .setStyle(TextInputStyle.Short)
-        .setPlaceholder('e.g. Chill vibes, evenings EU, looking to improve')
-        .setMaxLength(150)
-        .setRequired(false);
-
-      modal.addComponents(new ActionRowBuilder().addComponents(bioInput));
-      await interaction.showModal(modal);
-    }
-
     // ── SUGGESTION BUTTON (posted in #suggestions) ────────────────────────────
     if (customId === 'suggestion_open') {
       const modal = new ModalBuilder()
@@ -1606,8 +1653,6 @@ async function handleInteraction(interaction) {
         return replyAndDismiss(interaction, buildEpicLinkRequiredReply(guild.id, user.id));
       }
 
-      const platform = getPlatformFromMember(guild.id, member);
-
       const existingTournamentUnit = findUnitByDiscordId(guild.id, user.id);
       if (existingTournamentUnit) {
         if (existingTournamentUnit.tournamentName === tournamentName && existingTournamentUnit.region === region) {
@@ -1645,6 +1690,17 @@ async function handleInteraction(interaction) {
 
         const userData = await playerStore.getPlayer(guild.id, user.id);
         const homeRegion = userData?.region ?? region;
+        const platform = playerStore.resolveQueuePlatform(userData?.platforms, consoleOnly);
+
+        // null only when this tournament is console-only and the player hasn't checked Console in
+        // #get-roles — genuinely not eligible, not a guess. Blocked here instead of letting them
+        // join a pool that can never match them (queue.js's isCompatiblePlatform requires every
+        // member be platform === 'Console' for a console-only match).
+        if (!platform) {
+          return replyAndDismiss(interaction, {
+            content: `❌ This tournament is Console-only. Add **Console** as a platform in <#${getChannelId(guild.id, 'getRoles')}> first.`,
+          });
+        }
 
         const player = await buildPlayer({
           guildId: guild.id,
@@ -1663,8 +1719,6 @@ async function handleInteraction(interaction) {
           consoleOnly,
           ingameRoles: userData?.ingameRoles ?? [],
           languages: userData?.languages ?? [],
-          ageBracket: userData?.ageBracket ?? null,
-          bio: userData?.bio ?? null,
         });
 
         const { unit } = await joinQueue({ guildId: guild.id, players: [player], tournamentName, region, queueType });
@@ -1723,8 +1777,6 @@ async function handleInteraction(interaction) {
         return replyAndDismiss(interaction, buildEpicLinkRequiredReply(guild.id, user.id));
       }
 
-      const platform = getPlatformFromMember(guild.id, member);
-
       const existingTournamentUnit = findUnitByDiscordId(guild.id, user.id);
       if (existingTournamentUnit) {
         if (existingTournamentUnit.tournamentName === poolTournamentName && existingTournamentUnit.region === region) {
@@ -1764,6 +1816,13 @@ async function handleInteraction(interaction) {
 
         const userData = await playerStore.getPlayer(guild.id, user.id);
         const homeRegion = userData?.region ?? region;
+        const platform = playerStore.resolveQueuePlatform(userData?.platforms, consoleOnly);
+
+        if (!platform) {
+          return replyAndDismiss(interaction, {
+            content: `❌ This tournament is Console-only. Add **Console** as a platform in <#${getChannelId(guild.id, 'getRoles')}> first.`,
+          });
+        }
 
         const player = await buildPlayer({
           guildId: guild.id,
@@ -1782,8 +1841,6 @@ async function handleInteraction(interaction) {
           consoleOnly,
           ingameRoles: userData?.ingameRoles ?? [],
           languages: userData?.languages ?? [],
-          ageBracket: userData?.ageBracket ?? null,
-          bio: userData?.bio ?? null,
         });
 
         const { unit } = await joinQueue({ guildId: guild.id, players: [player], tournamentName: poolTournamentName, region, queueType });
@@ -1938,9 +1995,10 @@ async function handleInteraction(interaction) {
           });
         }
 
-        const platform = getPlatformFromMember(guild.id, member);
         const { epicUsername, epicId } = await resolveEpicIdentity(guild, member);
 
+        // platform is no longer passed in — buildCreativePlayer resolves it itself from the
+        // player's own stored Player.platforms.
         const player = await buildCreativePlayer({
           guildId: guild.id,
           guildName: guild.name,
@@ -1951,7 +2009,6 @@ async function handleInteraction(interaction) {
           epicId,
           mode: selection.mode,
           region: selection.region,
-          platform,
         });
 
         const { unit } = joinCreativeQueue({ guildId: guild.id, player, mode: selection.mode, region: selection.region });
@@ -2480,6 +2537,15 @@ function ingameRoleId(guildId, role) {
   return getRoleId(guildId, role);
 }
 
+// PC/Console — ROLE_SPECS (matchmaker-setup.js) has created these for every guild since day one,
+// but nothing ever assigned them until select_platform below: getPlatformFromMember used to READ
+// them (for isCompatiblePlatform's match-time gate and getStatsForContext's segment resolution),
+// with no self-service path to ever populate them, so a console-only tournament could never
+// actually produce a match — see players.js's resolveQueuePlatform doc comment for the full story.
+function platformRoleId(guildId, platform) {
+  return getRoleId(guildId, platform);
+}
+
 // ── HELPER: ASSIGN ROLE ───────────────────────────────────────────────────────
 async function assignRole(guild, discordId, roleId) {
   if (!roleId) return;
@@ -2488,6 +2554,21 @@ async function assignRole(guild, discordId, roleId) {
     await member.roles.add(roleId);
   } catch (err) {
     console.error(`Failed to assign role ${roleId}:`, err.message);
+  }
+}
+
+// ── HELPER: REMOVE ROLE ───────────────────────────────────────────────────────
+// Mirrors assignRole above — needed for select_platform (unlike every other get-roles select,
+// which only ever ADDS roles for a real reason: deselecting Console must actually revoke
+// eligibility for console-only tournament matching, not just leave a stale role granting it
+// forever, the way e.g. select_extra_regions' regions are never revoked once added).
+async function removeRole(guild, discordId, roleId) {
+  if (!roleId) return;
+  try {
+    const member = await guild.members.fetch(discordId);
+    await member.roles.remove(roleId);
+  } catch (err) {
+    console.error(`Failed to remove role ${roleId}:`, err.message);
   }
 }
 
@@ -2543,7 +2624,7 @@ async function updateQueueEmbed(guildId, channelId, tournamentName, region, isTr
 // Same job as updateQueueEmbed above, for Ranked Cup channels — rebuilds the per-rank count
 // breakdown (embeds.js's buildRankedCupTournamentEmbed) instead of a single queueCount, reading
 // each rank tier's own pool via rankedCupPoolName. Components are left untouched (same as
-// updateQueueEmbed) — the 6 rank buttons never change, only the embed's counts do.
+// updateQueueEmbed) — the rank buttons never change, only the embed's counts do.
 async function updateRankedCupQueueEmbed(guildId, channelId) {
   try {
     const channel = await client.channels.fetch(channelId);
@@ -2721,5 +2802,8 @@ async function closeMatchChannelCluster(channelsByGuildId, noticeMessage) {
 startWebhookServer(client);
 
 store.init()
-  .catch(err => console.error('[Store] init() failed unexpectedly:', err.message))
+  .catch(err => {
+    console.error('[Store] init() failed unexpectedly:', err.message);
+    storeInitError = err;
+  })
   .finally(() => client.login(process.env.DISCORD_TOKEN));

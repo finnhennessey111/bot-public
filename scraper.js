@@ -85,7 +85,7 @@ async function scrapePlayerOnce(epicUsername, region = 'EU', epicId = null, plat
       // blocked unrelated asset can no longer stall a scrape that already has everything it needs.
       await page.goto(url, { waitUntil: 'domcontentloaded', timeout: PLAYER_SCRAPE_NAV_TIMEOUT_MS });
 
-      const { profile, thisSeasonPR: domThisSeasonPR } = await page.evaluate(() => {
+      const { profile, thisSeasonPR: domThisSeasonPR, sessions: domSessions } = await page.evaluate(() => {
         const scripts = Array.from(document.querySelectorAll('script'));
         let profile = null;
         for (const script of scripts) {
@@ -116,12 +116,21 @@ async function scrapePlayerOnce(epicUsername, region = 'EU', epicId = null, plat
           return Number.isFinite(num) ? num : null;
         }
 
-        return { profile, thisSeasonPR: extractStatValue('This Season') };
+        // "Sessions" is a SECOND label/value pair in the same "Event Totals" block "This Season"
+        // already comes from (alongside Earnings/Events/Matches/Team Elims) — confirmed live via a
+        // real Puppeteer capture of this exact page: same `.profile-stat__label`/`.profile-stat__
+        // value` structure, same page load, no separate navigation needed. Unlike "This Season"
+        // there's no confirmed-wrong `profile` JSON alternative to guard against here — a real
+        // full-payload search of `profile` for a `session`-matching key found only per-event
+        // `windows[].data.sessions[]` records (individual session objects nested under myEvents),
+        // never a lifetime aggregate count — so the DOM is the only real source for this figure at
+        // all, not a fallback from a preferred JSON field the way thisSeasonPR's DOM read is.
+        return { profile, thisSeasonPR: extractStatValue('This Season'), sessions: extractStatValue('Sessions') };
       });
 
       if (!profile) throw new Error(`Could not find profile data for: ${epicUsername}`);
 
-      return parseProfileData(profile, domThisSeasonPR);
+      return parseProfileData(profile, domThisSeasonPR, domSessions);
 
     } finally {
       await closeBrowserSafely(browser);
@@ -147,7 +156,7 @@ async function scrapePlayer(epicUsername, region = 'EU', epicId = null, platform
   }
 }
 
-function parseProfileData(data, domThisSeasonPR) {
+function parseProfileData(data, domThisSeasonPR, domSessions) {
   const totalPR = extractPowerRank(data.powerRank);
   const prBand = extractPRBand(data.powerRank);
 
@@ -160,6 +169,13 @@ function parseProfileData(data, domThisSeasonPR) {
   // player with no competitive/PR history at all, not a markup-change false negative in the cases
   // checked) defaults to 0, same as "hasn't played this season" always meant here.
   const thisSeasonPR = domThisSeasonPR ?? 0;
+
+  // Unlike thisSeasonPR, deliberately kept null (never defaulted to 0) when the DOM block is
+  // absent — this is a divisor for tier-comparison.js's efficiency factor (totalPR / sessions), so
+  // "couldn't scrape a real count" and "genuinely has zero sessions" must stay distinguishable:
+  // silently defaulting to 0 here would either produce a division by zero or a fabricated
+  // "infinitely efficient" signal downstream, neither of which is real data.
+  const sessions = domSessions ?? null;
 
   const recentEvents = [];
   if (data.myEvents) {
@@ -204,7 +220,7 @@ function parseProfileData(data, domThisSeasonPR) {
   // soloModifier), so cap well above that to bound what gets stored without risking either signal.
   const cappedRecentEvents = recentEvents.slice(0, 20);
 
-  return { totalPR, thisSeasonPR, prBand, recentEvents: cappedRecentEvents };
+  return { totalPR, thisSeasonPR, prBand, recentEvents: cappedRecentEvents, sessions };
 }
 
 function extractPowerRank(powerRank) {
@@ -260,17 +276,32 @@ function computeOwnTournamentModifier(recentEvents, matchesEvent, currentPR) {
 }
 
 // soloModifier deliberately excludes ranked-cup events (name matches /ranked/i) even though
-// they're otherwise eligible (rosterSize === 1): ranked cups have easy lobbies and no real
-// stakes, so strong results there don't indicate real skill and must never feed this signal.
+// they're otherwise eligible (rosterSize === formRosterSize): ranked cups have easy lobbies and no
+// real stakes, so strong results there don't indicate real skill and must never feed this signal.
 // This exclusion is specific to soloModifier's use of results as a GENERAL skill signal — it
 // does NOT apply to ownTournamentModifier below, where self-referential history for the exact
 // same tournament (even if that tournament is a ranked cup) is always a fair signal.
 //
 // Real solo-event source confirmed unchanged: derived by filtering the player's own already-scraped
-// recentEvents (rosterSize === 1, title not ranked) rather than a dedicated Fortnite Tracker
-// playlist=solo fetch — investigated live: playlist=solo has no filtering effect on the per-player
-// profile URL (identical unfiltered results with or without it) and doesn't isolate solo-only
-// results on the tournament calendar URL either, so there's no real "corrected URL" to switch to.
+// recentEvents (rosterSize === formRosterSize, title not ranked) rather than a dedicated Fortnite
+// Tracker playlist=solo fetch — investigated live: playlist=solo has no filtering effect on the
+// per-player profile URL (identical unfiltered results with or without it) and doesn't isolate
+// solo-only results on the tournament calendar URL either, so there's no real "corrected URL" to
+// switch to. recentEvents itself is already PR-granting-only (scraper.js's parseProfileData skips
+// any event where !event.isPrEvent before it's ever stored), so no separate PR-granting check is
+// needed here beyond the rosterSize/ranked-cup filters.
+//
+// formRosterSize (default 1, i.e. solo) lets a caller ask for the SAME mechanism — recent decayed
+// PR from same-format events, as a percentage of currentPR — filtered on a different team size
+// instead. Added for creative-queue.js's buildCreativePlayer: a 1v1 join wants genuine recent SOLO
+// form (rosterSize 1, unchanged default), while a 2v2 join wants genuine recent DUO form
+// (rosterSize 2) — general recent performance in that format, not tied to one specific tournament,
+// same structural shape either way. Every other caller (queue.js's real-tournament buildPlayer,
+// elo.js's public lookup) never passes this, so they keep today's solo-only behavior unchanged.
+// The output fields below stay named soloModifier/soloEvents regardless of formRosterSize — every
+// existing consumer (feedback.js's MatchFeedback snapshot, elo.js's display) already treats that
+// name as "the recent-form modifier that was actually computed," not a promise it's always
+// literally solo; renaming it would only matter for a 2v2 join, where it's a duo-form modifier.
 //
 // No region argument anymore: this used to also take homeRegion/queueRegion to apply a
 // cross-region penalty when they differed, but that penalty is gone now that playerData ITSELF is
@@ -294,7 +325,7 @@ function computeOwnTournamentModifier(recentEvents, matchesEvent, currentPR) {
 // than a 0-100 placement-bucket score applied on top of a pre-scaled base. matchScore is therefore
 // inherently PR-equivalent by construction — no ×10/÷10 conversion needed anywhere this is
 // displayed (Discord or the website).
-function computeMatchScoreBreakdown(playerData, tournamentName) {
+function computeMatchScoreBreakdown(playerData, tournamentName, formRosterSize = 1) {
   const currentPR = playerData.totalPR;
 
   const { modifier: ownTournamentModifier } = computeOwnTournamentModifier(
@@ -302,7 +333,7 @@ function computeMatchScoreBreakdown(playerData, tournamentName) {
   );
 
   const soloEvents = playerData.recentEvents
-    .filter(e => e.rosterSize === 1 && !/ranked/i.test(e.name))
+    .filter(e => e.rosterSize === formRosterSize && !/ranked/i.test(e.name))
     .slice(0, 5);
 
   const soloModifier = (soloEvents.length > 0 && currentPR > 0)
@@ -425,9 +456,11 @@ async function applyTierComparisonModifier(breakdown, playerData) {
 // breakdown, since tier-comparison isn't tournament-specific the way Epic's own placement lookup is
 // — it's a general "does this player's own recent behavior resemble the tier above them" signal,
 // equally applicable to a creative match or a generic tournament-type check as to a real tournament
-// queue join.
-async function computeMatchScoreBreakdownWithTierComparison(playerData, tournamentName) {
-  const breakdown = computeMatchScoreBreakdown(playerData, tournamentName);
+// queue join. formRosterSize passes straight through to computeMatchScoreBreakdown (see its own
+// doc comment) — creative-queue.js's buildCreativePlayer is the one real caller that varies it
+// (1 for a 1v1 join, 2 for a 2v2 join); elo.js never passes it, so its public lookup stays solo-only.
+async function computeMatchScoreBreakdownWithTierComparison(playerData, tournamentName, formRosterSize = 1) {
+  const breakdown = computeMatchScoreBreakdown(playerData, tournamentName, formRosterSize);
   return applyTierComparisonModifier(breakdown, playerData);
 }
 

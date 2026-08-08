@@ -155,6 +155,13 @@ test('scrapePlayerOnce: still extracts correct real profile data from the real l
   assert.equal(typeof data.totalPR, 'number');
   assert.equal(typeof data.thisSeasonPR, 'number');
   assert.ok(Array.isArray(data.recentEvents));
+  // Sessions — same "Event Totals" section as Earnings/Events/Matches, same page load thisSeasonPR's
+  // DOM read already uses, no separate navigation. Real live capture (see scraper.js's
+  // parseProfileData doc comment) confirmed the block can genuinely be absent for an account with
+  // no competitive/PR history in the queried region/platform, same as thisSeasonPR — so this only
+  // asserts the type (number when present) or null, not an exact value that could legitimately
+  // change on the real site between runs.
+  assert.ok(data.sessions === null || typeof data.sessions === 'number', 'sessions must be a real number or a genuine null, never undefined/NaN/a string');
 });
 
 test('scrapeUpcomingTournaments: still extracts correct real calendar data from the real live site with both blocking layers active', async () => {

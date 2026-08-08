@@ -186,6 +186,16 @@ function buildTournamentGroups(rawSessions) {
         region: session.region,
         beginTime: session.beginTime,
         lastBeginTime: session.beginTime,
+        // Real scraped conclusion of this tournament (players.js's invalidateStaleAfterEvent,
+        // fired from channel-manager.js once this passes) — NOT the synthetic deleteAt buffer
+        // channel-manager.js separately computes for channel auto-deletion. null when the source
+        // that produced this session didn't carry a real endTime (see the two rawSessions builders
+        // above); a null group.endTime just means the event-driven invalidation trigger never
+        // fires for this tournament, same fail-soft shape as every other optional signal here.
+        // Tracks the LATEST endTime across every session grouped in below (multi-session
+        // tournaments like FNCS aren't truly over until their last round ends) — same "latest
+        // wins" reasoning as lastBeginTime just below.
+        endTime: session.endTime ?? null,
         consoleOnly: session.consoleOnly,
         isTrios,
         rosterSize,
@@ -209,6 +219,11 @@ function buildTournamentGroups(rawSessions) {
       if (beginTime < new Date(g.beginTime)) g.beginTime = session.beginTime;
       // Track latest start time (for deletion of multi-session tournaments)
       if (beginTime > new Date(g.lastBeginTime)) g.lastBeginTime = session.beginTime;
+      // Track latest real end time across every session/round grouped here — see the endTime
+      // comment on group creation above for why "latest wins" is correct here too.
+      if (session.endTime && (!g.endTime || new Date(session.endTime) > new Date(g.endTime))) {
+        g.endTime = session.endTime;
+      }
     }
   }
 
@@ -218,12 +233,13 @@ function buildTournamentGroups(rawSessions) {
   return Object.values(groups);
 }
 
-// Ranked Cup tournaments span 6 separate in-game rank tiers (Bronze/Silver/Gold/Platinum/Diamond/
-// Elite) under ONE Fortnite Tracker event listing — confirmed against live scrape data, real
-// titles never mention a rank tier at all ("Duos Ranked Cup (Battle Royale)"/"(Zero Build)"/
-// "(Reload)" is the full set observed, one per build mode per region). embeds.js's
-// buildRankedCupQueueButtons/buildRankedCupTournamentEmbed use this to give the channel one queue
-// button per rank instead of the single generic one every other tournament gets.
+// Ranked Cup tournaments span separate in-game rank tiers (Bronze/Silver/Gold/Platinum/Diamond/
+// Elite/Champion/Unreal — embeds.js's RANK_TIERS) under ONE Fortnite Tracker event listing —
+// confirmed against live scrape data, real titles never mention a rank tier at all ("Duos Ranked
+// Cup (Battle Royale)"/"(Zero Build)"/"(Reload)" is the full set observed, one per build mode per
+// region). embeds.js's buildRankedCupQueueButtons/buildRankedCupTournamentEmbed use this to give
+// the channel one queue button per rank instead of the single generic one every other tournament
+// gets.
 function isRankedCupTitle(nameLower) {
   return nameLower.includes('ranked cup');
 }
@@ -538,6 +554,11 @@ async function scrapeEpicCalendar() {
           titleLower,
           region,
           beginTime: window.beginTime,
+          // Epic's own real per-window end (confirmed live — epic-api.js's doc comment on the
+          // regionEntry shape). Dropped by every version of this function before players.js's
+          // event-driven cache invalidation needed it — see buildTournamentGroups' own endTime
+          // comment for what this becomes once grouped.
+          endTime: window.endTime ?? null,
           consoleOnly,
           // Only the consoleOnly boolean above is actually read downstream (channel-manager.js/
           // queue.js's isCompatiblePlatform) — the real platforms array is what consoleOnly was
@@ -586,6 +607,12 @@ async function scrapeTrackerCalendar() {
           titleLower,
           region,
           beginTime: window.beginTime,
+          // Not confirmed present in Fortnite Tracker's own raw `imp_calendar` blob the way it is
+          // for Epic's payload (see scrapeEpicCalendar's endTime comment) — read defensively the
+          // same way every other optional field from this source is. When absent, the group this
+          // session belongs to simply has no endTime, and players.js's event-driven invalidation
+          // just never fires for it (fails soft — see buildTournamentGroups' endTime comment).
+          endTime: window.endTime ?? null,
           consoleOnly: platforms.length === 1 && platforms[0] === 'Console',
           platforms,
           // e.g. "epicgames_S41_PSTypicalGamer_EU" — see buildTournamentGroups' eventId comment.

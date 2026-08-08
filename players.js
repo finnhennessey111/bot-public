@@ -8,42 +8,48 @@ const PlayerModel = require('./models/Player');
 const config = require('./config');
 const { scrapePlayer } = require('./scraper');
 
-// How long a scraped stats snapshot is trusted before a Queue click triggers a fresh FT scrape
-// (getPlayerStats), vs. how often a player may force one early via /refresh-stats
-// (refreshPlayerStats). Deliberately separate constants — one paces automatic reuse, the other
-// paces user-initiated re-scrapes — even though today they're both read off the same
-// lastUpdated timestamp.
-const RECENT_ACTIVITY_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+// How often a player may force a fresh FT scrape early via /refresh-stats (refreshPlayerStats),
+// independent of everything below — a player-initiated action, not automatic cache reuse.
 const REFRESH_COOLDOWN_MS = 60 * 60 * 1000;
 
 // Old tournament results never change once they're over — re-scraping a player whose most recent
-// recorded activity is already old can't turn up anything different, so such a player gets a much
-// longer TTL than one who's actively competing (where a fresh event, or Fortnite Tracker's own
-// continuous PR decay, could genuinely have moved the numbers since yesterday). ~90 days is a
-// conservative floor for "more than a Fortnite competitive season has passed" (real seasons run
-// roughly 10-14 weeks) — used only to pick a cache TTL, never to hide/discard any event data
+// recorded activity is already old can't turn up anything different. ~90 days is a conservative
+// floor for "more than a Fortnite competitive season has passed" (real seasons run roughly 10-14
+// weeks) — used only to pick a cache-invalidation strategy, never to hide/discard any event data
 // itself (recentEvents is stored and returned exactly as scraped either way).
 const SETTLED_ACTIVITY_WINDOW_DAYS = 90;
 
 // Not literally permanent: totalPR is Fortnite Tracker's own continuously-decaying figure (see
 // scraper.js/elo.js's doc comments on totalPR) — it can still drift slowly even for a player with
 // zero new events, so treating a "settled" player as cached forever would eventually go stale in
-// a way nothing would ever notice or correct. 30 days is a large reduction from the 24h recent-
-// activity TTL (the actual goal — meaningfully cut redundant re-scraping of data that can't have
-// meaningfully changed) without claiming a permanence this data doesn't really have.
+// a way nothing would ever notice or correct.
+//
+// This is now the ONE cache-TTL number in this file (getPlayerStats/getContextualPlayerStats both
+// read it directly, no more per-player branching) — but it plays two different roles depending on
+// isSettled(recentEvents):
+//   - For a SETTLED player, this genuinely is the intended freshness policy — nothing about them
+//     is expected to change often, so a flat 30-day passive expiry is the real mechanism.
+//   - For an ACTIVE player, this is a backstop only. Real freshness for an active player comes
+//     from invalidateStaleAfterEvent below (called from channel-manager.js the moment a real,
+//     scraped tournament conclusion — Epic's own endTime, not a guess — passes for their region):
+//     a player's cache isn't "stale" just because time passed, only once a tournament they'd
+//     plausibly care about has actually concluded since their last scrape. This number only fires
+//     for an active player if that event-driven path never ran at all (no FORTNITE_API_KEY, Epic's
+//     calendar never carried a real endTime for anything in their region, etc.) — a safety net
+//     against silent unbounded staleness, not the primary mechanism.
 const SETTLED_CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
 // A player with NO recorded events at all (brand new, or never actually competed) is deliberately
-// NOT "settled" — they could start playing any day, and there's no history to judge recency from,
-// so they stay on the short TTL rather than risking a month-stale zero after their first real
-// event. Only a player with genuine history whose MOST RECENT entry (recentEvents is stored
-// newest-first — see scraper.js's parseProfileData) is already old counts as settled.
-function cacheTtlMsFor(recentEvents) {
+// NOT "settled" — they could start playing any day, and there's no history to judge recency from.
+// Only a player with genuine history whose MOST RECENT entry (recentEvents is stored newest-first
+// — see scraper.js's parseProfileData) is already old counts as settled. Exported so
+// invalidateStaleAfterEvent's own tests can exercise this exact boundary directly.
+function isSettled(recentEvents) {
   const newestDate = recentEvents?.[0]?.date ? new Date(recentEvents[0].date).getTime() : null;
-  if (newestDate == null) return RECENT_ACTIVITY_CACHE_TTL_MS;
+  if (newestDate == null) return false;
 
   const ageDays = (Date.now() - newestDate) / (24 * 60 * 60 * 1000);
-  return ageDays > SETTLED_ACTIVITY_WINDOW_DAYS ? SETTLED_CACHE_TTL_MS : RECENT_ACTIVITY_CACHE_TTL_MS;
+  return ageDays > SETTLED_ACTIVITY_WINDOW_DAYS;
 }
 
 async function getPlayer(guildId, discordId) {
@@ -180,7 +186,7 @@ function clearedStatsFields() {
   // belong to the OLD epicId just as much as the home-context fields do — leaving them behind on
   // a re-link would keep serving the old account's region/platform-specific PR indefinitely
   // whenever a future queue join happens to need a non-home context.
-  return { totalPR: null, thisSeasonPR: null, prBand: null, recentEvents: [], lastUpdated: null, statsByContext: {} };
+  return { totalPR: null, thisSeasonPR: null, prBand: null, recentEvents: [], sessions: null, lastUpdated: null, statsByContext: {} };
 }
 
 // Called by the Epic OAuth callback (webhook-server.js) on every successful link, including a re-
@@ -225,27 +231,35 @@ function toStatsFields(scraped) {
     thisSeasonPR: scraped.thisSeasonPR,
     prBand: scraped.prBand,
     recentEvents: scraped.recentEvents,
+    // scraper.js's parseProfileData deliberately leaves this null (never defaults to 0) when
+    // Fortnite Tracker's own "Sessions" DOM block didn't render — see that function's own doc
+    // comment on why 0 would be indistinguishable from "genuinely zero sessions" for tier-
+    // comparison.js's PR-per-session efficiency factor, which divides by this.
+    sessions: scraped.sessions ?? null,
     lastUpdated: new Date(),
   };
 }
 
 // Called on every Queue click (queue.js's buildPlayer). Reuses a player's MongoDB record if it
-// was scraped within its recency-based TTL (cacheTtlMsFor — short for a player with recent/
-// current-season activity, much longer for one whose history is already settled) — skipping the
-// Puppeteer/FT Tracker round trip entirely — otherwise scrapes fresh and persists the result for
-// next time. This is always the player's HOME region, default-platform snapshot — see
+// was scraped within SETTLED_CACHE_TTL_MS — skipping the Puppeteer/FT Tracker round trip entirely
+// — otherwise scrapes fresh and persists the result for next time. For an active player this
+// passive check is rarely what actually decides staleness in practice: invalidateStaleAfterEvent
+// (below) already nulls lastUpdated the moment a real tournament they'd plausibly care about
+// concludes, well before this TTL would; see SETTLED_CACHE_TTL_MS's own doc comment for the full
+// split. This is always the player's HOME region, default-platform snapshot — see
 // getStatsForContext below for a queue-region/platform-specific fetch.
 async function getPlayerStats(guildId, discordId, epicUsername, epicId, region) {
   const existing = await PlayerModel.findOne({ guildId, discordId });
   const age = existing?.lastUpdated ? Date.now() - existing.lastUpdated.getTime() : null;
 
-  if (existing?.lastUpdated && age < cacheTtlMsFor(existing.recentEvents) && existing.totalPR != null) {
+  if (existing?.lastUpdated && age < SETTLED_CACHE_TTL_MS && existing.totalPR != null) {
     console.log(`[stats] cache HIT for ${epicUsername} (${discordId}) — scraped ${formatAge(age)} ago, skipping FT scrape`);
     return {
       totalPR: existing.totalPR,
       thisSeasonPR: existing.thisSeasonPR ?? 0,
       prBand: existing.prBand ?? null,
       recentEvents: existing.recentEvents ?? [],
+      sessions: existing.sessions ?? null,
     };
   }
 
@@ -305,13 +319,14 @@ async function getContextualPlayerStats(guildId, discordId, epicUsername, epicId
   const cached = existing?.statsByContext?.get(key);
   const age = cached?.lastUpdated ? Date.now() - new Date(cached.lastUpdated).getTime() : null;
 
-  if (cached?.lastUpdated && age < cacheTtlMsFor(cached.recentEvents) && cached.totalPR != null) {
+  if (cached?.lastUpdated && age < SETTLED_CACHE_TTL_MS && cached.totalPR != null) {
     console.log(`[stats] contextual cache HIT for ${epicUsername} (${discordId}) context=${key} — scraped ${formatAge(age)} ago`);
     return {
       totalPR: cached.totalPR,
       thisSeasonPR: cached.thisSeasonPR ?? 0,
       prBand: cached.prBand ?? null,
       recentEvents: cached.recentEvents ?? [],
+      sessions: cached.sessions ?? null,
     };
   }
 
@@ -338,7 +353,42 @@ async function getContextualPlayerStats(guildId, discordId, epicUsername, epicId
 // Platform (#6): only ever overridden for a Console player — gamepad for a console-exclusive
 // tournament, kbm otherwise — per config.ftPlatformSegments. tournamentConsoleOnly is a caller-
 // supplied boolean (false for creative queue, which has no console-exclusive-mode concept the way
-// tournaments' consoleOnly flag does) rather than this function inferring it.
+// tournaments' consoleOnly flag does) rather than this function inferring it. `platform` here is
+// always the single, already-resolved string resolveQueuePlatform below produces — never a raw
+// Player.platforms array.
+
+// Investigated before designing #get-roles' platform self-service: a real player can genuinely
+// have BOTH PC and Console history on the same account (plays console sometimes, PC other times),
+// which a forced single either/or pick can't represent. This resolves Player.platforms (the
+// self-service array — get-roles' select_platform handler, index.js) down to the single string
+// every real consumer here still wants (getStatsForContext's platformSegment resolution above,
+// queue.js's isCompatiblePlatform match gate, creative-queue.js's buildCreativePlayer) — CONTEXTUAL
+// to the specific queue action, not a fixed identity:
+//   - For a console-only tournament (tournamentConsoleOnly true): 'Console' if the player has
+//     checked Console at all (regardless of whether they also have PC) — that's the whole point of
+//     capturing it as an additive fact rather than a replace-one-with-the-other pick. null if they
+//     haven't — genuinely not eligible, not a guess; callers (index.js) block the join up front with
+//     a clear message rather than letting them queue into a pool that can never match them (the real
+//     silent-stuck-forever bug this replaces — see queue.js's isCompatiblePlatform, which already
+//     required platform === 'Console' for every member of a console-only match but had no real way
+//     to ever be true, since nothing populated it before this).
+//   - Otherwise: PC if they have it (their broad, cross-play-inclusive default — matches every
+//     existing non-console-restricted tournament/creative behavior, unaffected by also having
+//     Console), else Console if that's all they have (matches how a Console-only player's PR has
+//     always needed the kbm-equivalent FT segment even for a non-console-restricted event — see
+//     getStatsForContext's platformSegment formula above), else 'PC' as the ultimate default for a
+//     player who hasn't set anything (same fallback every caller already used before self-service
+//     existed).
+function resolveQueuePlatform(platforms, tournamentConsoleOnly) {
+  const list = platforms ?? [];
+  const hasPC = list.includes('PC');
+  const hasConsole = list.includes('Console');
+
+  if (tournamentConsoleOnly) return hasConsole ? 'Console' : null;
+  if (hasPC) return 'PC';
+  if (hasConsole) return 'Console';
+  return 'PC';
+}
 //
 // Returns both the stats AND prContext — the single indicator #6 asks for combining #3's region
 // transparency and #6's platform transparency, rather than two separate ad-hoc signals (embeds.js's
@@ -382,13 +432,64 @@ async function rescrapeRegisteredPlayers(guildId, region) {
   console.log(`[stats] cache invalidation — expired lastUpdated for ${matched} registered player(s) in guild=${guildId} region=${region} (re-scraped lazily on their next queue, via getPlayerStats)`);
 }
 
+// Called by channel-manager.js when a tracked tournament's REAL scraped endTime passes (Epic's
+// own eventWindow endTime — tournament-scraper.js's buildTournamentGroups — never a guessed/
+// hardcoded schedule, so this self-corrects automatically across seasons as Epic's own calendar
+// shifts). Same cheap, INSTANT-ONLY invalidation shape as rescrapeRegisteredPlayers above — clears
+// lastUpdated via a plain Mongo update, never scrapes here, the actual re-scrape still only
+// happens lazily on that player's next real queue action via getPlayerStats' existing cache-miss
+// path. Two things narrow this beyond rescrapeRegisteredPlayers' plain region match:
+//
+//   1. SETTLED players (isSettled — no recorded activity in SETTLED_ACTIVITY_WINDOW_DAYS) are
+//      left alone entirely. A tournament concluding in their home region says nothing about
+//      someone who hasn't shown up to compete in 90+ days — invalidating them on every regional
+//      conclusion would just reintroduce the wasted-rescrape churn the settled/long-TTL tier
+//      exists to avoid; they stay on SETTLED_CACHE_TTL_MS's plain passive expiry instead.
+//   2. Only players whose OWN cached snapshot predates eventEndTime get touched. A player who
+//      already queued (and got a fresh scrape) after this exact tournament concluded already
+//      reflects whatever it changed — nulling their cache again would force a pointless re-scrape
+//      on their next queue for zero new signal. This is a real per-player comparison (their own
+//      lastUpdated vs. this specific event's real conclusion), not a blind re-trigger every time
+//      this function runs.
+//
+// Bounded by "registered players in one guild+region" (typically small — see getAllScoredPlayers'
+// own doc comment on this bot's current scale), so fetching candidates into JS to apply isSettled
+// (already the single source of truth that decision uses elsewhere) is cheap and keeps this in
+// sync with that logic by construction, rather than re-deriving the same judgment in raw Mongo
+// query syntax where it could quietly drift.
+async function invalidateStaleAfterEvent(guildId, region, eventEndTime) {
+  const cutoffMs = new Date(eventEndTime).getTime();
+  if (!Number.isFinite(cutoffMs)) return;
+
+  const candidates = await PlayerModel.find(
+    { guildId, region, lastUpdated: { $ne: null } },
+    { lastUpdated: 1, recentEvents: 1 }
+  ).lean();
+
+  const staleIds = candidates
+    .filter(p => p.lastUpdated.getTime() < cutoffMs && !isSettled(p.recentEvents))
+    .map(p => p._id);
+
+  if (staleIds.length === 0) {
+    console.log(`[stats] event-conclusion invalidation: no active player with a pre-event cache in guild=${guildId} region=${region}`);
+    return;
+  }
+
+  await PlayerModel.updateMany({ _id: { $in: staleIds } }, { $set: { lastUpdated: null } });
+  console.log(`[stats] event-conclusion invalidation — expired lastUpdated for ${staleIds.length} active player(s) in guild=${guildId} region=${region} (re-scraped lazily on their next queue, via getPlayerStats)`);
+}
+
 // Powers elo.js's percentile ranking — needs "every OTHER player with a real recorded score",
 // not just one guild's registrants, so this is deliberately NOT guild-scoped (unlike every other
 // function here). Deduped down to one entry per real account using the SAME freshest-by-
 // lastUpdated rule findCanonicalByEpicUsername uses for a single lookup — without this, a player
 // registered under N guilds (a normal, already-supported situation — see that function's doc
 // comment) would occupy N slots in the comparison pool and skew everyone else's percentile.
-// Projected to only the fields the score formula actually needs, to keep the payload small.
+// Projected to only the fields the score formula (and, since it's the same real deduped
+// population, tier-comparison.js's daily band computation) actually needs, to keep the payload
+// small. sessions included alongside totalPR/recentEvents for tier-comparison.js's PR-per-session
+// efficiency factor — same HOME-context-only scope as totalPR/recentEvents here (not
+// statsByContext), consistent with how this function has always sampled the population.
 //
 // Full, unindexed collection scan (totalPR has no index) — fine at this bot's current scale (at
 // most a few thousand Player docs across all guilds combined). If the player base ever grows
@@ -398,7 +499,7 @@ async function rescrapeRegisteredPlayers(guildId, region) {
 async function getAllScoredPlayers() {
   const docs = await PlayerModel.find(
     { totalPR: { $ne: null } },
-    { epicId: 1, totalPR: 1, thisSeasonPR: 1, recentEvents: 1, lastUpdated: 1 }
+    { epicId: 1, totalPR: 1, thisSeasonPR: 1, recentEvents: 1, sessions: 1, lastUpdated: 1 }
   ).lean();
 
   const byAccount = new Map();
@@ -415,7 +516,35 @@ async function getAllScoredPlayers() {
     totalPR: doc.totalPR ?? 0,
     thisSeasonPR: doc.thisSeasonPR ?? 0,
     recentEvents: doc.recentEvents ?? [],
+    sessions: doc.sessions ?? null,
   }));
+}
+
+// Startup self-heal for the #get-roles bio/age-bracket removal — both features are gone
+// entirely (embeds.js no longer builds their select/button, index.js no longer handles their
+// interactions), but any player who used either one before removal still has the real value
+// sitting on their Player document. Neither field was ever backed by a Discord role (bio came
+// from a modal, ageBracket from a select menu with no assignRole call at all — confirmed via a
+// real search before removing), so unlike guild-config.js's GUILD_CONFIG_MIGRATIONS (which fixes
+// per-guild Discord objects — roles, channels — one guild at a time), this is a single global
+// Mongo update across every Player document regardless of guild: there's no Discord-side state to
+// reconcile, just stale data to clear. Called once at startup (index.js's clientReady handler,
+// alongside repairComingSoonCreativeChannels — same "pure DB, no client/guild loop needed"
+// shape). The filter means this is a cheap no-op on every startup after the first one actually
+// finds something to clean up.
+async function removeBioAndAgeBracketFields() {
+  const result = await PlayerModel.updateMany(
+    { $or: [{ bio: { $exists: true } }, { ageBracket: { $exists: true } }] },
+    { $unset: { bio: '', ageBracket: '' } }
+  );
+
+  const matched = result.matchedCount ?? 0;
+  if (matched === 0) {
+    console.log('[players] bio/ageBracket cleanup: no player documents still had either field — nothing to do');
+    return;
+  }
+
+  console.log(`[players] bio/ageBracket cleanup — removed the stale field(s) from ${matched} player document(s)`);
 }
 
 module.exports = {
@@ -428,14 +557,16 @@ module.exports = {
   getPlayerStats,
   getContextualPlayerStats,
   getStatsForContext,
+  resolveQueuePlatform,
   refreshPlayerStats,
   forceRefreshStats,
   rescrapeRegisteredPlayers,
+  invalidateStaleAfterEvent,
+  removeBioAndAgeBracketFields,
   findCanonicalByEpicUsername,
   searchEpicUsernames,
   getAllScoredPlayers,
-  cacheTtlMsFor,
-  RECENT_ACTIVITY_CACHE_TTL_MS,
+  isSettled,
   SETTLED_CACHE_TTL_MS,
   SETTLED_ACTIVITY_WINDOW_DAYS,
 };

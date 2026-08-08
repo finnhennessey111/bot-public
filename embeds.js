@@ -141,13 +141,22 @@ function buildTournamentEmbed(tournamentName, region, queueCount, isTrios = fals
 }
 
 // ── RANKED CUP (per-rank-tier queues) ───────────────────────────────────────
-// Ranked Cup tournaments (tournament-scraper.js's isRankedCupTitle) span 6 separate in-game rank
+// Ranked Cup tournaments (tournament-scraper.js's isRankedCupTitle) span separate in-game rank
 // tiers under ONE Fortnite Tracker event listing — confirmed against live scrape data, real titles
 // never mention a rank tier at all ("Duos Ranked Cup (Battle Royale)"/"(Zero Build)"/"(Reload)" is
 // the full set, one per build mode per region). A Bronze player and an Elite player shouldn't be
 // matched together, so this channel type gets one queue button per rank instead of buildQueueButtons'
 // single generic one. Discord buttons only have 5 fixed ButtonStyle values — no custom colors — so
 // a leading emoji is what visually distinguishes each rank's button instead.
+//
+// Champion and Unreal added on top of the original Bronze-through-Elite 6 — confirmed against real
+// Epic rank data that the actual in-game tier system goes further than Elite: Champion sits above
+// it, and Unreal sits above Champion with its own numbered leaderboard position. Each is its own
+// genuinely separate matching pool (rankedCupPoolName below), same as every existing tier — never
+// folded into Elite. Emoji picked to keep the same "colored square" visual language the existing 6
+// already use (🟫⬜🟨🟦💠⬛), rather than introducing a differently-shaped icon (a star/crown) that
+// would stand out inconsistently: 🟥 red for Champion, 🟪 purple for Unreal — matching each rank's
+// real in-game color.
 const RANK_TIERS = [
   { key: 'bronze', label: 'Bronze', emoji: '🟫' },
   { key: 'silver', label: 'Silver', emoji: '⬜' },
@@ -155,6 +164,8 @@ const RANK_TIERS = [
   { key: 'platinum', label: 'Platinum', emoji: '🟦' },
   { key: 'diamond', label: 'Diamond', emoji: '💠' },
   { key: 'elite', label: 'Elite', emoji: '⬛' },
+  { key: 'champion', label: 'Champion', emoji: '🟥' },
+  { key: 'unreal', label: 'Unreal', emoji: '🟪' },
 ];
 
 function rankTierByKey(key) {
@@ -197,8 +208,9 @@ function buildRankedCupTournamentEmbed(tournamentName, region, rankCounts, isTri
 
 // customId shape: queue_rank_<duo|lf2>_<rankKey> — queueType mirrors buildQueueButtons' existing
 // duo/lf2 split (Ranked Cups are duos in every real title observed so far, but this stays
-// queueType-generic rather than duo-only in case a trios Ranked Cup ever appears). 3-per-row so
-// all 6 fit across two rows.
+// queueType-generic rather than duo-only in case a trios Ranked Cup ever appears). 3-per-row —
+// with all 8 tiers (Bronze through Unreal) that's 3 rows (3+3+2), still well within Discord's
+// 5-action-row-per-message cap.
 function buildRankedCupQueueButtons(isTrios = false) {
   const queueType = isTrios ? 'lf2' : 'duo';
   const rows = [];
@@ -478,10 +490,6 @@ function buildTournamentPlayerFields(player, tournamentName) {
     { name: '🗣️ Language', value: languagesText, inline: true },
     { name: '🔗 Profile', value: `[View Profile](${profileUrl})` },
   ];
-
-  if (player.ageBracket) {
-    fields.splice(3, 0, { name: '🔞 Age Bracket', value: player.ageBracket, inline: true });
-  }
 
   const prContextNote = buildPrContextNote(player);
   if (prContextNote) {
@@ -1159,7 +1167,7 @@ function buildSuggestionsChannelEmbed() {
       'Got an idea to make MatchMaker better? Click the button below and it goes straight to the ' +
       'developer.\n\n' +
       'This is for feature suggestions only, and goes to MatchMaker\'s developer — not this ' +
-      'server\'s mods. For gameplay help or account issues, check #how-to-use or tag a mod instead.'
+      'server\'s mods. For gameplay help or account issues, tag a mod instead.'
     )
     .setColor(0x4A90D9)
     .setFooter({ text: 'MatchMaker' });
@@ -1235,30 +1243,38 @@ function buildRolesComponents() {
       .addOptions(LANGUAGE_OPTIONS.map(l => new StringSelectMenuOptionBuilder().setLabel(l).setValue(l)))
   );
 
-  const ageBracketMenu = new ActionRowBuilder().addComponents(
-    new StringSelectMenuBuilder()
-      .setCustomId('select_age_bracket')
-      .setPlaceholder('🔞 Age bracket (optional)')
-      .setMinValues(0)
-      .setMaxValues(1)
-      .addOptions(
-        new StringSelectMenuOptionBuilder().setLabel('13-14').setValue('13-14'),
-        new StringSelectMenuOptionBuilder().setLabel('15-16').setValue('15-16'),
-        new StringSelectMenuOptionBuilder().setLabel('16+').setValue('16+'),
-      )
-  );
-
-  // 5 select rows fills Discord's 5-action-row-per-message cap — the bio button (a button, which
-  // can't share a row with a select menu) has to go in a second message, see buildBioButtonRow().
-  return [regionMenu, extraRegionMenu, ingameRoleMenu, languageMenu, ageBracketMenu];
+  // Only 4 rows now (down from 5 — ageBracket removed entirely: confirmed dead, displayed on the
+  // tournament match card but never used for any actual matching/safety restriction). Platform
+  // (buildPlatformSelectRow below) still lives in its own second message rather than being folded
+  // in here now that there's room — that would leave an already-posted second message on every
+  // existing server with nothing to show once the bio button (its other occupant) is also removed,
+  // needing its own cleanup on top of what removing bio/ageBracket already requires. Simplest to
+  // just keep the two-message split as-is.
+  return [regionMenu, extraRegionMenu, ingameRoleMenu, languageMenu];
 }
 
-function buildBioButtonRow() {
+// Posted alone in the getRolesBio message (matchmaker-setup.js) — used to share that message with
+// buildBioButtonRow, removed along with the rest of the bio feature (confirmed dead: fully wired
+// through modal -> DB -> buildPlayer but never displayed anywhere). Deliberately MULTI-select
+// (0-2), same shape as extraRegionMenu above — NOT a forced either/or
+// pick between PC and Console. Real nuance this exists for: a player can genuinely have both PC
+// and Console history on the same account (plays console sometimes, PC other times), which a
+// single mandatory choice can't represent. players.js's resolveQueuePlatform is what turns this
+// additive fact into the single value each specific queue action actually needs — see that
+// function's doc comment for the full reasoning, including why checking Console here is what
+// makes a console-only tournament matchable at all (queue.js's isCompatiblePlatform match gate
+// requires it, and nothing populated that signal before this existed).
+function buildPlatformSelectRow() {
   return new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId('set_bio')
-      .setLabel('✏️ Set Bio (optional)')
-      .setStyle(ButtonStyle.Secondary)
+    new StringSelectMenuBuilder()
+      .setCustomId('select_platform')
+      .setPlaceholder('🎮 Platform(s) (optional) — check Console too if you sometimes play there')
+      .setMinValues(0)
+      .setMaxValues(2)
+      .addOptions(
+        new StringSelectMenuOptionBuilder().setLabel('PC').setValue('PC').setEmoji('🖥️'),
+        new StringSelectMenuOptionBuilder().setLabel('Console').setValue('Console').setEmoji('🎮'),
+      )
   );
 }
 
@@ -1327,7 +1343,7 @@ function buildWelcomeDmEmbed(guildName) {
       '**1.** Run `/matchmaker-setup` as a server admin — this creates all the roles, categories, ' +
       'channels, and starter embeds MatchMaker needs, including a verified role that\'s assigned ' +
       'automatically when a member links their Epic account (new members only see #register until ' +
-      'they have it, then #get-roles/#how-to-use/#access unlock automatically).\n\n' +
+      'they have it, then #get-roles/#access unlock automatically).\n\n' +
       'That\'s it — MatchMaker will be fully live for your server after that.'
     )
     .setColor(0x4A90D9)
@@ -1675,7 +1691,7 @@ function buildPlayerLookupEmbed(discordUser, playerDoc, accessStatus) {
     embed.addFields(
       { name: '🎮 Epic Username', value: playerDoc.epicUsername ?? 'Unknown', inline: true },
       { name: '📍 Region', value: playerDoc.region ?? 'Unknown', inline: true },
-      { name: '🖥️ Platform', value: playerDoc.platform ?? 'Unknown', inline: true },
+      { name: '🖥️ Platform', value: playerDoc.platforms?.length ? playerDoc.platforms.join(', ') : 'Unknown', inline: true },
       { name: '⚡ Total PR', value: `${playerDoc.totalPR ?? 'N/A'}`, inline: true },
       { name: '📅 This Season PR', value: `${playerDoc.thisSeasonPR ?? 'N/A'}`, inline: true },
       { name: '🕐 Stats Age', value: playerDoc.lastUpdated ? `<t:${Math.floor(new Date(playerDoc.lastUpdated).getTime() / 1000)}:R>` : 'Never scraped', inline: true },
@@ -1750,7 +1766,7 @@ module.exports = {
   buildSetupInstructionsEmbed,
   buildRolesEmbed,
   buildRolesComponents,
-  buildBioButtonRow,
+  buildPlatformSelectRow,
   buildRegisterEmbed,
   buildEpicLinkButtonRow,
   buildEpicAuthorizeLinkRow,

@@ -244,8 +244,6 @@ async function buildPlayer({
   consoleOnly,
   ingameRoles,
   languages,
-  ageBracket,
-  bio,
 }) {
   const resolvedPlatform = platform ?? 'PC';
   const resolvedConsoleOnly = consoleOnly ?? false;
@@ -286,8 +284,6 @@ async function buildPlayer({
     consoleOnly: resolvedConsoleOnly,
     ingameRoles: ingameRoles ?? [],
     languages: languages ?? [],
-    ageBracket: ageBracket ?? null,
-    bio: bio ?? null,
     totalPR: playerData.totalPR,
     thisSeasonPR: playerData.thisSeasonPR,
     matchScore,

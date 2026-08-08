@@ -58,8 +58,8 @@ function makePlayer(discordId, tournamentName, region) {
   return {
     guildId: 'g1', guildName: 'Test Guild', discordId, discordUsername: discordId, discordTag: discordId,
     epicUsername: discordId, epicId: discordId, tournamentName, homeRegion: region, queueRegion: region,
-    queueType: 'duo', platform: 'PC', consoleOnly: false, ingameRoles: [], languages: [], ageBracket: null,
-    bio: null, totalPR: 500, thisSeasonPR: 0, matchScore: 500, soloModifier: 0, recentEvents: [], joinedAt: new Date(),
+    queueType: 'duo', platform: 'PC', consoleOnly: false, ingameRoles: [], languages: [],
+    totalPR: 500, thisSeasonPR: 0, matchScore: 500, soloModifier: 0, recentEvents: [], joinedAt: new Date(),
   };
 }
 
@@ -89,7 +89,7 @@ test('updateActiveTournamentEmbeds: a stale Ranked Cup channel (isRankedCup neve
   assert.equal(msg.edits.length, 1, 'exactly one edit this tick');
 
   const allButtons = msg.edits[0].components.flatMap(r => r.toJSON().components);
-  assert.equal(allButtons.length, 6, 'must now have all 6 rank buttons');
+  assert.equal(allButtons.length, 8, 'must now have all 8 rank buttons (Bronze through Unreal)');
   assert.ok(allButtons.every(b => b.custom_id.startsWith('queue_rank_')), 'every button must be rank-scoped, not the old generic one');
 
   const embedJson = msg.edits[0].embeds[0].toJSON();

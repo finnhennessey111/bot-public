@@ -22,7 +22,7 @@ const assert = require('node:assert/strict');
 const tierComparison = require('../tier-comparison');
 const {
   MIN_EVENTS_FOR_TIER_SIGNAL, TIER_WINDOW_SIZE, BAND_WIDTH_PR, MIN_BAND_PLAYERS, MAX_TIER_MODIFIER,
-  computeWindowStats, bandRangeForPR, computeBandStatsFromPlayers,
+  computeWindowStats, computeEfficiency, bandRangeForPR, computeBandStatsFromPlayers,
   runDailyTierBandComputation, getTierComparisonModifier,
 } = tierComparison;
 
@@ -110,6 +110,20 @@ test('computeWindowStats: perfectly flat prPoints across the window gives zero t
   assert.equal(result.consistency, 0, 'zero variance across a flat window must show as zero CV, not null or NaN');
 });
 
+// ── computeEfficiency — the fourth factor ─────────────────────────────────────
+test('computeEfficiency: a real positive totalPR/sessions pair returns the genuine PR-per-session ratio', () => {
+  assert.equal(computeEfficiency(500, 100), 5);
+  assert.equal(computeEfficiency(392, 392), 1);
+});
+
+test('computeEfficiency: null (never 0 or a fabricated ratio) whenever sessions is missing/zero or totalPR isn\'t a real positive number', () => {
+  assert.equal(computeEfficiency(500, 0), null, 'zero sessions must not divide-by-zero into Infinity or silently become 0');
+  assert.equal(computeEfficiency(500, null), null);
+  assert.equal(computeEfficiency(500, undefined), null, 'a player scraped before Sessions existed (field genuinely absent) must not fabricate a ratio');
+  assert.equal(computeEfficiency(0, 100), null);
+  assert.equal(computeEfficiency(null, 100), null);
+});
+
 // ── bandRangeForPR ───────────────────────────────────────────────────────────
 test('bandRangeForPR: assigns a PR value to the correct band, and the next band\'s bandMin is exactly this band\'s bandMax', () => {
   const mid = Math.floor(BAND_WIDTH_PR * 2.5); // comfortably inside the 3rd band (0-indexed 2nd)
@@ -152,6 +166,25 @@ test('computeBandStatsFromPlayers: groups real players into the correct bands an
 
 test('computeBandStatsFromPlayers: an empty real player list produces zero bands, not a crash', () => {
   assert.deepEqual(computeBandStatsFromPlayers([]), []);
+});
+
+test('computeBandStatsFromPlayers: avgEfficiency is computed only from players with a real sessions count — same null-tolerant pattern as avgConsistency', () => {
+  const players = [
+    { ...playerWithFlatHistory(50, 40), sessions: 8 },   // efficiency 50/8 = 6.25
+    { ...playerWithFlatHistory(50, 60), sessions: 20 },  // efficiency 50/20 = 2.5
+    { ...playerWithFlatHistory(50, 50) },                // no sessions at all
+  ];
+  const bands = computeBandStatsFromPlayers(players);
+  const band0 = bands.find(b => b.bandMin === 0);
+
+  assert.equal(band0.playerCount, 3, 'all 3 still count toward playerCount/avgLevel — missing sessions only affects avgEfficiency specifically');
+  assert.equal(band0.avgEfficiency, expectedAverage([6.25, 2.5]), 'only the 2 real efficiency values are averaged; the player missing sessions contributes nothing to this one factor');
+});
+
+test('computeBandStatsFromPlayers: a band where NO player has a real sessions count gets avgEfficiency: null, not NaN or a fabricated 0', () => {
+  const players = [playerWithFlatHistory(50, 40), playerWithFlatHistory(50, 60)];
+  const bands = computeBandStatsFromPlayers(players);
+  assert.equal(bands.find(b => b.bandMin === 0).avgEfficiency, null);
 });
 
 // ── runDailyTierBandComputation: the daily batch job ─────────────────────────
@@ -379,5 +412,62 @@ test('getTierComparisonModifier: db.isConnected() false fails fast to hasSignal:
   } finally {
     db.isConnected = originalIsConnected;
     TierBandStatsModel.findOne = originalFindOne;
+  }
+});
+
+// ── getTierComparisonModifier: efficiency as a genuine fourth factor ─────────
+test('getTierComparisonModifier: efficiency (PR/session) is genuinely blended in as a real 4th factor — a player matching all 3 window factors at their OWN band but matching efficiency at the NEXT band gets a real partial modifier, not zero', async () => {
+  // level/trend/consistency all set to EXACTLY match ownBand's own averages (resemblance 0 each,
+  // same setup as the "sits exactly at own band" test above) — efficiency is the only factor that
+  // diverges, set to match nextBand exactly (resemblance 1).
+  const player = { ...playerWithFlatHistory(50, 55), sessions: 10 }; // totalPR 50, sessions 10 -> efficiency 5
+  const restore = stubBandLookup({
+    0: { bandMin: 0, bandMax: BAND_WIDTH_PR, playerCount: MIN_BAND_PLAYERS + 5, avgLevel: 55, avgTrend: 0, avgConsistency: 0, avgEfficiency: 1 },
+    [BAND_WIDTH_PR]: { bandMin: BAND_WIDTH_PR, bandMax: BAND_WIDTH_PR * 2, playerCount: MIN_BAND_PLAYERS + 5, avgLevel: 90, avgTrend: 5, avgConsistency: 0.2, avgEfficiency: 5 },
+  });
+  try {
+    const result = await getTierComparisonModifier(player);
+    assert.equal(result.hasSignal, true);
+    assert.equal(result.factorsUsed, 4, 'level, trend, consistency, AND efficiency must all be real, comparable factors here');
+    assert.equal(
+      result.resemblance, 0.25,
+      'level/trend/consistency resemble ONLY the own band (0 each); efficiency resembles the NEXT band exactly (1) — average of [0,0,0,1] is 0.25, proving efficiency genuinely contributes its own independent factor rather than being ignored'
+    );
+    assert.equal(result.modifier, MAX_TIER_MODIFIER * 0.25);
+  } finally {
+    restore();
+  }
+});
+
+test('getTierComparisonModifier: a player with no scraped Sessions count still gets a real signal from the other 3 factors — efficiency missing means one fewer factor, never a failure', async () => {
+  const player = playerWithFlatHistory(50, 90); // no `sessions` field at all — same player as the "capped at 1.0" test
+  const restore = stubBandLookup({
+    0: { bandMin: 0, bandMax: BAND_WIDTH_PR, playerCount: MIN_BAND_PLAYERS + 5, avgLevel: 55, avgTrend: -2, avgConsistency: 0.3, avgEfficiency: 2 },
+    [BAND_WIDTH_PR]: { bandMin: BAND_WIDTH_PR, bandMax: BAND_WIDTH_PR * 2, playerCount: MIN_BAND_PLAYERS + 5, avgLevel: 90, avgTrend: 0, avgConsistency: 0, avgEfficiency: 6 },
+  });
+  try {
+    const result = await getTierComparisonModifier(player);
+    assert.equal(result.hasSignal, true);
+    assert.equal(result.factorsUsed, 3, 'efficiency must be excluded (no real sessions data) — never averaged in as a fabricated mismatch');
+    assert.equal(result.resemblance, 1, 'the 3 real window factors alone already fully resemble the next band — efficiency\'s absence must not water that down');
+  } finally {
+    restore();
+  }
+});
+
+test('getTierComparisonModifier: efficiency data — even a perfect match — never bypasses the MIN_BAND_PLAYERS gate, same threshold discipline as the other three factors', async () => {
+  const player = { ...playerWithFlatHistory(50, 55), sessions: 10 }; // efficiency 5, would perfectly discriminate the two bands below
+  const restore = stubBandLookup({
+    // own band deliberately UNDER MIN_BAND_PLAYERS
+    0: { bandMin: 0, bandMax: BAND_WIDTH_PR, playerCount: MIN_BAND_PLAYERS - 1, avgLevel: 55, avgTrend: 0, avgConsistency: 0, avgEfficiency: 1 },
+    [BAND_WIDTH_PR]: { bandMin: BAND_WIDTH_PR, bandMax: BAND_WIDTH_PR * 2, playerCount: MIN_BAND_PLAYERS + 5, avgLevel: 90, avgTrend: 5, avgConsistency: 0.2, avgEfficiency: 5 },
+  });
+  try {
+    const result = await getTierComparisonModifier(player);
+    assert.equal(result.hasSignal, false, 'own band below MIN_BAND_PLAYERS must gate off the WHOLE result — a strong efficiency signal must never punch through this threshold on its own');
+    assert.equal(result.modifier, 0);
+    assert.match(result.reason, /own PR band/i);
+  } finally {
+    restore();
   }
 });

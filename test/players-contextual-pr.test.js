@@ -1,9 +1,11 @@
 // Verifies players.js's three real changes together, since they share the same cache machinery:
 //
-//   #2 — split caching: a player whose most recent recorded event is already "settled" (older than
-//   SETTLED_ACTIVITY_WINDOW_DAYS, ~90 days) gets a much longer cache TTL than one with recent/
-//   current-season activity, cutting redundant re-scrapes of data that can't have changed. A player
-//   with NO recorded events at all stays on the short TTL (they could start playing any day).
+//   #2 — split caching: a SETTLED player (most recent recorded event older than
+//   SETTLED_ACTIVITY_WINDOW_DAYS, ~90 days) gets a flat, long passive cache TTL, since nothing
+//   about them is expected to change. An ACTIVE player (recent/current-season activity, or no
+//   recorded events at all — they could start playing any day) is no longer expired by a flat
+//   short timer at all — see test/players-event-invalidation.test.js for the event-driven
+//   mechanism (invalidateStaleAfterEvent) that now handles their freshness instead.
 //
 //   #3 — region-aware PR: a player queueing in a region that differs from their registered home
 //   region gets a fresh, separate fetch for THAT region specifically, cached apart from (never
@@ -57,47 +59,56 @@ function withStubs({ findOneResult = null, scrapeImpl } = {}, fn) {
   });
 }
 
-// ── #2: cacheTtlMsFor ─────────────────────────────────────────────────────────
-test('cacheTtlMsFor: recent activity (newest event within 90 days) gets the short TTL', () => {
+// ── #2: isSettled / SETTLED_CACHE_TTL_MS ──────────────────────────────────────
+test('isSettled: recent activity (newest event within 90 days) is NOT settled', () => {
   const recentEvents = [{ name: 'X', date: new Date(Date.now() - 5 * 86400000).toISOString() }];
-  assert.equal(playerStore.cacheTtlMsFor(recentEvents), playerStore.RECENT_ACTIVITY_CACHE_TTL_MS);
+  assert.equal(playerStore.isSettled(recentEvents), false);
 });
 
-test('cacheTtlMsFor: settled activity (newest event older than 90 days) gets the long TTL', () => {
+test('isSettled: activity older than 90 days IS settled', () => {
   const oldEvents = [{ name: 'X', date: new Date(Date.now() - 200 * 86400000).toISOString() }];
-  assert.equal(playerStore.cacheTtlMsFor(oldEvents), playerStore.SETTLED_CACHE_TTL_MS);
-  assert.ok(playerStore.SETTLED_CACHE_TTL_MS > playerStore.RECENT_ACTIVITY_CACHE_TTL_MS, 'settled TTL must genuinely be longer, not just different');
+  assert.equal(playerStore.isSettled(oldEvents), true);
 });
 
-test('cacheTtlMsFor: no recorded events at all stays on the SHORT TTL — never treated as settled', () => {
-  assert.equal(playerStore.cacheTtlMsFor([]), playerStore.RECENT_ACTIVITY_CACHE_TTL_MS);
-  assert.equal(playerStore.cacheTtlMsFor(undefined), playerStore.RECENT_ACTIVITY_CACHE_TTL_MS);
+test('isSettled: no recorded events at all is NOT settled — never treated as settled with no history to judge from', () => {
+  assert.equal(playerStore.isSettled([]), false);
+  assert.equal(playerStore.isSettled(undefined), false);
 });
 
-test('getPlayerStats: a settled player (old activity) is still a cache HIT well past the old 24h window — no scrape triggered', async () => {
+test('getPlayerStats: a settled player (old activity) is a cache HIT days after their last scrape', async () => {
   const oldEvents = [{ name: 'X', date: new Date(Date.now() - 200 * 86400000).toISOString() }];
   const existing = {
     totalPR: 500, thisSeasonPR: 0, prBand: null, recentEvents: oldEvents,
-    lastUpdated: new Date(Date.now() - 5 * 86400000), // 5 days ago: stale under the OLD flat 24h TTL, fresh under the new settled TTL
+    lastUpdated: new Date(Date.now() - 5 * 86400000), // 5 days ago: well within SETTLED_CACHE_TTL_MS (30 days)
   };
 
   await withStubs({ findOneResult: existing }, async ({ scrapeCalls }) => {
     const stats = await playerStore.getPlayerStats('g1', 'd1', 'Player1', 'e1', 'EU');
-    assert.equal(scrapeCalls.length, 0, 'a settled player 5 days stale must NOT trigger a re-scrape (30-day settled TTL)');
+    assert.equal(scrapeCalls.length, 0, 'a settled player 5 days stale must NOT trigger a re-scrape');
     assert.equal(stats.totalPR, 500);
   });
 });
 
-test('getPlayerStats: a recently-active player past the 24h recent-activity TTL is a cache MISS — scrapes fresh', async () => {
+test('getPlayerStats: an active player stays a cache HIT well past the OLD flat 24h window — freshness is event-driven now, not time-driven', async () => {
   const recentEvents = [{ name: 'X', date: new Date(Date.now() - 2 * 86400000).toISOString() }];
   const existing = {
     totalPR: 500, thisSeasonPR: 0, prBand: null, recentEvents,
-    lastUpdated: new Date(Date.now() - 25 * 3600000), // 25h ago: past the 24h recent-activity TTL
+    lastUpdated: new Date(Date.now() - 25 * 3600000), // 25h ago: past the old 24h TTL, but nothing invalidated them
   };
+
+  await withStubs({ findOneResult: existing }, async ({ scrapeCalls }) => {
+    const stats = await playerStore.getPlayerStats('g1', 'd1', 'Player1', 'e1', 'EU');
+    assert.equal(scrapeCalls.length, 0, 'time alone must not expire an active player\'s cache — only a real event conclusion (invalidateStaleAfterEvent) should');
+    assert.equal(stats.totalPR, 500);
+  });
+});
+
+test('getPlayerStats: a player whose cache was already nulled (e.g. by invalidateStaleAfterEvent) is a cache MISS — scrapes fresh', async () => {
+  const existing = { totalPR: 500, thisSeasonPR: 0, prBand: null, recentEvents: [], lastUpdated: null };
 
   await withStubs({ findOneResult: existing, scrapeImpl: () => ({ totalPR: 999, thisSeasonPR: 5, prBand: null, recentEvents: [] }) }, async ({ scrapeCalls }) => {
     const stats = await playerStore.getPlayerStats('g1', 'd1', 'Player1', 'e1', 'EU');
-    assert.equal(scrapeCalls.length, 1, 'an actively-competing player must still re-scrape on the short TTL');
+    assert.equal(scrapeCalls.length, 1, 'a nulled lastUpdated must always re-scrape, regardless of settled/active status');
     assert.equal(stats.totalPR, 999);
   });
 });

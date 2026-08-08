@@ -22,15 +22,16 @@
 // range where distance starts to matter), not picked arbitrarily. Cheap to retune later: every
 // player-band assignment is recomputed fresh on every batch run, nothing is migrated.
 //
-// SESSIONS/EFFICIENCY FACTOR: deliberately not implemented at all. Confirmed during investigation
-// that a Fortnite Tracker "Sessions" count is never scraped anywhere in this codebase — the
-// `/events?...&competitive=pr` page scraper.js reads only carries competitive-PR-event data
-// (scraper.js's parseProfileData), not a lifetime session count. Real scraping for it would need
-// live verification (a different Tracker page, and confirmation it doesn't silently break the
-// existing single-request-per-player design) before it could be trusted — out of scope here per
-// explicit instruction to drop it until there's real player volume to justify that investigation.
-// This module ships with exactly three factors instead: window-average decayed PR ("level"), trend
-// (an OLS slope across the window), and consistency (coefficient of variation across the window).
+// FOUR real factors, per the original design: window-average decayed PR ("level"), trend (an OLS
+// slope across the window), consistency (coefficient of variation across the window), and
+// efficiency (totalPR / real scraped Sessions count — computeEfficiency below). The first three
+// come from computeWindowStats' recentEvents window; efficiency is a genuinely different KIND of
+// signal (overall PR earned per session invested, not a per-event trajectory measure), so it's
+// computed separately from the player's totalPR/sessions rather than folded into the window. A
+// Fortnite Tracker "Sessions" count wasn't scraped anywhere in this codebase for a while — that
+// gap is closed now (scraper.js's parseProfileData, same page load thisSeasonPR's DOM read already
+// uses, no separate navigation — confirmed live before implementing, not assumed) — see
+// models/Player.js's sessions field doc comment.
 //
 // "QUALIFYING EVENTS" — the window factors 1-3 above are computed from: the player's own
 // recentEvents (scraper.js's parseProfileData, newest-first, already capped at 20), filtered to
@@ -136,6 +137,21 @@ function computeWindowStats(recentEvents) {
   return { sampleSize: values.length, avgLevel, trend, consistency };
 }
 
+// The fourth factor — PR earned per real lifetime session played (players.js's/scraper.js's
+// sessions, platform-scoped the same way totalPR already is). Deliberately independent of
+// computeWindowStats above: this doesn't need a qualifying-events window at all, just the
+// player's own current totalPR and their scraped Sessions count, so it's computed separately
+// rather than folded into that function's signature. null (never 0, never a guessed ratio) — same
+// "no signal, not a zeroed-out result" discipline as consistency's own null case — whenever either
+// input isn't a real positive number: sessions missing/zero (not yet scraped since this field
+// existed, or a genuinely brand-new account with no recorded sessions) or totalPR not yet
+// established. Callers null-filter this exactly like consistency, so a player/band missing it
+// simply contributes one fewer factor to the average, never a fabricated value.
+function computeEfficiency(totalPR, sessions) {
+  if (!(totalPR > 0) || !(sessions > 0)) return null;
+  return totalPR / sessions;
+}
+
 // Real PR band a given totalPR falls into — bandMax of one band is exactly bandMin of the next, so
 // "the next band up" is always a simple, exact lookup (bandMin: thisBand.bandMax), never a
 // recomputation or an off-by-one guess.
@@ -151,27 +167,35 @@ function bandRangeForPR(totalPR) {
 // stats and is not counted in playerCount — see models/TierBandStats.js's doc comment on why
 // counting them would misrepresent how statistically trustworthy a band's averages actually are.
 function computeBandStatsFromPlayers(players) {
-  const byBand = new Map(); // bandMin -> { bandMin, bandMax, levels: [], trends: [], consistencies: [] }
+  const byBand = new Map(); // bandMin -> { bandMin, bandMax, levels: [], trends: [], consistencies: [], efficiencies: [] }
 
   for (const player of players) {
     const windowStats = computeWindowStats(player.recentEvents);
     if (!windowStats) continue;
 
+    // Efficiency gated on the SAME per-player qualification as level/trend/consistency (a real
+    // windowStats) — not an independent bypass. A player already needs genuine recent competitive
+    // history for tier-comparison to apply to them at all; efficiency is one more factor evaluated
+    // once they qualify, not a separate door in.
+    const efficiency = computeEfficiency(player.totalPR, player.sessions);
+
     const { bandMin, bandMax } = bandRangeForPR(player.totalPR);
-    if (!byBand.has(bandMin)) byBand.set(bandMin, { bandMin, bandMax, levels: [], trends: [], consistencies: [] });
+    if (!byBand.has(bandMin)) byBand.set(bandMin, { bandMin, bandMax, levels: [], trends: [], consistencies: [], efficiencies: [] });
     const bucket = byBand.get(bandMin);
     bucket.levels.push(windowStats.avgLevel);
     bucket.trends.push(windowStats.trend);
     if (windowStats.consistency != null) bucket.consistencies.push(windowStats.consistency);
+    if (efficiency != null) bucket.efficiencies.push(efficiency);
   }
 
-  return [...byBand.values()].map(({ bandMin, bandMax, levels, trends, consistencies }) => ({
+  return [...byBand.values()].map(({ bandMin, bandMax, levels, trends, consistencies, efficiencies }) => ({
     bandMin,
     bandMax,
     playerCount: levels.length,
     avgLevel: average(levels),
     avgTrend: average(trends),
     avgConsistency: consistencies.length > 0 ? average(consistencies) : null,
+    avgEfficiency: efficiencies.length > 0 ? average(efficiencies) : null,
   }));
 }
 
@@ -222,11 +246,13 @@ function resemblance(playerValue, ownAvg, nextAvg) {
 }
 
 // The real per-player entry point. playerData needs { totalPR, recentEvents } (the same shape
-// computeMatchScoreBreakdown already takes — no new shape invented). Always resolves to a real,
-// honest result — hasSignal:false + modifier:0 whenever ANY required real signal is missing (the
-// player's own window, their own band, or the next band up), per the explicit "plain PR-native
-// scoring with no tier-comparison modifier at all" fallback requirement — never a guessed or
-// partial modifier from incomplete data.
+// computeMatchScoreBreakdown already takes — no new shape invented) plus sessions (players.js's
+// getStatsForContext-resolved, platform-scoped count — optional: a missing/null sessions just
+// drops the efficiency factor below, same as a missing consistency already does, never a hard
+// failure). Always resolves to a real, honest result — hasSignal:false + modifier:0 whenever ANY
+// required real signal is missing (the player's own window, their own band, or the next band up),
+// per the explicit "plain PR-native scoring with no tier-comparison modifier at all" fallback
+// requirement — never a guessed or partial modifier from incomplete data.
 async function getTierComparisonModifier(playerData) {
   const windowStats = computeWindowStats(playerData?.recentEvents);
   if (!windowStats) {
@@ -257,10 +283,13 @@ async function getTierComparisonModifier(playerData) {
     return { modifier: 0, hasSignal: false, reason: 'next PR band up has too few real players for valid stats yet' };
   }
 
+  const efficiency = computeEfficiency(playerData.totalPR, playerData.sessions);
+
   const factorResemblances = [
     resemblance(windowStats.avgLevel, ownBand.avgLevel, nextBand.avgLevel),
     resemblance(windowStats.trend, ownBand.avgTrend, nextBand.avgTrend),
     resemblance(windowStats.consistency, ownBand.avgConsistency, nextBand.avgConsistency),
+    resemblance(efficiency, ownBand.avgEfficiency, nextBand.avgEfficiency),
   ].filter(r => r != null);
 
   if (factorResemblances.length === 0) {
@@ -287,6 +316,7 @@ module.exports = {
   MIN_BAND_PLAYERS,
   MAX_TIER_MODIFIER,
   computeWindowStats,
+  computeEfficiency,
   bandRangeForPR,
   computeBandStatsFromPlayers,
   runDailyTierBandComputation,

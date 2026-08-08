@@ -1,8 +1,9 @@
-// Verifies requirement 2: register/get-roles/how-to-use/access are created inside a dedicated
-// "MatchMaker" category instead of at server root, where generic names like "register" or
-// "how-to-use" are more likely to collide with a channel a server already has for its own purposes.
+// Verifies requirement 2: register/get-roles/access are created inside a dedicated "MatchMaker"
+// category instead of at server root, where a generic name like "register" is more likely to
+// collide with a channel a server already has for its own purposes.
 // #setup is deliberately excluded (mod-only, permissions.js's MOD_ONLY_CHANNEL_KEYS — see
-// matchmaker-setup.js's CHANNEL_SPECS comment).
+// matchmaker-setup.js's CHANNEL_SPECS comment). #how-to-use no longer exists at all — see
+// test/howto-channel-removal.test.js.
 //
 // Exercises the real runMatchmakerSetup (not a reimplementation) against a fake Discord guild.
 // guild-config.js is stubbed at the require-cache level, same precedent as
@@ -110,22 +111,24 @@ function makeFakeGuild() {
   return { guild, rolesById, channelsById, createCalls, setParentCalls };
 }
 
-test('matchmaker-setup: CATEGORY_SPECS includes a MatchMaker category, and register/getRoles/howto are marked for it (access too, when access gating is enabled)', () => {
+test('matchmaker-setup: CATEGORY_SPECS includes a MatchMaker category, and register/getRoles are marked for it (access too, when access gating is enabled)', () => {
   withFakeGuildConfig((runMatchmakerSetup, getCurrent, CATEGORY_SPECS, CHANNEL_SPECS) => {
     assert.ok(CATEGORY_SPECS.some(s => s.key === 'matchmaker' && s.name === 'MatchMaker'));
 
     const byKey = Object.fromEntries(CHANNEL_SPECS.map(s => [s.key, s]));
     assert.equal(byKey.register.category, 'matchmaker');
     assert.equal(byKey.getRoles.category, 'matchmaker');
-    assert.equal(byKey.howto.category, 'matchmaker');
     if (byKey.access) assert.equal(byKey.access.category, 'matchmaker');
 
     // #setup is deliberately excluded — mod-only, not part of the member-facing collision concern.
     assert.equal(byKey.setup.category, undefined);
+
+    // #how-to-use no longer exists at all — see test/howto-channel-removal.test.js.
+    assert.equal(byKey.howto, undefined);
   });
 });
 
-test('matchmaker-setup: a fresh run creates register/getRoles/howto directly under the new MatchMaker category (not at root)', () => {
+test('matchmaker-setup: a fresh run creates register/getRoles directly under the new MatchMaker category (not at root), and never creates #how-to-use at all', () => {
   return withFakeGuildConfig(async (runMatchmakerSetup, getCurrent) => {
     const { guild, createCalls } = makeFakeGuild();
     await runMatchmakerSetup(guild);
@@ -134,7 +137,7 @@ test('matchmaker-setup: a fresh run creates register/getRoles/howto directly und
     const matchmakerCategoryId = saved.categoryIds.matchmaker;
     assert.ok(matchmakerCategoryId, 'a MatchMaker category should have been created and saved');
 
-    for (const name of ['register', 'get-roles', 'how-to-use']) {
+    for (const name of ['register', 'get-roles']) {
       const call = createCalls.find(c => c.name === name);
       assert.ok(call, `#${name} should have been created`);
       assert.equal(call.parent, matchmakerCategoryId, `#${name} should be created under the MatchMaker category, not at root`);
@@ -143,10 +146,13 @@ test('matchmaker-setup: a fresh run creates register/getRoles/howto directly und
     // #setup stays at root, unaffected.
     const setupCall = createCalls.find(c => c.name === 'setup');
     assert.equal(setupCall.parent, null, '#setup should stay at server root');
+
+    assert.equal(createCalls.some(c => c.name === 'how-to-use'), false, '#how-to-use must never be created on a fresh run');
+    assert.equal(saved.channelIds.howto, undefined);
   });
 });
 
-test('matchmaker-setup: re-running after an existing (pre-category) setup moves register/getRoles/howto into the new MatchMaker category', () => {
+test('matchmaker-setup: re-running after an existing (pre-category) setup moves register/getRoles into the new MatchMaker category', () => {
   return withFakeGuildConfig(async (runMatchmakerSetup, getCurrent, CATEGORY_SPECS, CHANNEL_SPECS, setGuildConfig) => {
     const { guild, createCalls } = makeFakeGuild();
 
@@ -154,12 +160,11 @@ test('matchmaker-setup: re-running after an existing (pre-category) setup moves 
     // channels manually at root and seed config to look like a completed prior run.
     const registerChannel = await guild.channels.create({ name: 'register', type: 0 });
     const getRolesChannel = await guild.channels.create({ name: 'get-roles', type: 0 });
-    const howtoChannel = await guild.channels.create({ name: 'how-to-use', type: 0 });
     const setupChannel = await guild.channels.create({ name: 'setup', type: 0 });
     createCalls.length = 0; // only care about calls made during the actual setup run below
 
     await setGuildConfig(guild.id, {
-      channelIds: { setup: setupChannel.id, register: registerChannel.id, getRoles: getRolesChannel.id, howto: howtoChannel.id },
+      channelIds: { setup: setupChannel.id, register: registerChannel.id, getRoles: getRolesChannel.id },
     });
 
     await runMatchmakerSetup(guild);
@@ -170,11 +175,10 @@ test('matchmaker-setup: re-running after an existing (pre-category) setup moves 
 
     assert.equal(registerChannel.parentId, matchmakerCategoryId, '#register should have been reparented into MatchMaker');
     assert.equal(getRolesChannel.parentId, matchmakerCategoryId, '#get-roles should have been reparented into MatchMaker');
-    assert.equal(howtoChannel.parentId, matchmakerCategoryId, '#how-to-use should have been reparented into MatchMaker');
     assert.equal(setupChannel.parentId, null, '#setup should NOT be reparented');
 
     // No duplicate channels were created for the ones that already existed.
-    assert.equal(createCalls.some(c => ['register', 'get-roles', 'how-to-use', 'setup'].includes(c.name)), false,
+    assert.equal(createCalls.some(c => ['register', 'get-roles', 'setup'].includes(c.name)), false,
       'no duplicate channels should be created for ones that already existed and were just reparented');
   });
 });

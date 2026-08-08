@@ -261,7 +261,7 @@ test('THE ACTUAL BUG: an existing 6s channel from before the coming-soon change 
 test('a SECOND /matchmaker-setup re-run does not re-edit a channel that is already showing the coming-soon embed (no needless API churn)', () => {
   return withFakeGuildConfig(async (runMatchmakerSetup, getCurrent, CREATIVE_CHANNEL_SPECS, setGuildConfig) => {
     const { guild, editCalls } = makeFakeGuild();
-    // Scoped to creative-6s/8s only — several OTHER channels (setup/getRoles/howto/register/
+    // Scoped to creative-6s/8s only — several OTHER channels (setup/getRoles/register/
     // suggestions) are edited on EVERY /matchmaker-setup re-run by design (ensurePosted's existing,
     // unrelated "roll out wording changes" behavior), so a raw total editCalls.length would always
     // grow between runs regardless of whether this fix works.

@@ -10,7 +10,7 @@
 //   1. #register only (ENTRY_CHANNEL_KEYS) — visible to @everyone, no role needed.
 //   2. The Epic OAuth flow (epic-oauth.js / webhook-server.js's /epic-callback) grants the
 //      verified role (auto-created by /matchmaker-setup, stored as roleIds.verified) directly on
-//      a successful link -> unlocks #get-roles, #how-to-use, #access, and #suggestions (verifiedChannels).
+//      a successful link -> unlocks #get-roles, #access, and #suggestions (verifiedChannels).
 // Neither tournament nor creative queue channels are part of this ladder — every server member
 // can see every one of them regardless of role state; only actually queueing still requires the
 // Registered role, checked independently at click-time (index.js's queue_duo/lf2 handler for
@@ -56,7 +56,6 @@ const ENTRY_CHANNEL_KEYS = ['register'];
 // to normal posting.
 const verifiedChannels = [
   { key: 'getRoles' },
-  { key: 'howto' },
   { key: 'access', sendMessages: false },
   { key: 'suggestions' },
 ];
@@ -162,12 +161,12 @@ async function enforceEntryChannels(guild) {
 
 // If the guild has no verified role configured yet (roleIds.verified unset — pre-dating the
 // auto-create in /matchmaker-setup), these channels are left exactly as they currently are rather
-// than locked out entirely — an upgrading server shouldn't lose access to
-// get-roles/how-to-use/access just because /matchmaker-setup hasn't been re-run yet.
+// than locked out entirely — an upgrading server shouldn't lose access to get-roles/access just
+// because /matchmaker-setup hasn't been re-run yet.
 async function enforceVerifiedChannels(guild) {
   const verifiedRoleId = getRoleId(guild.id, 'verified');
   if (!verifiedRoleId) {
-    console.warn('  ⚠️ No verified role configured for this guild (re-run /matchmaker-setup) — skipping progressive-visibility enforcement for get-roles/how-to-use/access');
+    console.warn('  ⚠️ No verified role configured for this guild (re-run /matchmaker-setup) — skipping progressive-visibility enforcement for get-roles/access');
     return;
   }
 

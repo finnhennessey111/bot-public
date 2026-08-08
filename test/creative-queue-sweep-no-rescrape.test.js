@@ -27,7 +27,7 @@ const playerStore = require('../players');
 function makeMemberArgs(discordId, mode) {
   return {
     guildId: 'g1', guildName: 'Test Guild', discordId, discordUsername: discordId, discordTag: discordId,
-    epicUsername: discordId, epicId: discordId, mode, region: 'EU', platform: 'PC',
+    epicUsername: discordId, epicId: discordId, mode, region: 'EU',
   };
 }
 

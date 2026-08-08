@@ -166,6 +166,33 @@ const GUILD_CONFIG_MIGRATIONS = [
       return `renamed #${channel.id} from "${previousName}" to "suggestions-report-a-bug"`;
     },
   },
+  {
+    // Deletes the dedicated #how-to-use channel matchmaker-setup.js used to auto-create — removed
+    // entirely (matchmaker-setup.js's CHANNEL_SPECS no longer has a 'howto' entry) since it's
+    // redundant with /setup-howto (index.js), which posts the exact same embed on demand into
+    // whichever channel a mod actually wants it in. A guild that ran /matchmaker-setup before this
+    // shipped still has the old channel and its stored channelIds.howto/setupMessageIds.howto —
+    // this deletes the real Discord channel (if it's still there) and clears both stored ids, same
+    // "self-heal automatically at next startup" precedent as every other migration here.
+    //
+    // Deliberately does NOT clear config on a failed delete (e.g. missing Manage Channels) — left
+    // "missing" so this retries every startup until it actually succeeds, rather than silently
+    // forgetting about an orphaned channel forever the way clearing config on failure would.
+    name: 'channelIds.howto deleted (how-to-use channel removed)',
+    isMissing: (config) => !!config.channelIds?.howto,
+    apply: async (guild) => {
+      const config = getGuildConfig(guild.id);
+      const channelId = config.channelIds.howto;
+      const channel = await guild.channels.fetch(channelId).catch(() => null);
+
+      if (channel) {
+        await channel.delete(); // let this throw — a real failure (e.g. missing permission) must keep isMissing true so this retries next startup, not silently succeed
+      }
+
+      await deleteConfigKeys(guild.id, { channelIds: ['howto'], setupMessageIds: ['howto'] });
+      return channel ? `deleted #${channel.name} (${channelId}) and cleared stored channel/message id` : 'channel already gone — cleared stale stored channel/message id';
+    },
+  },
 ];
 
 // Startup self-heal: for every guild the bot is currently in, check each known migration against
@@ -279,6 +306,31 @@ async function setGuildConfig(guildId, partial) {
     { upsert: true }
   );
   return merged;
+}
+
+// Removes keys entirely (not just overwrites with a new value) — setGuildConfig's merge can only
+// ever ADD/overwrite a key in one of the flat maps, never remove one (`{...current, ...partial}`
+// keeps whatever `current` already had for any key `partial` doesn't mention), so a genuine
+// deletion (e.g. GUILD_CONFIG_MIGRATIONS' howto-channel-removal migration below, clearing a stale
+// channelId after actually deleting the Discord channel) needs its own path: a real Mongo $unset,
+// not a $set. `keysByMap` is `{ channelIds: ['howto'], setupMessageIds: ['howto'] }` shaped — one
+// array of keys to drop per top-level map.
+async function deleteConfigKeys(guildId, keysByMap) {
+  const current = cache[guildId] ?? emptyConfig();
+  const unsetDoc = {};
+
+  for (const [mapName, keys] of Object.entries(keysByMap)) {
+    const map = { ...current[mapName] };
+    for (const key of keys) {
+      delete map[key];
+      unsetDoc[`${mapName}.${key}`] = '';
+    }
+    current[mapName] = map;
+  }
+
+  cache[guildId] = current;
+  await GuildModel.updateOne({ guildId }, { $unset: unsetDoc });
+  return current;
 }
 
 module.exports = {

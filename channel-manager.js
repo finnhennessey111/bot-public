@@ -11,6 +11,7 @@ const playerStore = require('./players');
 const tournamentApproval = require('./tournament-approval');
 const { markSelfDeletion } = require('./self-deletion-tracker');
 const DeletedTournamentChannelModel = require('./models/DeletedTournamentChannel');
+const { alertError } = require('./error-alert');
 
 const EMBED_REFRESH_INTERVAL_MS = 60 * 1000;
 
@@ -19,6 +20,27 @@ const EMBED_REFRESH_INTERVAL_MS = 60 * 1000;
 // every newly-detected tournament already sits behind tournament-approval.js's manual DM-approval
 // gate, so scrape cadence was never what determined how fast a channel actually went live.
 const TOURNAMENT_CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000;
+
+// Tracks the last time scrapeUpcomingTournaments() resolved without throwing — read by
+// webhook-server.js's /health endpoint (getLastSuccessfulScrapeAt) as the health-check's "last
+// successful tournament scrape" field. null until the first scrape completes after a fresh process
+// start — deliberately not persisted, since a restart genuinely means "we don't know yet" until the
+// next scrape runs.
+let lastSuccessfulScrapeAt = null;
+
+// Every real call site below goes through this instead of tournament-scraper.js's
+// scrapeUpcomingTournaments directly, so lastSuccessfulScrapeAt only advances on an actual
+// successful resolution — a thrown error skips the assignment and propagates to the caller's own
+// catch, exactly as before this wrapper existed.
+async function scrapeAndTrack() {
+  const result = await scrapeUpcomingTournaments();
+  lastSuccessfulScrapeAt = new Date();
+  return result;
+}
+
+function getLastSuccessfulScrapeAt() {
+  return lastSuccessfulScrapeAt;
+}
 
 // How long after a tournament's last session begins its queue channel stays up before auto-deleting.
 const CHANNEL_DELETE_BUFFER_MS = 2 * 60 * 60 * 1000;
@@ -204,7 +226,7 @@ function computeRankCounts(guildId, tournamentName, region) {
 }
 
 async function createTournamentChannel(guild, tournament, pinnedMessages) {
-  const { name, region, beginTime, lastBeginTime, isTrios, consoleOnly, isPermanent, isRankedCup } = tournament;
+  const { name, region, beginTime, lastBeginTime, endTime, isTrios, consoleOnly, isPermanent, isRankedCup } = tournament;
 
   // Last-resort guard: tournament-scraper.js's buildTournamentGroups already drops sessions whose
   // title is nothing but a build-mode label (see isBareBuildModeLabel there) before they ever
@@ -379,6 +401,17 @@ async function createTournamentChannel(guild, tournament, pinnedMessages) {
       // require every matched member be on Console for a genuinely console-only tournament.
       consoleOnly: !!consoleOnly,
       beginTime,
+      // Real, scraped tournament conclusion (tournament-scraper.js's buildTournamentGroups) —
+      // captured once here, at creation, same as beginTime/deleteAt just below. Not re-derived on
+      // later ticks: by the time a later scrape would want to update it, this tournament's session
+      // has typically already begun and dropped out of scrapeUpcomingTournaments' results entirely
+      // (its own past-time filter), so there's no later opportunity to backfill a better value
+      // anyway — this snapshot IS the best data ever available for it. null for a legacy channel
+      // predating this field, a manually /setup-tournament-created one, or a Fortnite-Tracker-
+      // fallback discovery whose raw calendar didn't carry a real endTime — updateActiveTournamentEmbeds'
+      // event-conclusion invalidation trigger below just never fires for those, same fail-soft
+      // shape as every other optional scraped field.
+      endTime: endTime ?? null,
       deleteAt: deleteAfter,
       permanent: !!isPermanent,
     };
@@ -577,17 +610,41 @@ async function updateActiveTournamentEmbeds(guild, pinnedMessages, backfillTourn
     // Tournament just moved from upcoming to past (beginTime has elapsed) — expire every
     // registered player's cached stats in this region (no scraping here, see players.js's
     // rescrapeRegisteredPlayers) so their cached stats pick up the event that just happened the
-    // next time they actually queue, rather than each of them individually waiting out the 24h
-    // queue-join cache. statsRescraped is set synchronously (before the invalidation resolves) so
-    // an overlapping tick within the same ~60s window can't fire it twice. Doesn't apply to
-    // permanent tournaments — there's no single "this tournament just began" moment for something
-    // that's always open.
+    // next time they actually queue, rather than each of them individually waiting out
+    // SETTLED_CACHE_TTL_MS's much longer passive backstop. statsRescraped is set synchronously
+    // (before the invalidation resolves) so an overlapping tick within the same ~60s window can't
+    // fire it twice. Doesn't apply to permanent tournaments — there's no single "this tournament
+    // just began" moment for something that's always open.
     if (!pinned.permanent && !pinned.statsRescraped && new Date(pinned.beginTime).getTime() <= Date.now()) {
       pinned.statsRescraped = true;
       savePinnedMessages(guild.id);
       console.log(`  🔄 ${channelId} (${pinned.tournamentName}, ${pinned.region}) — tournament has begun, expiring cached stats for registered players in this region`);
       playerStore.rescrapeRegisteredPlayers(guild.id, pinned.region)
         .catch(err => console.error(`  ❌ Cache invalidation failed for ${pinned.tournamentName} (${pinned.region}):`, err.message));
+    }
+
+    // Tournament's REAL scraped conclusion (pinned.endTime — Epic's own eventWindow endTime, see
+    // tournament-scraper.js's buildTournamentGroups) has passed. This is a SEPARATE, more precise
+    // trigger than the beginTime one above: that one already force-refreshes everyone in the
+    // region the moment the tournament STARTS (so results mid-event aren't served stale forever);
+    // this one additionally catches the case where a player's cache was written WHILE the
+    // tournament was still running (e.g. they queued an hour into it) — still "fresh" by the
+    // begin-time trigger's standard, but genuinely stale once the event actually concludes and
+    // Fortnite Tracker's own recorded results for it settle. Same cheap, INSTANT-ONLY invalidation
+    // shape as the trigger above — never an eager re-scrape here, see players.js's
+    // invalidateStaleAfterEvent for the real logic (region-scoped, active-players-only, and skips
+    // anyone who already scraped fresh after this exact conclusion, so a player who queued right
+    // after the event ended isn't needlessly re-flagged). eventEndInvalidated is set synchronously
+    // before the invalidation promise resolves, same fire-once-per-channel guard as
+    // statsRescraped above. Skipped when endTime isn't known (see its own doc comment on the
+    // pinnedMessages entry above) and for permanent tournaments — same "no single 'ended' moment"
+    // reasoning as the beginTime trigger's own permanent exemption.
+    if (!pinned.permanent && pinned.endTime && !pinned.eventEndInvalidated && new Date(pinned.endTime).getTime() <= Date.now()) {
+      pinned.eventEndInvalidated = true;
+      savePinnedMessages(guild.id);
+      console.log(`  🔄 ${channelId} (${pinned.tournamentName}, ${pinned.region}) — tournament has concluded (real endTime passed), invalidating cache for active players in this region who haven't refreshed since`);
+      playerStore.invalidateStaleAfterEvent(guild.id, pinned.region, pinned.endTime)
+        .catch(err => console.error(`  ❌ Event-conclusion cache invalidation failed for ${pinned.tournamentName} (${pinned.region}):`, err.message));
     }
 
     try {
@@ -701,16 +758,23 @@ async function forEachGuild(client, action) {
 async function runTournamentCheckTick(client, pinnedMessages) {
   let tournaments;
   try {
-    tournaments = await scrapeUpcomingTournaments();
+    tournaments = await scrapeAndTrack();
   } catch (err) {
     console.error('Failed to scrape tournaments for this check:', err.message);
+    await alertError(client, {
+      area: 'Tournament Scrape',
+      summary: `The scheduled tournament scrape failed this tick (both Epic and Fortnite Tracker) — tournament detection is stalled until the next tick succeeds: ${err.message}`,
+    });
     return;
   }
 
   const approvedTournaments = await tournamentApproval.gateTournaments(client, tournaments, pinnedMessages);
   await forEachGuild(client, guild => checkAndCreateChannels(guild, approvedTournaments, pinnedMessages));
 
-  await tournamentApproval.expirePendingApprovals(client).catch(err => console.error('[tournament-approval] Failed to sweep expired approvals:', err.message));
+  await tournamentApproval.expirePendingApprovals(client).catch(err => {
+    console.error('[tournament-approval] Failed to sweep expired approvals:', err.message);
+    alertError(client, { area: 'Tournament Approval Sweep', summary: `expirePendingApprovals threw: ${err.message}` });
+  });
 }
 
 // Single-guild version of runTournamentCheckTick's core (scrape -> gate -> checkAndCreateChannels)
@@ -731,7 +795,7 @@ async function runTournamentCheckTick(client, pinnedMessages) {
 // createTournamentChannel already logs-and-skips per tournament when a guild has no forum
 // configured for a given region/build-mode combo yet, it doesn't throw.
 async function catchUpTournamentsForGuild(client, guild, pinnedMessages) {
-  const tournaments = await scrapeUpcomingTournaments();
+  const tournaments = await scrapeAndTrack();
   const approvedTournaments = await tournamentApproval.gateTournaments(client, tournaments, pinnedMessages);
   await checkAndCreateChannels(guild, approvedTournaments, pinnedMessages);
 }
@@ -751,7 +815,7 @@ async function runEmbedRefreshTick(client, pinnedMessages) {
   if (anyNeedsBackfill) {
     console.log('  🔍 At least one pinned channel is missing beginTime — fetching one shared scrape for backfill this tick');
     try {
-      backfillTournaments = await scrapeUpcomingTournaments();
+      backfillTournaments = await scrapeAndTrack();
     } catch (err) {
       console.error('  ❌ Backfill scrape failed:', err.message);
     }
@@ -805,4 +869,10 @@ module.exports = {
   // forum-post migration's #5 item specifically asked to verify this deletion path works with
   // ThreadChannel.delete() the same way it always did with a normal channel's.
   deleteManagedChannel,
+  // Read by webhook-server.js's /health endpoint.
+  getLastSuccessfulScrapeAt,
+  // Exported for testability (same precedent as buildChannelName/abbreviateBuildMode/
+  // deleteManagedChannel above) — not called directly by anything outside this module otherwise,
+  // startScheduler is the only real caller.
+  runTournamentCheckTick,
 };

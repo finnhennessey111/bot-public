@@ -18,7 +18,6 @@ function basePlayer(overrides = {}) {
     queueType: 'duo',
     ingameRoles: [],
     languages: [],
-    ageBracket: null,
     recentEvents: [],
     platform: 'PC',
     ...overrides,

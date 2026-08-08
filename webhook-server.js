@@ -27,6 +27,9 @@ const playerStore = require('./players');
 const { getRoleId, getChannelId } = require('./guild-config');
 const elo = require('./elo');
 const { createRateLimiter } = require('./rate-limit');
+const { alertError } = require('./error-alert');
+const db = require('./db');
+const channelManager = require('./channel-manager');
 
 function getStripeSdk() {
   if (!process.env.STRIPE_SECRET_KEY) return null;
@@ -293,6 +296,7 @@ function startWebhookServer(client) {
         res.json({ received: true });
       } catch (err) {
         console.error(`[webhook] Failed to handle ${event.type}:`, err.message);
+        alertError(client, { area: 'Stripe Webhook', summary: `A verified Stripe ${event.type} event failed to process: ${err.message}` });
         res.status(500).json({ error: 'internal error handling event' });
       }
     });
@@ -340,7 +344,7 @@ function startWebhookServer(client) {
         await playerStore.linkEpicAccount(guildId, discordId, { epicId, epicUsername });
 
         // See permissions.js's progressive-visibility ladder, which gates
-        // #get-roles/#how-to-use/#access behind this role.
+        // #get-roles/#access behind this role.
         const verifiedRoleId = getRoleId(guildId, 'verified');
         if (verifiedRoleId) {
           const guild = await client.guilds.fetch(guildId).catch(() => null);
@@ -355,6 +359,7 @@ function startWebhookServer(client) {
         res.send(renderEpicResultPage(true, `Linked as ${escapeHtml(epicUsername)}!`));
       } catch (err) {
         console.error('[epic-oauth] Failed to store linked account:', err.message);
+        alertError(client, { area: 'Epic Account Linking', summary: `Epic OAuth succeeded for Discord ${discordId} but saving the linked account failed: ${err.message}` });
         res.status(500).send(renderEpicResultPage(false, 'Linked with Epic Games, but saving your account failed. Please try again.'));
       }
     });
@@ -452,6 +457,7 @@ function startWebhookServer(client) {
           if (err) {
             console.error('[deploy] Deploy command failed:', err.message);
             if (stderr) console.error('[deploy] stderr:', stderr);
+            alertError(client, { area: 'Deploy', summary: `git pull && pm2 restart matchmaker-beta failed after a verified push to main — the bot may be stuck on old code: ${err.message}` });
             return;
           }
           console.log('[deploy] Deploy output:', stdout);
@@ -495,6 +501,23 @@ function startWebhookServer(client) {
     }
   });
 
+  // Plain-JSON status page for uptime monitoring or a manual check by someone without SSH access
+  // to the server — always registered, same "no external credentials needed" reasoning as
+  // /api/elo/* above. 503 (not 200) when Mongo is down, so an automated check that only looks at
+  // the HTTP status code (rather than parsing the body) still catches it.
+  app.get('/health', (req, res) => {
+    const mongoConnected = db.isConnected();
+    const lastSuccessfulScrapeAt = channelManager.getLastSuccessfulScrapeAt();
+
+    res.status(mongoConnected ? 200 : 503).json({
+      status: mongoConnected ? 'ok' : 'degraded',
+      uptimeSeconds: Math.floor(process.uptime()),
+      mongoConnected,
+      lastSuccessfulScrapeAt: lastSuccessfulScrapeAt ? lastSuccessfulScrapeAt.toISOString() : null,
+      timestamp: new Date().toISOString(),
+    });
+  });
+
   app.get('/api/elo/:epicUsername', eloRateLimit, async (req, res) => {
     const { epicUsername } = req.params;
     if (!epicUsername || epicUsername.length > MAX_EPIC_USERNAME_LENGTH) {
@@ -521,6 +544,7 @@ function startWebhookServer(client) {
       epicEnabled && 'GET /epic-callback',
       discordOAuthEnabled && 'GET /premium/:plan, GET /discord-checkout-callback',
       deployEnabled && 'POST /deploy',
+      'GET /health',
       'GET /api/elo/:epicUsername',
       'GET /api/elo/search',
     ].filter(Boolean);

@@ -32,6 +32,12 @@ const tierBandStatsSchema = new mongoose.Schema({
   // reliability" for this band. null when no contributing player had a normalizable (non-zero
   // average level) consistency value.
   avgConsistency: { type: Number, default: null },
+  // Mean of each contributing player's own totalPR/sessions ratio (tier-comparison.js's
+  // computeEfficiency) — "typical PR earned per session" for this band, the fourth real factor
+  // per the module's original design. null when no contributing player had a real, non-zero
+  // scraped Sessions count to compute a ratio from (players.js's toStatsFields — a player scraped
+  // before scraper.js started reading Sessions, for instance).
+  avgEfficiency: { type: Number, default: null },
   computedAt: { type: Date, default: Date.now },
 });
 

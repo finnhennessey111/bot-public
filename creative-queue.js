@@ -32,6 +32,18 @@ const MODES = {
   '2v2': ['2v2 Realistics', '2v2 Zone Wars'],
 };
 
+// Which recentEvents rosterSize buildCreativePlayer's form-modifier (scraper.js's
+// computeMatchScoreBreakdown formRosterSize) should filter on for a given creative mode string —
+// 1v1 wants genuine recent SOLO form, 2v2 wants genuine recent DUO form, each a general "how have
+// they been doing in this format lately" signal, not tied to one specific tournament (same
+// structural shape solo already used). Falls back to 1 (solo) for anything that isn't a real 1v1/2v2
+// mode string (shouldn't happen for a real queue join, but matches computeMatchScoreBreakdown's own
+// default rather than silently producing NaN/undefined).
+function formRosterSizeForMode(mode) {
+  if (MODES['2v2'].includes(mode)) return 2;
+  return 1;
+}
+
 const REGIONS = ['EU', 'NAC'];
 
 const creativeMatchEvents = new EventEmitter();
@@ -226,13 +238,20 @@ function startCreativeMatchSweep() {
   setInterval(sweepAllCreativeQueues, config.matchSweepIntervalSeconds * 1000);
 }
 
-async function buildCreativePlayer({ guildId, guildName, discordId, discordUsername, discordTag, epicUsername, epicId, mode, region, platform }) {
+async function buildCreativePlayer({ guildId, guildName, discordId, discordUsername, discordTag, epicUsername, epicId, mode, region }) {
   // homeRegion (the player's registered region) vs region (the region they're queueing this
   // creative match in) — same distinction queue.js's buildPlayer draws for tournaments, needed so
   // getStatsForContext knows whether this join's region genuinely differs from home (#3).
   const registered = await playerStore.getPlayer(guildId, discordId);
   const homeRegion = registered?.region ?? region;
-  const resolvedPlatform = platform ?? 'PC';
+  // Resolved from the player's own stored profile (#get-roles' select_platform — Player.platforms,
+  // an additive 0-2 fact, never a forced PC/Console pick) rather than a caller-supplied argument —
+  // this function already fetches `registered` for homeRegion just above, so there's no reason to
+  // make every call site fetch it separately too (unlike queue.js's buildPlayer, whose caller
+  // already fetches the player doc anyway for ingameRoles/languages, so THAT one still takes
+  // platform as a resolved argument — see index.js). tournamentConsoleOnly is always false here,
+  // same reasoning as getStatsForContext's call just below.
+  const resolvedPlatform = playerStore.resolveQueuePlatform(registered?.platforms, false);
 
   // Creative queue has no console-exclusive-mode concept the way a tournament's consoleOnly flag
   // does (every mode here is open to any platform) — so tournamentConsoleOnly is always false;
@@ -249,7 +268,14 @@ async function buildCreativePlayer({ guildId, guildName, discordId, discordUsern
   // computeMatchScoreBreakdownWithTierComparison (not the plain sync computeMatchScoreBreakdown) —
   // layers tier-comparison.js's real-band modifier on top; safely inert (adds exactly 0) whenever
   // there isn't yet enough real player data for a valid comparison, per that module's own gating.
-  const { matchScore, soloModifier } = await computeMatchScoreBreakdownWithTierComparison(playerData, mode);
+  //
+  // formRosterSizeForMode(mode) is what actually splits 1v1 from 2v2 scoring — a 1v1 join still
+  // gets the solo-form modifier exactly as before (rosterSize 1, the default), a 2v2 join gets the
+  // duo-form modifier instead (rosterSize 2, same real-decayed-PR mechanism, just a different team
+  // size filtered from the player's own recentEvents). soloModifier below is genuinely a duo-form
+  // modifier for a 2v2 join despite the field's name — see computeMatchScoreBreakdown's own doc
+  // comment on why that name is kept regardless of formRosterSize.
+  const { matchScore, soloModifier } = await computeMatchScoreBreakdownWithTierComparison(playerData, mode, formRosterSizeForMode(mode));
 
   return {
     guildId,
@@ -313,6 +339,7 @@ function requeueCreativeUnit(unit) {
 module.exports = {
   MODES,
   REGIONS,
+  formRosterSizeForMode,
   buildCreativePlayer,
   joinCreativeQueue,
   requeueCreativeUnit,

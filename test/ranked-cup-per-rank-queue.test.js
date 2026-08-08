@@ -1,6 +1,6 @@
 // Verifies the Ranked Cup per-rank-tier queue feature: Ranked Cup tournaments (Bronze/Silver/
-// Gold/Platinum/Diamond/Elite) span one shared Fortnite Tracker event listing but should never let
-// players from different ranks match each other. Covers:
+// Gold/Platinum/Diamond/Elite/Champion/Unreal) span one shared Fortnite Tracker event listing but
+// should never let players from different ranks match each other. Covers:
 //   1. Detection (tournament-scraper.js's isRankedCupTitle) — only matches real "Ranked Cup" titles.
 //   2. Genuine pool separation (queue.js, real/unmodified) — a Bronze unit and an Elite unit with
 //      near-identical PR (who WOULD match under the normal widening rules) never pair up once
@@ -33,8 +33,8 @@ function makePlayer(discordId, tournamentName, region, totalPR) {
   return {
     guildId: 'g1', guildName: 'Test Guild', discordId, discordUsername: discordId, discordTag: discordId,
     epicUsername: discordId, epicId: discordId, tournamentName, homeRegion: region, queueRegion: region,
-    queueType: 'duo', platform: 'PC', consoleOnly: false, ingameRoles: [], languages: [], ageBracket: null,
-    bio: null, totalPR, thisSeasonPR: 0, matchScore: totalPR, soloModifier: 0, recentEvents: [], joinedAt: new Date(),
+    queueType: 'duo', platform: 'PC', consoleOnly: false, ingameRoles: [], languages: [],
+    totalPR, thisSeasonPR: 0, matchScore: totalPR, soloModifier: 0, recentEvents: [], joinedAt: new Date(),
   };
 }
 
@@ -78,13 +78,59 @@ test('ranked cup queues: a Bronze unit and an Elite unit with matching PR never 
   }
 });
 
+test('ranked cup queues: Champion and Unreal (the two new tiers) each get their own genuinely separate pool — never mixing with Elite or each other', async () => {
+  const realTournamentName = `Duos Ranked Cup (Battle Royale) ${Math.random()}`;
+  const region = 'EU';
+  const elitePool = rankedCupPoolName(realTournamentName, 'elite');
+  const championPool = rankedCupPoolName(realTournamentName, 'champion');
+  const unrealPool = rankedCupPoolName(realTournamentName, 'unreal');
+
+  assert.notEqual(elitePool, championPool, 'Elite and Champion pool names must differ');
+  assert.notEqual(elitePool, unrealPool, 'Elite and Unreal pool names must differ');
+  assert.notEqual(championPool, unrealPool, 'Champion and Unreal pool names must differ');
+
+  const found = [];
+  const onMatch = e => found.push(e);
+  matchEvents.on('matchFound', onMatch);
+
+  try {
+    // Identical PR across all three — under the real widening rules these would ALL pair up if
+    // they shared a pool. They must not, since Champion/Unreal are their own real pools.
+    await joinQueue({ guildId: 'g1', players: [makePlayer('elite-1', realTournamentName, region, 900)], tournamentName: elitePool, region, queueType: 'duo' });
+    await joinQueue({ guildId: 'g1', players: [makePlayer('champion-1', realTournamentName, region, 900)], tournamentName: championPool, region, queueType: 'duo' });
+    await joinQueue({ guildId: 'g1', players: [makePlayer('unreal-1', realTournamentName, region, 900)], tournamentName: unrealPool, region, queueType: 'duo' });
+
+    assert.equal(found.length, 0, 'a lone Elite, a lone Champion, and a lone Unreal player must never match each other');
+    assert.ok(findUnitByDiscordId('g1', 'elite-1'), 'Elite player still waiting in their own pool');
+    assert.ok(findUnitByDiscordId('g1', 'champion-1'), 'Champion player still waiting in their own pool');
+    assert.ok(findUnitByDiscordId('g1', 'unreal-1'), 'Unreal player still waiting in their own pool');
+
+    // A second Unreal player — same-rank matching must still work normally for the new tier too.
+    await joinQueue({ guildId: 'g1', players: [makePlayer('unreal-2', realTournamentName, region, 905)], tournamentName: unrealPool, region, queueType: 'duo' });
+    assert.equal(found.length, 1, 'two Unreal players with close PR must match each other');
+    assert.equal(found[0].tournamentName, unrealPool);
+    const matchedIds = [...found[0].unitA.members, ...found[0].unitB.members].map(p => p.discordId).sort();
+    assert.deepEqual(matchedIds, ['unreal-1', 'unreal-2'], 'the match must be exactly the two Unreal players — Elite/Champion must never be pulled in');
+
+    assert.equal(getQueueCount('g1', elitePool, region), 1, 'Elite player completely unaffected, still queued');
+    assert.equal(getQueueCount('g1', championPool, region), 1, 'Champion player completely unaffected, still queued');
+    assert.equal(getQueueCount('g1', unrealPool, region), 0, 'both Unreal players left the pool once matched');
+  } finally {
+    matchEvents.off('matchFound', onMatch);
+    removeFromQueueAnywhere('g1', 'elite-1');
+    removeFromQueueAnywhere('g1', 'champion-1');
+    removeFromQueueAnywhere('g1', 'unreal-1');
+    removeFromQueueAnywhere('g1', 'unreal-2');
+  }
+});
+
 // ── 3. EMBED/BUTTON BUILDERS ──────────────────────────────────────────────────
-test('buildRankedCupQueueButtons: 6 rank buttons across 2 rows, correct customIds and emoji, no generic queue button', () => {
+test('buildRankedCupQueueButtons: 8 rank buttons across 3 rows, correct customIds and emoji, no generic queue button', () => {
   const rows = buildRankedCupQueueButtons(false).map(r => r.toJSON());
   const allButtons = rows.flatMap(r => r.components);
 
-  assert.equal(allButtons.length, 6, 'one button per rank tier');
-  assert.equal(rows.length, 2, 'expected 2 rows for 6 buttons at 3 per row');
+  assert.equal(allButtons.length, 8, 'one button per rank tier (Bronze through Unreal)');
+  assert.equal(rows.length, 3, 'expected 3 rows for 8 buttons at 3 per row (3+3+2)');
 
   for (const tier of RANK_TIERS) {
     const btn = allButtons.find(b => b.custom_id === `queue_rank_duo_${tier.key}`);
@@ -97,7 +143,7 @@ test('buildRankedCupQueueButtons: 6 rank buttons across 2 rows, correct customId
 });
 
 test('buildRankedCupTournamentEmbed: shows a per-rank count breakdown, not one generic count', () => {
-  const rankCounts = { bronze: 3, silver: 0, gold: 5, platinum: 1, diamond: 0, elite: 2 };
+  const rankCounts = { bronze: 3, silver: 0, gold: 5, platinum: 1, diamond: 0, elite: 2, champion: 1, unreal: 4 };
   const embed = buildRankedCupTournamentEmbed('Duos Ranked Cup (Battle Royale)', 'EU', rankCounts, false).toJSON();
 
   const field = embed.fields.find(f => /queuing/i.test(f.name));
@@ -105,6 +151,8 @@ test('buildRankedCupTournamentEmbed: shows a per-rank count breakdown, not one g
   assert.match(field.value, /Bronze.*3/);
   assert.match(field.value, /Gold.*5/);
   assert.match(field.value, /Elite.*2/);
+  assert.match(field.value, /Champion.*1/);
+  assert.match(field.value, /Unreal.*4/);
   assert.ok(!embed.fields.some(f => f.name === '🟢 Players Queuing'), 'must not use the plain single-count field name');
 });
 
@@ -217,9 +265,9 @@ test('createTournamentChannel: a Ranked Cup title gets the per-rank buttons + br
     const created = [...channelsById.values()].find(c => c.id !== FORUM_ID);
     assert.ok(created, 'a forum post should have been created');
     const message = getLastMessage();
-    assert.equal(message.components.length, 2, 'expected 2 button rows for the 6 rank buttons');
+    assert.equal(message.components.length, 3, 'expected 3 button rows for the 8 rank buttons (3+3+2)');
     const allButtons = message.components.flatMap(r => r.toJSON().components);
-    assert.equal(allButtons.length, 6);
+    assert.equal(allButtons.length, 8);
     assert.ok(allButtons.every(b => b.custom_id.startsWith('queue_rank_')), 'every button must be rank-scoped');
 
     const pinnedEntry = Object.values(pinnedMessages)[0];

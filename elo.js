@@ -44,7 +44,7 @@
 
 const { computeMatchScoreBreakdown, computeMatchScoreBreakdownWithTierComparison, computeOwnTournamentModifier } = require('./scraper');
 const { PERMANENT_KEYWORDS } = require('./tournament-scraper');
-const { findCanonicalByEpicUsername, getAllScoredPlayers } = require('./players');
+const { findCanonicalByEpicUsername, getAllScoredPlayers, resolveQueuePlatform } = require('./players');
 const config = require('./config');
 
 // Never a real tournament title (recentEvents' names all come from real scraped Fortnite Tracker
@@ -103,7 +103,13 @@ const PERMANENT_KEYWORD_CONSOLE_ONLY = {
 // reported bug (a console player who HAS queued before, so the correct context is already cached,
 // just never being read).
 function resolvePlayerDataForContext(player, tournamentConsoleOnly) {
-  const platform = player.platform ?? 'PC';
+  // player.platform (singular) never existed as real data — confirmed nothing ever wrote it, so
+  // this always silently fell back to 'PC' and never showed a real Console player's cached
+  // kbm/gamepad-segment context here, even when players.js's getContextualPlayerStats already had
+  // it cached from a real queue join. player.platforms (plural, self-service — #get-roles' select_
+  // platform) is the real signal now; resolveQueuePlatform is the same resolution every live queue
+  // path uses, see its own doc comment (players.js).
+  const platform = resolveQueuePlatform(player.platforms, tournamentConsoleOnly);
   const platformSegment = platform === 'Console'
     ? (tournamentConsoleOnly ? config.ftPlatformSegments.Console : config.ftPlatformSegments.PC)
     : 'all';
@@ -116,6 +122,7 @@ function resolvePlayerDataForContext(player, tournamentConsoleOnly) {
         totalPR: cached.totalPR ?? 0,
         thisSeasonPR: cached.thisSeasonPR ?? 0,
         recentEvents: cached.recentEvents ?? [],
+        sessions: cached.sessions ?? null,
       };
     }
   }
@@ -124,6 +131,7 @@ function resolvePlayerDataForContext(player, tournamentConsoleOnly) {
     totalPR: player.totalPR ?? 0,
     thisSeasonPR: player.thisSeasonPR ?? 0,
     recentEvents: player.recentEvents ?? [],
+    sessions: player.sessions ?? null,
   };
 }
 

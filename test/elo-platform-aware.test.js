@@ -40,7 +40,7 @@ test('elo.js: a Console player checking Console Duos Victory Cup gets their GAME
   const original = PlayerModel.find;
   const player = {
     epicUsername: 'ConsolePlayer', epicUsernameLower: 'consoleplayer', epicId: 'console1',
-    region: 'EU', platform: 'Console',
+    region: 'EU', platforms: ['Console'],
     totalPR: 300, recentEvents: [{ name: 'Solo Cash Cup', placement: 500, prPoints: 10, rosterSize: 1 }], lastUpdated: new Date(),
     // The gamepad-context snapshot a real queue join for a console-exclusive tournament would have
     // populated (players.js's getContextualPlayerStats) — genuinely different numbers than home, so
@@ -68,7 +68,7 @@ test('elo.js: a Console player checking FNCS Division (NOT console-exclusive) ge
   const original = PlayerModel.find;
   const player = {
     epicUsername: 'ConsolePlayer2', epicUsernameLower: 'consoleplayer2', epicId: 'console2',
-    region: 'EU', platform: 'Console',
+    region: 'EU', platforms: ['Console'],
     totalPR: 300, recentEvents: [], lastUpdated: new Date(),
     statsByContext: {
       'EU|kbm': { totalPR: 450, recentEvents: [{ name: 'FNCS Division 2', placement: 10, prPoints: 120, rosterSize: 3 }] },
@@ -93,7 +93,7 @@ test('elo.js: a PC player is completely unaffected by platform-scoping — alway
   const original = PlayerModel.find;
   const player = {
     epicUsername: 'PcPlayer', epicUsernameLower: 'pcplayer', epicId: 'pc1',
-    region: 'EU', platform: 'PC',
+    region: 'EU', platforms: ['PC'],
     totalPR: 600, recentEvents: [{ name: 'FNCS Division 1', placement: 4, prPoints: 180, rosterSize: 3 }], lastUpdated: new Date(),
     // Even if a statsByContext entry somehow existed, a PC player's segment is always "all" — it
     // must never be consulted.
@@ -115,7 +115,7 @@ test('elo.js: a Console player who has NEVER queued a console-exclusive tourname
   const original = PlayerModel.find;
   const player = {
     epicUsername: 'NewConsolePlayer', epicUsernameLower: 'newconsoleplayer', epicId: 'console3',
-    region: 'NAC', platform: 'Console',
+    region: 'NAC', platforms: ['Console'],
     totalPR: 250, recentEvents: [], lastUpdated: new Date(),
     statsByContext: {}, // never queued anything context-specific yet
   };
@@ -133,7 +133,7 @@ test('elo.js: a Console player with home totalPR still null, but a real gamepad 
   const original = PlayerModel.find;
   const player = {
     epicUsername: 'ContextOnlyPlayer', epicUsernameLower: 'contextonlyplayer', epicId: 'console4',
-    region: 'EU', platform: 'Console',
+    region: 'EU', platforms: ['Console'],
     totalPR: null, recentEvents: [], lastUpdated: null, // home "all" segment never scraped (never ran /refresh-stats)
     statsByContext: { 'EU|gamepad': { totalPR: 700, recentEvents: [] } }, // but HAS queued a console-exclusive tournament for real
   };
@@ -152,7 +152,7 @@ test('elo.js: a player with genuinely no stats anywhere (no home fields, no stat
   const original = PlayerModel.find;
   const player = {
     epicUsername: 'TrulyNew', epicUsernameLower: 'trulynew', epicId: 'console5',
-    region: 'EU', platform: 'Console', totalPR: null, recentEvents: [], lastUpdated: null,
+    region: 'EU', platforms: ['Console'], totalPR: null, recentEvents: [], lastUpdated: null,
   };
   PlayerModel.find = stubPlayerFind([player]);
   try {
@@ -169,7 +169,7 @@ test('elo.js: resolvePlayerDataForContext\'s platform-scoped playerData feeds th
   const gamepadEvents = [{ name: 'Console Duos Victory Cup', placement: 1, prPoints: 300, rosterSize: 2 }];
   const player = {
     epicUsername: 'FormulaCheck', epicUsernameLower: 'formulacheck', epicId: 'console6',
-    region: 'EU', platform: 'Console', totalPR: 100, recentEvents: [], lastUpdated: new Date(),
+    region: 'EU', platforms: ['Console'], totalPR: 100, recentEvents: [], lastUpdated: new Date(),
     statsByContext: { 'EU|gamepad': { totalPR: 800, recentEvents: gamepadEvents } },
   };
   PlayerModel.find = stubPlayerFind([player]);

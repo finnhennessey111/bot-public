@@ -165,7 +165,7 @@ test('matchmaker-setup: roles/categories/channels created before a partial failu
       && saved.categoryIds.tournaments_EU && saved.categoryIds.tournaments_NAC && saved.categoryIds.tournaments_ME,
       'all 5 categories (matchmaker, creative, 3 region tournament categories) should be saved even though the run failed later'
     );
-    assert.ok(saved.channelIds.register && saved.channelIds.getRoles && saved.channelIds.howto,
+    assert.ok(saved.channelIds.register && saved.channelIds.getRoles,
       'channels created before the failing #setup embed post should be saved');
     assert.ok(
       TOURNAMENT_FORUM_SPECS.every(spec => saved.channelIds[spec.key]),

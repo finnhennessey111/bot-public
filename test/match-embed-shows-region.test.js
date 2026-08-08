@@ -15,7 +15,7 @@ test('buildMatchCard (tournament match confirmation): shows the player\'s region
   const player = {
     epicUsername: 'Ninja', discordUsername: 'ninja#0001', discordTag: 'ninja',
     platform: 'PC', homeRegion: 'NAC', totalPR: 12345, queueType: 'duo',
-    ingameRoles: [], languages: [], ageBracket: null, epicId: null,
+    ingameRoles: [], languages: [], epicId: null,
     recentEvents: [],
   };
 

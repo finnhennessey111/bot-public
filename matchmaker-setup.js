@@ -16,8 +16,8 @@ const { ACCESS_GATING_ENABLED } = require('./access');
 const { BUILD_MODES } = require('./build-mode');
 const changelog = require('./changelog');
 const {
-  buildRolesEmbed, buildRolesComponents, buildBioButtonRow, buildRegisterEmbed, buildEpicLinkButtonRow,
-  buildHowtoEmbed, buildSetupInstructionsEmbed,
+  buildRolesEmbed, buildRolesComponents, buildPlatformSelectRow, buildRegisterEmbed, buildEpicLinkButtonRow,
+  buildSetupInstructionsEmbed,
   buildAccessChannelEmbed, buildAccessChannelButtons,
   buildSuggestionsChannelEmbed, buildSuggestionButtonRow,
 } = require('./embeds');
@@ -34,9 +34,9 @@ const ROLE_SPECS = [
   { key: 'Registered', name: 'Registered' },
   { key: 'mod', name: 'MatchMaker Mod' },
   // Assigned directly by the Epic OAuth callback (webhook-server.js's /epic-callback) on a
-  // successful link — gates #get-roles/#how-to-use/#access (permissions.js's progressive-
-  // visibility ladder). Auto-created here like every other role, so setup never needs an admin to
-  // hand us an externally-managed role ID.
+  // successful link — gates #get-roles/#access (permissions.js's progressive-visibility ladder).
+  // Auto-created here like every other role, so setup never needs an admin to hand us an
+  // externally-managed role ID.
   { key: 'verified', name: 'MatchMaker Verified' },
 ];
 
@@ -50,10 +50,10 @@ const ROLE_SPECS = [
 // deletes a pre-existing category/channel, they're just no longer created/managed for new setups.
 // See ensureTournamentForums' own doc comment for why 9 separate forums instead of tags.
 const CATEGORY_SPECS = [
-  // Parent for register/get-roles/how-to-use/access (CHANNEL_SPECS' `category: 'matchmaker'`
-  // entries below) — groups the bot's generically-named, member-facing channels together instead
-  // of scattering them at server root next to a server's own channels, where names like
-  // "register" or "how-to-use" are more likely to clash with something the server already has.
+  // Parent for register/get-roles/access (CHANNEL_SPECS' `category: 'matchmaker'` entries below)
+  // — groups the bot's generically-named, member-facing channels together instead of scattering
+  // them at server root next to a server's own channels, where a name like "register" is more
+  // likely to clash with something the server already has.
   // position: 0 — pinned to the very top of the channel list (not left wherever Discord's default
   // append-at-the-end placement would put it) so a brand new member's first-ever view of the
   // server leads with #register, not whatever the server's own channels happen to be. Re-applied
@@ -86,7 +86,11 @@ const CHANNEL_SPECS = [
   { key: 'setup', name: 'setup' },
   { key: 'register', name: 'register', category: 'matchmaker' },
   { key: 'getRoles', name: 'get-roles', category: 'matchmaker' },
-  { key: 'howto', name: 'how-to-use', category: 'matchmaker' },
+  // 'howto' ('how-to-use') deliberately removed — the dedicated auto-created channel is gone; the
+  // same content is still reachable via /setup-howto (index.js), which a mod can now run in
+  // whichever channel they'd rather have it live in. guild-config.js's GUILD_CONFIG_MIGRATIONS
+  // self-heals any already-set-up server that still has the old channel — see that migration's own
+  // doc comment.
   // Centralized suggest-a-feature (suggestions.js) — one button+modal, forwarded straight to the
   // developer and stored centrally, rather than free-form messages scattered across dozens of
   // separate servers' channels. Verified-member-visible (permissions.js's verifiedChannels).
@@ -129,7 +133,7 @@ const REGION_SPECS = [
 // 9 forums: one per region×build-mode combination. key matches exactly what channel-manager.js's
 // createTournamentChannel looks up (`tournamentForum_${region}_${buildMode}`) — guild-config.js's
 // existing flat channelIds map stores each one under this composite key, same mechanism every
-// other single-channel entry (getRoles, howto, setup, ...) already uses; no new top-level
+// other single-channel entry (getRoles, setup, ...) already uses; no new top-level
 // guild-config field needed for this (unlike the old tagIds map, which this replaces and makes
 // unused going forward — see guild-config.js's own migration doc comment on why tagIds is left in
 // place rather than deleted).
@@ -409,16 +413,20 @@ async function runMatchmakerSetup(guild) {
         guild.client, config.setupMessageIds, channelIds, 'getRoles',
         () => ({ embeds: [buildRolesEmbed()], components: buildRolesComponents() })
       );
-      // Bio button posted as its own message right after — Discord caps a message at 5 action
-      // rows, and buildRolesComponents() already uses all 5 for select menus (a select can't
-      // share a row with a button either), so there's no room left in the same message.
+      // Platform select posted as its own message right after — originally shared with the bio
+      // button (now removed entirely, confirmed dead), kept as a separate message rather than
+      // folded back into buildRolesComponents()'s now-4/5-row message: that would leave THIS
+      // message (already posted on every existing server) with nothing to show, needing its own
+      // cleanup on top of what removing bio/ageBracket already requires — simpler to just keep the
+      // split. Message key stays 'getRolesBio' (not renamed) — ensurePosted edits this SAME
+      // already-tracked message in place, so an existing server picks up the bio-button removal
+      // automatically on the next re-run (/matchmaker-setup or the owner-only
+      // /refresh-all-servers), no separate migration needed for the message CONTENT (unlike the
+      // stale Player.bio/ageBracket DATA, which does need one — see players.js's
+      // removeBioAndAgeBracketFields).
       setupMessageIds.getRolesBio = await ensurePosted(
         guild.client, config.setupMessageIds, { ...channelIds, getRolesBio: channelIds.getRoles }, 'getRolesBio',
-        () => ({ components: [buildBioButtonRow()] })
-      );
-      setupMessageIds.howto = await ensurePosted(
-        guild.client, config.setupMessageIds, channelIds, 'howto',
-        () => ({ embeds: [buildHowtoEmbed()] })
+        () => ({ components: [buildPlatformSelectRow()] })
       );
       setupMessageIds.register = await ensurePosted(
         guild.client, config.setupMessageIds, channelIds, 'register',
@@ -467,7 +475,7 @@ async function runMatchmakerSetup(guild) {
       throw err;
     }
 
-    const verifiedRoleLine = `Verified role: <@&${roleIds.verified}> — get-roles/how-to-use/access `
+    const verifiedRoleLine = `Verified role: <@&${roleIds.verified}> — get-roles/access `
       + 'unlock once a member links their Epic account via the Link Epic Account button in #register.';
 
     return {

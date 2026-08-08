@@ -24,14 +24,18 @@ test('config.js: regionPenalties table no longer exists', () => {
   assert.equal(config.regionPenalties, undefined);
 });
 
-test('computeMatchScoreBreakdown: no longer accepts (or is affected by) region arguments — same score regardless of what extra args are passed', () => {
+test('computeMatchScoreBreakdown: no longer accepts (or is affected by) region arguments — a stale 4th+ positional arg has zero effect', () => {
   const playerData = {
     totalPR: 500,
     recentEvents: [{ name: 'Solo Cash Cup', placement: 100, prPoints: 40, rosterSize: 1, elims: 5 }],
   };
 
+  // The 3rd positional argument is now formRosterSize (added for creative-queue.js's 1v1/2v2
+  // split — see test/creative-1v1-2v2-score-split.test.js), so it's deliberately left at its
+  // default (1) here rather than reused for this test's own point; only a 4th+ position (the old
+  // queueRegion slot) is what this test needs to prove is dead/ignored.
   const bare = computeMatchScoreBreakdown(playerData, 'Some Tournament');
-  const withStaleRegionArgs = computeMatchScoreBreakdown(playerData, 'Some Tournament', 'ME', 'EU'); // ME->EU used to carry a real 0.25 penalty
+  const withStaleRegionArg = computeMatchScoreBreakdown(playerData, 'Some Tournament', undefined, 'EU'); // 'EU' used to be queueRegion, carrying a real cross-region penalty
 
-  assert.deepEqual(bare, withStaleRegionArgs, 'extra region arguments (even a historically-penalized ME->EU pair) must have zero effect — they are simply ignored now');
+  assert.deepEqual(bare, withStaleRegionArg, 'a stale 4th positional argument (even a historically-penalized region value) must have zero effect — it is simply ignored now');
 });
