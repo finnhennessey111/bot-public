@@ -43,10 +43,22 @@ const BLOCKED_RESOURCE_TYPES = new Set(['image', 'font', 'stylesheet', 'media'])
 //   - cdnjs.cloudflare.com, cdn.jsdelivr.net: the same real capture showed the live page loading
 //     actual Vue.js from both (cdnjs.cloudflare.com/ajax/libs/vue/2.5.16/vue.min.js and
 //     cdn.jsdelivr.net/npm/vue@3.5.31/dist/vue.global.prod.js, plus vue-spinner) — real libraries
-//     the page depends on, not ad-tech riding a public CDN. Not something this scrape's own data
-//     extraction needs (that comes from a raw inline <script> tag, not anything Vue renders), but
-//     blocking a dependency the live page genuinely loads is a different risk than blocking
-//     confirmed ad-tech, so both stay allowed.
+//     the page depends on, not ad-tech riding a public CDN. CONFIRMED via a real live test, not
+//     just inferred from the capture (an earlier version of this comment assumed the scrape's data
+//     "comes from a raw inline <script> tag, not anything Vue renders" — that assumption was never
+//     actually true for two of the three fields and was untested until now): scraped the same real,
+//     active player (AG Sky., EU) twice in one process, once with the current blocklist and once
+//     with these two hosts also added to it. totalPR was unaffected both times (228008 — it really
+//     does come from the raw `const profile = {...}` <script> blob, never the DOM), but
+//     thisSeasonPR silently dropped from a real 43596 to 0, and sessions from a real 795 to null.
+//     Vue.js is what actually renders the .profile-stat__label/.profile-stat__value elements
+//     scraper.js's extractStatValue reads (see scraper.js's parseProfileData/extractStatValue doc
+//     comments) — that markup is simply absent from the server-rendered HTML without it, no error,
+//     no warning, just a silent reversion to the exact thisSeasonPR/sessions bugs the DOM-read fix
+//     (test/scraper-this-season-dom.test.js) was written to solve. Pinned by a live regression test
+//     in test/proxy-domain-blocking.test.js. Both hosts stay allowed, permanently — unlike the
+//     "not yet verified, block would be risky" entries below, this one is a confirmed hard
+//     requirement, not an open question.
 //   - notifications.thetrackernetwork.com: "Tracker Network" is Fortnite Tracker's own parent
 //     brand — the same capture also showed cdn.thetrackernetwork.com, trackercdn.com, and
 //     imgsvc.trackercdn.com serving real first-party images (player badges, premium icons), and

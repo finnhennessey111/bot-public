@@ -164,6 +164,49 @@ test('scrapePlayerOnce: still extracts correct real profile data from the real l
   assert.ok(data.sessions === null || typeof data.sessions === 'number', 'sessions must be a real number or a genuine null, never undefined/NaN/a string');
 });
 
+// Regression test for the investigation documented in proxy-config.js's BLOCKED_DOMAINS comment:
+// cdnjs.cloudflare.com/cdn.jsdelivr.net serve the real Vue.js the live page depends on to render
+// its .profile-stat__label/.profile-stat__value markup — the ONLY source scraper.js's
+// extractStatValue has for thisSeasonPR/sessions (test/scraper-this-season-dom.test.js's DOM-read
+// fix). Blocking either host doesn't error — it silently reverts both fields to their "DOM block
+// absent" defaults (0 and null), exactly the bug that fix solved. Confirmed live, not assumed:
+// same real account test/scraper-this-season-dom.test.js's own real-site test uses (known to have
+// a genuine positive thisSeasonPR and sessions count, so a drop to 0/null is unambiguous — not
+// indistinguishable from a real zero-history account the way test/scraper-this-season-dom.test.js's
+// InactivePlayer case is).
+//
+// Mutates the real BLOCKED_DOMAINS Set that isBlockedDomain/blockUnnecessaryResources read from
+// directly (same object scraper.js's live request-interception uses) rather than adding these
+// hosts to source and reverting — proves the live consequence of doing so without ever actually
+// shipping it, and is restored in `finally` regardless of pass/fail.
+test('BLOCKED_DOMAINS must never include cdnjs.cloudflare.com/cdn.jsdelivr.net — confirmed live: blocking Vue silently breaks thisSeasonPR/sessions DOM extraction', async () => {
+  const ACCOUNT = 'AG Sky.';
+  const REGION = 'EU';
+  const EPIC_ID = '2f98535a-2b2a-43d0-922c-1aa56034cbb6';
+
+  const baseline = await scrapePlayerOnce(ACCOUNT, REGION, EPIC_ID);
+  assert.equal(typeof baseline.thisSeasonPR, 'number');
+  assert.ok(baseline.thisSeasonPR > 0, `expected a real, live, positive thisSeasonPR for this known active player, got ${baseline.thisSeasonPR}`);
+  assert.equal(typeof baseline.sessions, 'number');
+  assert.ok(baseline.sessions > 0, `expected a real, live, positive sessions count for this known active player, got ${baseline.sessions}`);
+
+  BLOCKED_DOMAINS.add('cdnjs.cloudflare.com');
+  BLOCKED_DOMAINS.add('cdn.jsdelivr.net');
+  try {
+    const withVueBlocked = await scrapePlayerOnce(ACCOUNT, REGION, EPIC_ID);
+
+    // totalPR must be completely unaffected — it comes from the raw `const profile = {...}`
+    // <script> blob, never the DOM, never Vue.
+    assert.equal(withVueBlocked.totalPR, baseline.totalPR);
+
+    assert.equal(withVueBlocked.thisSeasonPR, 0, 'blocking Vue must never silently reintroduce the exact thisSeasonPR bug the DOM-read fix solved');
+    assert.equal(withVueBlocked.sessions, null, 'blocking Vue must never silently reintroduce the exact sessions bug the DOM-read fix solved');
+  } finally {
+    BLOCKED_DOMAINS.delete('cdnjs.cloudflare.com');
+    BLOCKED_DOMAINS.delete('cdn.jsdelivr.net');
+  }
+});
+
 test('scrapeUpcomingTournaments: still extracts correct real calendar data from the real live site with both blocking layers active', async () => {
   const tournaments = await scrapeUpcomingTournaments();
 
